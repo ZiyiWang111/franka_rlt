@@ -61,7 +61,9 @@ lerobot-record \
   --dataset.single_task="Grab and handover the red cube to the other arm"
 ```
 """
+from evo_rlt.adapters.lerobot.franka_robot import FrankaRobotConfig, FrankaRobot  # noqa: F401
 
+import inspect
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -190,6 +192,9 @@ class DatasetRecordConfig:
     encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Record observations with zero actions and without commanding the robot.
+    # Passive static smoke-test mode: requires no policy/teleoperator.
+    zero_action_mode: bool = False
 
     def __post_init__(self):
         if self.single_task is None:
@@ -365,7 +370,7 @@ class RecordConfig:
             # preprocessor/postprocessor come from VLA model directory
             self.policy.pretrained_path = self.rlt.vla_model
 
-        if self.teleop is None and self.policy is None:
+        if self.teleop is None and self.policy is None and not self.dataset.zero_action_mode:
             raise ValueError("Choose a policy, a teleoperator, or enable RLT to control the robot")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
@@ -431,6 +436,11 @@ class RecordConfig:
     def __get_path_fields__(cls) -> list[str]:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
         return ["policy"]
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    params = inspect.signature(fn).parameters
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _ensure_human_inloop_compatible_features(
@@ -706,7 +716,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # unbind s/f so the user cannot accidentally end an episode out of
         # the double-tap state machine.
         bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
-        listener, events = init_keyboard_listener(
+        listener_kwargs = dict(
             intervention_toggle_key=" " if rlt_hil_mode else cfg.intervention_toggle_key,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
             episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
@@ -717,6 +727,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
         )
+        if _accepts_kwarg(init_keyboard_listener, "intervention_toggle_key"):
+            listener, events = init_keyboard_listener(**listener_kwargs)
+        else:
+            # lerobot >= 0.5: base init_keyboard_listener() takes no arguments and only
+            # binds right/left/esc. Fall back only when no extended key bindings are
+            # requested; otherwise fail loudly instead of silently degrading
+            # RLT/HIL key controls.
+            intervention_keys_needed = (
+                cfg.intervention_state_machine_enabled and policy is not None and teleop is not None
+            )
+            extended_keys_requested = any(
+                (
+                    intervention_keys_needed,
+                    cfg.enable_critical_phase_labeling,
+                    cfg.rlt.enable,
+                    bind_ep_outcome_keys,
+                    teleop_r_key_mode,
+                )
+            )
+            if extended_keys_requested:
+                raise ValueError(
+                    "Extended keyboard bindings are requested (RLT / critical phase / episode "
+                    "outcome labeling / intervention / teleop r-key episodes), but the installed "
+                    "lerobot's init_keyboard_listener does not accept key-binding arguments. "
+                    "Use a lerobot version with the extended listener, or disable these features."
+                )
+            listener, events = init_keyboard_listener()
 
         def _warmup_rlt_path() -> None:
             if not (rlt_active and policy is not None and preprocessor is not None and postprocessor is not None):
@@ -782,6 +819,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 start_in_teleop=cfg.rlt.start_in_teleop,
                 intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
+                zero_action_mode=cfg.dataset.zero_action_mode,
             )
 
         def _current_episode_frame_count() -> int:
@@ -887,7 +925,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         def _finish_recorded_episode(recorded_episodes: int, episode_success: str | None) -> int:
             if _discard_rerecord_episode():
                 return recorded_episodes
-            dataset.save_episode(extra_episode_metadata=_extra_episode_metadata(episode_success))
+            extra_meta = _extra_episode_metadata(episode_success)
+            if extra_meta is None:
+                dataset.save_episode()
+            elif _accepts_kwarg(dataset.save_episode, "extra_episode_metadata"):
+                dataset.save_episode(extra_episode_metadata=extra_meta)
+            else:
+                raise RuntimeError(
+                    "Episode metadata (outcome labeling / RLT intervals) was requested, but the "
+                    "installed lerobot's save_episode does not accept extra_episode_metadata. "
+                    "Use prepare_lerobot_runtime(background_episode_video_encoding=True) to "
+                    "enable the patched path."
+                )
             return recorded_episodes + 1
 
         with VideoEncodingManager(dataset):

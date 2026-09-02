@@ -219,6 +219,7 @@ def record_loop(
     rl_phase_double_tap_window_s: float = 1.0,
     start_in_teleop: bool = False,
     intervention_action_blend_time_s: float = 0.0,
+    zero_action_mode: bool = False,
 ):
     if intervention_action_blend_time_s < 0:
         raise ValueError("intervention_action_blend_time_s must be >= 0")
@@ -718,24 +719,29 @@ def record_loop(
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
 
-        if act_processed_policy is None and act_processed_teleop is None:
-            logging.info(
-                "No policy or teleoperator provided, skipping action generation."
-                "This is likely to happen when resetting the environment without a teleop device."
-                "The robot won't be at its rest position at the start of the next episode."
-            )
-            continue
-
-        if act_processed_teleop is not None:
-            last_teleop_action = act_processed_teleop
-            teleop_fallback_warned = False
+        zero_action_source = act_processed_policy is None and act_processed_teleop is None
+        if zero_action_source:
+            if not zero_action_mode:
+                logging.info(
+                    "No policy or teleoperator provided, skipping action generation."
+                    "This is likely to happen when resetting the environment without a teleop device."
+                    "The robot won't be at its rest position at the start of the next episode."
+                )
+                continue
+            # Passive static recording: observations are recorded with zero
+            # actions and no command is sent to the robot.
+            is_intervention = 0.0
+            action_values = zero_policy_action
+        else:
+            if act_processed_teleop is not None:
+                last_teleop_action = act_processed_teleop
+                teleop_fallback_warned = False
+            is_intervention, action_values = _select_action_values(act_processed_policy, act_processed_teleop)
+            action_values = _apply_intervention_blend(is_intervention, action_values)
 
         policy_action_for_storage = (
             act_processed_policy if act_processed_policy is not None else zero_policy_action
         )
-
-        is_intervention, action_values = _select_action_values(act_processed_policy, act_processed_teleop)
-        action_values = _apply_intervention_blend(is_intervention, action_values)
 
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
@@ -748,7 +754,10 @@ def record_loop(
         if selected_from_policy:
             last_policy_action_for_blend = _clone_robot_action(action_values)
         _t0 = time.perf_counter()
-        if policy_sync_executor is not None and selected_from_policy:
+        if zero_action_source:
+            # Passive static recording: never command the robot.
+            pass
+        elif policy_sync_executor is not None and selected_from_policy:
             _sent_action = run_with_connection_retry(
                 "policy_sync_executor.send_action",
                 lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(

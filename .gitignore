@@ -10,3 +10,4 @@ dist/
 outputs/
 cache/
 wandb/
+datasets/
