@@ -882,3 +882,157 @@ def record_loop(
     if _recovery_fh is not None:
         logging.info("[Recovery] Wrote %d frames to recovery_frames.jsonl", _frame_counter)
         _recovery_fh.close()
+
+
+""" ------------------------- manual-demo recording loop -------------------------"""
+
+
+def process_gripper_key_events(robot: Robot, events: dict) -> None:
+    """Consume one-shot manual-demo gripper events and command the robot's Hand.
+
+    ``events["close_gripper"]`` / ``events["open_gripper"]`` are set by the
+    manual-demo keyboard listener; this helper must run on the recording
+    thread (between frames / during the idle poll) because the robotLab
+    control-client socket is single-threaded request/reply -- it cannot be
+    driven from the pynput callback thread or a background thread. The RPC is
+    blocking, so the recorder pauses for the duration of the grasp/open (the
+    operator holds the arm still then, so pose deltas stay ~0).
+
+    Robots without ``open_gripper``/``close_gripper`` methods are skipped with a
+    warning; command failures are logged and never crash the recorder.
+    """
+    for event_name, action in (("close_gripper", "close"), ("open_gripper", "open")):
+        if not events.get(event_name):
+            continue
+        events[event_name] = False
+        method = getattr(robot, f"{action}_gripper", None)
+        if not callable(method):
+            logging.warning(
+                "Gripper '%s' key pressed, but robot %s has no %s_gripper() support; ignoring.",
+                action,
+                getattr(robot, "name", type(robot).__name__),
+                action,
+            )
+            continue
+        try:
+            grasped = method()
+        except Exception:  # noqa: BLE001 - a gripper fault must not kill a take
+            logging.exception("Gripper '%s' command failed.", action)
+            continue
+        detail = " (grasped)" if (action == "close" and grasped) else ""
+        logging.info("Manual-demo gripper: %s%s", action, detail)
+
+
+def record_manual_demo_loop(
+    *,
+    robot: Robot,
+    dataset: LeRobotDataset,
+    events: dict,
+    fps: float,
+    single_task: str,
+    control_time_s: float | None = None,
+    collector_policy_id_human: int = COLLECTOR_HUMAN,
+    play_sounds: bool = True,
+) -> None:
+    """Record one human-guided demonstration episode into ``dataset``.
+
+    The operator drives the arm by hand (Desk Programming / Guiding mode); this
+    loop only *reads* state and never calls ``robot.send_action``. Frames are
+    buffered one behind so that every stored frame's ``action`` is the measured
+    6D delta toward the *next* frame's measured TCP pose; the last frame carries
+    a zero action (``action[t] = delta(pose[t] -> pose[t+1])``). The episode ends
+    when ``events["exit_early"]`` is set; the caller decides whether to save the
+    buffer (RIGHT) or discard it (LEFT).
+
+    The observation must expose ``ee_x..ee_rz`` (TCP pose, rotvec in radians)
+    alongside the scalar joint / gripper features -- i.e. the FrankaRobot.
+
+    Complementary-info columns are written with the same shape the non-manual
+    record_loop writes (zero intervention / prefix phase / human collector id),
+    so the saved episodes keep the unified schema.
+    """
+    from evo_rlt.adapters.lerobot.franka_robot.pose_math import compute_delta_action
+
+    _recovery_fh = None
+    if dataset.root is not None:
+        _recovery_fh = open(dataset.root / "recovery_frames.jsonl", "a")  # noqa: SIM115
+
+    def _write_recovery_row(frame: dict) -> None:
+        if _recovery_fh is None:
+            return
+        row = {}
+        for key, value in frame.items():
+            if "image" in key or key == "task":
+                continue
+            if isinstance(value, np.ndarray):
+                row[key] = value.tolist()
+            elif isinstance(value, (int, float, str, bool)):
+                row[key] = value
+        _recovery_fh.write(json.dumps(row) + "\n")
+        _recovery_fh.flush()
+
+    def _ee_pose(obs: dict) -> list[float]:
+        try:
+            return [float(obs[f"ee_{axis}"]) for axis in ("x", "y", "z", "rx", "ry", "rz")]
+        except KeyError as exc:  # pragma: no cover - defensive for non-Franka robots
+            raise ValueError(
+                "record_manual_demo_loop needs an observation with ee_x..ee_rz "
+                "(TCP pose in rotvec). It is built for the FrankaRobot."
+            ) from exc
+
+    def _zero_action() -> dict[str, float]:
+        return {name: 0.0 for name in dataset.features[ACTION]["names"]}
+
+    def _add_frame(obs_frame: dict, action: dict) -> None:
+        action_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
+        policy_action_frame = build_dataset_frame(
+            dataset.features, _zero_action(), prefix="complementary_info.policy_action"
+        )
+        frame = {**obs_frame, **action_frame, **policy_action_frame, "task": single_task}
+        if "complementary_info.is_intervention" in dataset.features:
+            frame["complementary_info.is_intervention"] = np.array([0.0], dtype=np.float32)
+        if "complementary_info.state" in dataset.features:
+            frame["complementary_info.state"] = np.array([0.0], dtype=np.float32)
+        if "complementary_info.collector_policy_id" in dataset.features:
+            frame["complementary_info.collector_policy_id"] = np.array(
+                [collector_policy_id_human], dtype=np.int64
+            )
+        if "complementary_info.phase" in dataset.features:
+            frame["complementary_info.phase"] = np.array([PHASE_PREFIX], dtype=np.float32)
+        dataset.add_frame(frame)
+        _write_recovery_row(frame)
+
+    log_say(
+        "Recording manual demo: guide the arm. Press RIGHT to end and save, LEFT to discard.",
+        play_sounds,
+    )
+    pending = None  # (obs_frame, ee_pose) of the previous sample
+    num_frames = 0
+    start_t = time.perf_counter()
+    try:
+        while not events["exit_early"]:
+            if control_time_s is not None and time.perf_counter() - start_t > control_time_s:
+                logging.warning("Manual demo episode hit control_time_s=%.1fs; ending.", control_time_s)
+                break
+            # Grip/release the Hand mid-take (C/O keys). Blocking RPC: frame
+            # sampling pauses for its duration, which is fine -- the operator
+            # is holding the arm still while the fingers close.
+            process_gripper_key_events(robot, events)
+            iter_start = time.perf_counter()
+            obs = robot.get_observation()
+            pose = _ee_pose(obs)
+            if pending is not None:
+                prev_obs_frame, prev_pose = pending
+                _add_frame(prev_obs_frame, compute_delta_action(prev_pose, pose))
+                num_frames += 1
+            pending = (build_dataset_frame(dataset.features, obs, prefix=OBS_STR), pose)
+            precise_sleep(max(1.0 / fps - (time.perf_counter() - iter_start), 0.0))
+    finally:
+        # Flush the trailing sample: it has no successor pose, so its action is zero.
+        if pending is not None:
+            _add_frame(pending[0], _zero_action())
+            num_frames += 1
+        logging.info("Manual demo episode finished: %d frames added.", num_frames)
+        if _recovery_fh is not None:
+            _recovery_fh.close()
+            _recovery_fh = None

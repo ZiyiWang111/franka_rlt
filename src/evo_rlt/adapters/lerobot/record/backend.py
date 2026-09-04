@@ -65,6 +65,7 @@ from evo_rlt.adapters.lerobot.franka_robot import FrankaRobotConfig, FrankaRobot
 
 import inspect
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -106,7 +107,11 @@ from evo_rlt.adapters.lerobot.record.hil import (
     _capture_policy_runtime_state,  # noqa: F401
     _predict_policy_action_with_acp_inference,  # noqa: F401
 )
-from evo_rlt.adapters.lerobot.record.loop import record_loop
+from evo_rlt.adapters.lerobot.record.loop import (
+    process_gripper_key_events,
+    record_loop,
+    record_manual_demo_loop,
+)
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -195,10 +200,38 @@ class DatasetRecordConfig:
     # Record observations with zero actions and without commanding the robot.
     # Passive static smoke-test mode: requires no policy/teleoperator.
     zero_action_mode: bool = False
+    # Real manual-demonstration recording: the operator guides the FR3 by hand
+    # (Desk Programming/Guiding mode), presses ENTER to start an episode, RIGHT
+    # to end and save it, LEFT to discard and re-record. The recorder only
+    # reads state (wrist+front RGB, joints, joint velocities, TCP pose, gripper)
+    # and writes the measured 6D delta action; it never commands the robot.
+    # Requires no policy/teleoperator and must not be combined with zero_action_mode.
+    manual_demo_mode: bool = False
+    # Manual-demo keyboard control of the Franka Hand: while an episode records
+    # AND in the idle windows between episodes the operator can force-grasp with
+    # `manual_demo_gripper_close_key` and open with `manual_demo_gripper_open_key`.
+    # Single characters, case-insensitive; only meaningful when manual_demo_mode
+    # is on a Franka. Commands are blocking RPCs to the control server, run on
+    # the recording thread (see record.loop.process_gripper_key_events).
+    manual_demo_gripper_close_key: str = "c"
+    manual_demo_gripper_open_key: str = "o"
 
     def __post_init__(self):
         if self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
+        if self.zero_action_mode and self.manual_demo_mode:
+            raise ValueError("`zero_action_mode` and `manual_demo_mode` are mutually exclusive.")
+        if self.manual_demo_mode:
+            for key_name, key_value in (
+                ("manual_demo_gripper_close_key", self.manual_demo_gripper_close_key),
+                ("manual_demo_gripper_open_key", self.manual_demo_gripper_open_key),
+            ):
+                if not key_value or len(key_value) != 1:
+                    raise ValueError(f"`{key_name}` must be a single character.")
+            if self.manual_demo_gripper_close_key.lower() == self.manual_demo_gripper_open_key.lower():
+                raise ValueError(
+                    "`manual_demo_gripper_close_key` and `manual_demo_gripper_open_key` must be distinct."
+                )
 
 
 @dataclass
@@ -370,8 +403,15 @@ class RecordConfig:
             # preprocessor/postprocessor come from VLA model directory
             self.policy.pretrained_path = self.rlt.vla_model
 
-        if self.teleop is None and self.policy is None and not self.dataset.zero_action_mode:
-            raise ValueError("Choose a policy, a teleoperator, or enable RLT to control the robot")
+        if (
+            self.teleop is None
+            and self.policy is None
+            and not self.dataset.zero_action_mode
+            and not self.dataset.manual_demo_mode
+        ):
+            raise ValueError(
+                "Choose a policy, a teleoperator, or enable RLT/zero_action_mode/manual_demo_mode to control the robot"
+            )
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
 
@@ -441,6 +481,81 @@ class RecordConfig:
 def _accepts_kwarg(fn, name: str) -> bool:
     params = inspect.signature(fn).parameters
     return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _start_manual_demo_keyboard_listener(
+    gripper_close_key: str = "c",
+    gripper_open_key: str = "o",
+):
+    """Build the pynput keyboard listener driving manual-demonstration episodes.
+
+    Returns ``(listener, events)``. All bindings fire on key press:
+
+      - Enter -> ``events["start_episode"]``      begin recording the next episode
+      - Right -> ``events["exit_early"]``         end the current episode and save it
+      - Left  -> ``events["rerecord_episode"]`` + ``exit_early``  discard, re-record
+      - Esc   -> ``events["stop_recording"]`` + ``exit_early``    quit everything
+      - ``gripper_close_key`` (default ``c``) -> ``events["close_gripper"]``  grasp the Hand
+      - ``gripper_open_key``  (default ``o``) -> ``events["open_gripper"]``   open the Hand
+
+    Gripper events are one-shot flags consumed on the recording thread by
+    ``record.loop.process_gripper_key_events`` (blocking RPCs must not run on
+    the pynput thread).
+    """
+    if is_headless():
+        raise RuntimeError(
+            "manual_demo_mode needs a physical keyboard: ENTER starts an episode, RIGHT "
+            "ends & saves it, LEFT discards it, ESC quits, "
+            f"{gripper_close_key.upper()} closes the gripper, {gripper_open_key.upper()} opens it. "
+            "The session is headless."
+        )
+    from pynput import keyboard
+
+    gripper_close_key = gripper_close_key.lower()
+    gripper_open_key = gripper_open_key.lower()
+
+    events = {
+        "start_episode": False,
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "episode_outcome": None,
+        "close_gripper": False,
+        "open_gripper": False,
+    }
+
+    def _is_char_key(key, target: str) -> bool:
+        return (
+            isinstance(key, keyboard.KeyCode)
+            and key.char is not None
+            and key.char.lower() == target
+        )
+
+    def on_press(key) -> None:
+        if key == keyboard.Key.enter:
+            events["start_episode"] = True
+            logging.info("manual-demo key: ENTER -> start episode")
+        elif key == keyboard.Key.right:
+            events["exit_early"] = True
+            logging.info("manual-demo key: RIGHT -> end episode and save")
+        elif key == keyboard.Key.left:
+            events["exit_early"] = True
+            events["rerecord_episode"] = True
+            logging.info("manual-demo key: LEFT -> discard episode, re-record")
+        elif key == keyboard.Key.esc:
+            events["exit_early"] = True
+            events["stop_recording"] = True
+            logging.info("manual-demo key: ESC -> stop recording")
+        elif _is_char_key(key, gripper_close_key):
+            events["close_gripper"] = True
+            logging.info("manual-demo key: %s -> close gripper", gripper_close_key)
+        elif _is_char_key(key, gripper_open_key):
+            events["open_gripper"] = True
+            logging.info("manual-demo key: %s -> open gripper", gripper_open_key)
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener, events
 
 
 def _ensure_human_inloop_compatible_features(
@@ -727,7 +842,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
         )
-        if _accepts_kwarg(init_keyboard_listener, "intervention_toggle_key"):
+        if cfg.dataset.manual_demo_mode:
+            if teleop is not None or policy is not None:
+                raise ValueError(
+                    "`dataset.manual_demo_mode=true` requires no `policy` and no `teleop`: the arm "
+                    "is guided by hand and the recorder only reads state (never sends servo commands)."
+                )
+            listener, events = _start_manual_demo_keyboard_listener(
+                gripper_close_key=cfg.dataset.manual_demo_gripper_close_key,
+                gripper_open_key=cfg.dataset.manual_demo_gripper_open_key,
+            )
+        elif _accepts_kwarg(init_keyboard_listener, "intervention_toggle_key"):
             listener, events = init_keyboard_listener(**listener_kwargs)
         else:
             # lerobot >= 0.5: base init_keyboard_listener() takes no arguments and only
@@ -939,20 +1064,79 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
             return recorded_episodes + 1
 
-        with VideoEncodingManager(dataset):
-            _warmup_rlt_path()
+        def _record_manual_demo_episode() -> None:
+            # Human guiding: frames are buffered one-behind so each stored frame's
+            # action is the measured 6D delta toward the next frame's TCP pose.
+            record_manual_demo_loop(
+                robot=robot,
+                dataset=dataset,
+                events=events,
+                fps=cfg.dataset.fps,
+                single_task=cfg.dataset.single_task,
+                control_time_s=cfg.dataset.episode_time_s,
+                collector_policy_id_human=collector_policy_id_human,
+                play_sounds=cfg.play_sounds,
+            )
+
+        def _run_manual_demo_episodes() -> int:
+            """Run the reset/wait <-> record state machine for manual demos.
+
+            Reset/wait windows are *not* recorded (no frame is added while waiting
+            for ENTER). Only ENTER-started stretches are written; RIGHT saves,
+            LEFT discards (no count), ESC stops. Returns the number of saved episodes.
+            """
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                events["episode_outcome"] = None
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                _start_episode_trackers()
-                _reset_policy_for_episode()
-                _record_episode()
-                _finish_episode_trackers()
-                episode_success = _resolve_current_episode_success()
-                _notify_episode_outcome(episode_success)
-                _run_reset_loop_if_needed(recorded_episodes)
-                recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
+                events["start_episode"] = False
+                log_say(
+                    f"Manual demo {recorded_episodes + 1}/{cfg.dataset.num_episodes}: guide the arm "
+                    "to the start pose, then press ENTER to record. "
+                    "RIGHT ends & saves this episode; LEFT discards it; ESC quits.",
+                    cfg.play_sounds,
+                )
+                while not events["start_episode"] and not events["stop_recording"]:
+                    # Gripper keys stay live between takes so the operator can
+                    # open/close the Hand while re-positioning the object.
+                    process_gripper_key_events(robot, events)
+                    time.sleep(0.05)
+                if events["stop_recording"]:
+                    break
+                events["exit_early"] = False
+                events["rerecord_episode"] = False
+                _record_manual_demo_episode()
+                if events["stop_recording"]:
+                    # ESC pressed mid-episode: drop the partial episode instead of saving it.
+                    log_say("Quitting; discarding the partial episode", cfg.play_sounds)
+                    dataset.clear_episode_buffer()
+                    break
+                if events["rerecord_episode"]:
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    log_say("Discarding episode; record it again", cfg.play_sounds)
+                    dataset.clear_episode_buffer()
+                    continue
+                dataset.save_episode()
+                recorded_episodes += 1
+                log_say(f"Episode {recorded_episodes}/{cfg.dataset.num_episodes} saved", cfg.play_sounds)
+            return recorded_episodes
+
+        with VideoEncodingManager(dataset):
+            _warmup_rlt_path()
+            if cfg.dataset.manual_demo_mode:
+                recorded_episodes = _run_manual_demo_episodes()
+            else:
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    events["episode_outcome"] = None
+                    log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                    _start_episode_trackers()
+                    _reset_policy_for_episode()
+                    _record_episode()
+                    _finish_episode_trackers()
+                    episode_success = _resolve_current_episode_success()
+                    _notify_episode_outcome(episode_success)
+                    _run_reset_loop_if_needed(recorded_episodes)
+                    recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
     finally:
         def _save_critical_phase_intervals() -> None:
             if critical_phase_tracker is None or len(critical_phase_tracker) == 0:
