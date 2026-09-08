@@ -923,6 +923,133 @@ def process_gripper_key_events(robot: Robot, events: dict) -> None:
         logging.info("Manual-demo gripper: %s%s", action, detail)
 
 
+""" ------------------------- manual-demo health watchdog -------------------------
+
+The two failure modes that matter here are both *silent* in the raw recorder:
+a camera whose stream stops just freezes ``wait_for_frames``, and a control
+server whose death leaves the state-read cache frozen while the gripper RPCs
+(tripwire only when a Hand is attached) are absent. This watchdog turns both
+into a loud, bounded reaction:
+
+  * a 1 Hz control-server probe (silent while healthy; faults are loud),
+  * a camera stall => typed CameraFrameTimeout raised inside get_observation
+    (see franka_robot), caught here and latched,
+  * a latched fault aborts the in-progress take (discarded, never saved) and
+    exits the recorder (code 1): neither a dead control server nor a stalled
+    camera is recoverable in-process (camera pipelines cannot be restarted
+    mid-process), so the recorder stops instead of writing bad frames.
+
+Detection latency for a *hard* server drop is bounded by the robotLab client's
+command-socket RCVTIMEO (10 s): a ping or gripper RPC confirms the death only
+after that timeout. That is the floor without touching robotLab; the value of
+this watchdog is that it ends a silent freeze within ~10 s and refuses to keep
+collecting, instead of writing bad frames until a human notices.
+"""
+
+HEALTH_PROBE_INTERVAL_S = 1.0  # max cadence of the probe (fault detection)
+HEALTH_STILL_DOWN_EVERY_S = 30.0  # re-alert cadence while a fault persists
+HEALTH_DOWN_HEARTBEAT_EVERY_S = 5.0  # cadence of the DOWN heartbeat line while a fault persists
+HEALTH_SLOW_OBS_MS = 200.0  # a single get_observation above this is "slow"
+
+
+def new_health_state() -> dict:
+    """Fresh health dict shared between the idle window and take loops so that a
+    latched fault in one take blocks the next one too."""
+    return {
+        "last_probe_t": 0.0,
+        "server_down": False,
+        "camera_down": None,  # camera name, or None
+        "last_alert_t": 0.0,
+        "last_down_hb_t": 0.0,  # last time the DOWN heartbeat line was printed
+        "last_slow_warn_t": 0.0,
+        "last_obs_ms": None,  # duration of the most recent get_observation
+    }
+
+
+def _health_alert(health: dict, play_sounds: bool, title: str, detail: str) -> None:
+    health["last_alert_t"] = time.perf_counter()
+    logging.warning("[HEALTH] %s: %s", title, detail)
+    log_say(f"health warning: {title}", play_sounds)
+
+
+def manual_demo_health_tick(
+    *,
+    robot: Robot,
+    health: dict,
+    recording: bool,
+    play_sounds: bool,
+) -> None:
+    """Periodic control-server (+ camera, while recording) health probe + heartbeat.
+
+    Runs at most once per :data:`HEALTH_PROBE_INTERVAL_S`; each call is a no-op
+    otherwise. On a new fault it latches ``health["server_down"]`` /
+    ``health["camera_down"]``, logs an alert and beeps; the caller aborts the
+    current take (discarding it) and exits the recorder. Cameras are
+    only meaningful while frames are expected (``recording=True``): between
+    takes the pipelines are running but not sampled, so their ages are stale by
+    design and are not checked there.
+    """
+    now = time.perf_counter()
+    if now - health["last_probe_t"] < HEALTH_PROBE_INTERVAL_S:
+        return
+    health["last_probe_t"] = now
+
+    probe_ok = True
+    probe_ms = None
+    if hasattr(robot, "probe"):
+        probe = robot.probe()
+        probe_ok = bool(probe.get("ok", False))
+        probe_ms = probe.get("ms")
+        if not probe_ok:
+            if not health["server_down"]:
+                health["server_down"] = True
+                _health_alert(
+                    health,
+                    play_sounds,
+                    "control server DOWN",
+                    f"ping failed ({probe.get('error')}). Discarding the current episode "
+                    "and exiting. Restart the control server, then relaunch the recorder.",
+                )
+            elif now - health["last_alert_t"] >= HEALTH_STILL_DOWN_EVERY_S:
+                _health_alert(
+                    health, play_sounds, "control server still DOWN", str(probe.get("error"))
+                )
+        elif health["server_down"]:
+            health["server_down"] = False
+            logging.info("[HEALTH] control server back up (ping %.1f ms)", probe_ms)
+            log_say("control server recovered", play_sounds)
+
+    # A latched camera fault only clears on a recorder restart (pipelines cannot
+    # be restarted mid-process); keep reminding the operator.
+    if health["camera_down"] and now - health["last_alert_t"] >= HEALTH_STILL_DOWN_EVERY_S:
+        _health_alert(
+            health,
+            play_sounds,
+            "camera stalled",
+            f"camera '{health['camera_down']}' is not delivering frames; restart the recorder "
+            "to clear this state.",
+        )
+
+    # Fault line: WARNING, throttled to HEALTH_DOWN_HEARTBEAT_EVERY_S while a
+    # fault persists (the transition alert + beep came from _health_alert above).
+    # Healthy heartbeats are DEBUG only, so a healthy run stays quiet on console.
+    cam_str = ""
+    if recording and hasattr(robot, "camera_frame_ages"):
+        ages = robot.camera_frame_ages()
+        parts = [f"{name}+{age * 1000:.0f}ms" for name, age in ages.items() if age is not None]
+        cam_str = " cams[" + " ".join(parts) + "]" if parts else " cams[none]"
+    elif not recording:
+        cam_str = " (idle)"
+    server_str = f"{probe_ms:.1f}ms" if probe_ms is not None else "n/a"
+    if not probe_ok:
+        if now - health["last_down_hb_t"] >= HEALTH_DOWN_HEARTBEAT_EVERY_S:
+            health["last_down_hb_t"] = now
+            logging.warning("[HEALTH] heartbeat: control server DOWN%s", cam_str)
+    else:
+        obs_str = f" obs={health['last_obs_ms']:.0f}ms" if health["last_obs_ms"] is not None else ""
+        logging.debug("[HEALTH] heartbeat: server %s%s%s", server_str, cam_str, obs_str)
+
+
 def record_manual_demo_loop(
     *,
     robot: Robot,
@@ -933,8 +1060,16 @@ def record_manual_demo_loop(
     control_time_s: float | None = None,
     collector_policy_id_human: int = COLLECTOR_HUMAN,
     play_sounds: bool = True,
-) -> None:
+    health: dict | None = None,
+) -> dict | None:
     """Record one human-guided demonstration episode into ``dataset``.
+
+    ``health`` is the shared watchdog state created by :func:`new_health_state`
+    (one per recording session, reused across takes and idle windows). When a
+    control-server or camera fault is detected the in-progress take is aborted
+    (not saved) and ``events["stop_recording"]`` is set, so the caller discards
+    the episode buffer and exits the recorder (code 1): the control server is
+    gone or a camera is stalled, so continuing would only record garbage.
 
     The operator drives the arm by hand (Desk Programming / Guiding mode); this
     loop only *reads* state and never calls ``robot.send_action``. Frames are
@@ -950,12 +1085,22 @@ def record_manual_demo_loop(
     Complementary-info columns are written with the same shape the non-manual
     record_loop writes (zero intervention / prefix phase / human collector id),
     so the saved episodes keep the unified schema.
+
+    Returns:
+        A summary dict (frame count, wall duration, gripper and joint state of
+        the last observed sample) when the take ended cleanly and is meant to be
+        saved, or ``None`` when it was aborted by a health fault (the caller then
+        discards the episode buffer).
     """
     from evo_rlt.adapters.lerobot.franka_robot.pose_math import compute_delta_action
 
     _recovery_fh = None
     if dataset.root is not None:
         _recovery_fh = open(dataset.root / "recovery_frames.jsonl", "a")  # noqa: SIM115
+
+    # Watchdog state; one dict is shared across all takes and idle windows of a
+    # recording session (see the manual-demo health watchdog section above).
+    health = new_health_state() if health is None else health
 
     def _write_recovery_row(frame: dict) -> None:
         if _recovery_fh is None:
@@ -1008,6 +1153,8 @@ def record_manual_demo_loop(
     )
     pending = None  # (obs_frame, ee_pose) of the previous sample
     num_frames = 0
+    _aborted = False  # set when a health fault ends the take without saving it
+    last_obs = None  # raw observation of the most recent sample (for the summary)
     start_t = time.perf_counter()
     try:
         while not events["exit_early"]:
@@ -1018,8 +1165,65 @@ def record_manual_demo_loop(
             # sampling pauses for its duration, which is fine -- the operator
             # is holding the arm still while the fingers close.
             process_gripper_key_events(robot, events)
+            # Health probe (control-server ping + heartbeat). A latched fault
+            # (e.g. the control server dropped mid-take) aborts the take now,
+            # before another stale frame can be captured.
+            manual_demo_health_tick(
+                robot=robot, health=health, recording=True, play_sounds=play_sounds
+            )
+            if health["server_down"] or health["camera_down"]:
+                logging.warning(
+                    "[HEALTH] aborting take: server_down=%s camera_down=%s",
+                    health["server_down"],
+                    health["camera_down"],
+                )
+                events["stop_recording"] = True  # health fault is fatal: caller discards + exits
+                events["exit_early"] = True
+                _aborted = True
+                break
             iter_start = time.perf_counter()
-            obs = robot.get_observation()
+            try:
+                obs = robot.get_observation()
+            except RuntimeError as exc:
+                # A camera stall surfaces as franka_robot.CameraFrameTimeout
+                # (carries a .camera attr); anything else raised here is a
+                # robotLab RPC failure, i.e. the control server is gone or
+                # unresponsive. Either way the take is discarded -- never saved
+                # as a partial demo -- and the recorder exits (code 1): neither
+                # fault is recoverable in-process.
+                camera = getattr(exc, "camera", None)
+                if camera is not None:
+                    health["camera_down"] = camera
+                    _health_alert(
+                        health,
+                        play_sounds,
+                        f"camera '{camera}' stalled",
+                        f"no new frame within the timeout: {exc}",
+                    )
+                else:
+                    health["server_down"] = True
+                    _health_alert(
+                        health,
+                        play_sounds,
+                        "control server DOWN / robot fault",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                events["stop_recording"] = True  # health fault is fatal: caller discards + exits
+                events["exit_early"] = True
+                _aborted = True
+                break
+            last_obs = obs
+            obs_ms = (time.perf_counter() - iter_start) * 1000.0
+            health["last_obs_ms"] = obs_ms
+            if obs_ms > HEALTH_SLOW_OBS_MS and (
+                time.perf_counter() - health["last_slow_warn_t"] >= HEALTH_STILL_DOWN_EVERY_S
+            ):
+                health["last_slow_warn_t"] = time.perf_counter()
+                logging.warning(
+                    "[HEALTH] slow observation: %.0f ms (> %.0f ms); check camera/USB/disk.",
+                    obs_ms,
+                    HEALTH_SLOW_OBS_MS,
+                )
             pose = _ee_pose(obs)
             if pending is not None:
                 prev_obs_frame, prev_pose = pending
@@ -1028,11 +1232,29 @@ def record_manual_demo_loop(
             pending = (build_dataset_frame(dataset.features, obs, prefix=OBS_STR), pose)
             precise_sleep(max(1.0 / fps - (time.perf_counter() - iter_start), 0.0))
     finally:
-        # Flush the trailing sample: it has no successor pose, so its action is zero.
-        if pending is not None:
+        # Flush the trailing sample: it has no successor pose, so its action is
+        # zero. Skipped on a health abort -- the caller discards the whole
+        # buffer anyway and a fabricated zero-action frame would be misleading.
+        if not _aborted and pending is not None:
             _add_frame(pending[0], _zero_action())
             num_frames += 1
-        logging.info("Manual demo episode finished: %d frames added.", num_frames)
+        logging.info(
+            "Manual demo episode finished: %d frames added%s.",
+            num_frames,
+            " (aborted, take will be discarded)" if _aborted else "",
+        )
         if _recovery_fh is not None:
             _recovery_fh.close()
             _recovery_fh = None
+        # Build the post-save summary only for clean takes the caller will keep.
+        if _aborted or last_obs is None:
+            summary = None
+        else:
+            summary = {
+                "num_frames": num_frames,
+                "duration_s": time.perf_counter() - start_t,
+                "gripper_width": float(last_obs["gripper_width"]),
+                "gripper_grasped": float(last_obs["gripper_grasped"]),
+                "joints_deg": [float(last_obs[f"joint_{i}"]) * (180.0 / np.pi) for i in range(7)],
+            }
+    return summary

@@ -1,4 +1,7 @@
+import logging
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pyrealsense2 as rs
@@ -11,6 +14,38 @@ from .configuration_franka import FrankaRobotConfig
 
 sys.path.insert(0, "/home/embint/robotLab")
 from robots.franka.control_client import FrankaArmControllerClient
+
+# Steady-state: if a camera delivers no new frame for this long, treat it as
+# stalled (recorder aborts the take instead of writing stale/frozen frames).
+# Warm-up frames at connect get a longer budget so a cold USB/sensor start is
+# never mis-flagged.
+CAM_FRAME_TIMEOUT_MS = 1000
+CAM_WARMUP_TIMEOUT_MS = 5000
+CAM_WARMUP_FRAMES = 10
+
+# FCI session-lease renewal cadence. On firmware 5.9.0 a Franka FCI session with
+# no active control loop is terminated after ~55 s; the robotLab control server's
+# idle loop only *reads* state, and state reads do NOT renew the lease (only
+# control commands do). robotLab is out of our hands, so Evo-RLT renews it from
+# here: a background thread sends one fire-and-forget servo_joint to the *current*
+# joint position this often while the arm is Idle, so the 1 kHz loop runs a few ms
+# and resets the lease. (Validated 2026-09-07: single ticks every 20 s survived
+# 120 s of idle.) During Guiding/UserStopped the pulse is skipped (no command is
+# accepted then) -- safe because hand-guided stretches are < 55 s and the next
+# Idle gap renews.
+FCI_KEEPALIVE_INTERVAL_S = 20.0
+
+
+class CameraFrameTimeout(RuntimeError):
+    """Raised when a camera stream does not deliver a new frame in time.
+
+    Carries ``.camera`` (``"wrist"`` / ``"front"``) so the recorder's health
+    watchdog can report *which* camera stalled without importing this module.
+    """
+
+    def __init__(self, camera: str, waited_ms: int):
+        super().__init__(f"camera '{camera}' delivered no frame within {waited_ms} ms")
+        self.camera = camera
 
 
 class FrankaRobot(Robot):
@@ -41,6 +76,11 @@ class FrankaRobot(Robot):
         self.front_camera_cfg.enable_stream(
             rs.stream.color, 1920, 1080, rs.format.rgb8, 30
         )
+        # Collection-health bookkeeping (see CAM_FRAME_TIMEOUT_MS / .camera_frame_ages)
+        self._cam_streams = {"wrist": self.camera, "front": self.front_camera}
+        self._cam_last_frame_t = {"wrist": None, "front": None}
+        self._keepalive_thread = None
+        self._keepalive_stop = threading.Event()
 
     @property
     def observation_features(self):
@@ -80,13 +120,17 @@ class FrankaRobot(Robot):
         self.robot.connect()
         self.camera.start(self.camera_cfg)
         self.front_camera.start(self.front_camera_cfg)
-        for _ in range(10):
-            self.camera.wait_for_frames()
-            self.front_camera.wait_for_frames()
+        # Warm both pipelines; a camera that cannot deliver its first frames is
+        # a startup failure (raise), not a silent mid-take surprise.
+        for _ in range(CAM_WARMUP_FRAMES):
+            self._read_camera_frame("wrist", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
+            self._read_camera_frame("front", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
         self._connected = True
         self._cmd_pose = None
+        self._start_keepalive()
 
     def disconnect(self):
+        self._stop_keepalive()
         for pipeline in (self.camera, self.front_camera):
             try:
                 pipeline.stop()
@@ -96,6 +140,50 @@ class FrankaRobot(Robot):
             self.robot.disconnect()
         self._connected = False
         self._cmd_pose = None
+
+    # -- FCI session-lease keep-alive (system 5.9.0) -------------------------
+    # See FCI_KEEPALIVE_INTERVAL_S for the why. servo_joint is chosen over
+    # move_tool_impedance because it is a *streaming* command: fire-and-forget,
+    # neither blocking nor marking the server busy, so a pulse can never collide
+    # with a concurrent gripper RPC ("worker busy"). A single tick is enough --
+    # the arm is already at the target, so the motion completes in ~1-2 ms and
+    # the lease watchdog (no control command for ~55 s) is reset.
+    def _start_keepalive(self) -> None:
+        self._stop_keepalive()          # no double threads if connect() re-runs
+        self._keepalive_stop.clear()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="fci-keepalive")
+        self._keepalive_thread.start()
+        logging.info("FCI session-lease keep-alive started (every %.0f s)",
+                     FCI_KEEPALIVE_INTERVAL_S)
+
+    def _stop_keepalive(self) -> None:
+        self._keepalive_stop.set()
+        thread, self._keepalive_thread = self._keepalive_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.is_set():
+            self._keepalive_stop.wait(timeout=FCI_KEEPALIVE_INTERVAL_S)
+            if self._keepalive_stop.is_set():
+                break
+            self._keepalive_pulse()
+
+    def _keepalive_pulse(self) -> None:
+        try:
+            if not self._connected:
+                return
+            if "Idle" not in self.robot.robot_mode_nowait():
+                return
+            q = self.robot.get_joint_angles()
+            # Guard the server's read-failure fallback ([0.0]*7): never servo the
+            # arm to an all-zero target that is not a real measured pose.
+            if len(q) != 7 or all(abs(v) < 1e-6 for v in q):
+                return
+            self.robot.servo_joint(q)
+        except Exception:  # noqa: BLE001 - a renewal glitch must never kill the thread
+            pass
 
     def get_observation(self):
         q = self.robot.get_joint_angles()
@@ -113,10 +201,10 @@ class FrankaRobot(Robot):
             gripper_width = 0.0
             gripper_grasped = 0.0
 
-        frames = self.camera.wait_for_frames()
+        frames = self._read_camera_frame("wrist")
         wrist = np.asanyarray(frames.get_color_frame().get_data())
 
-        front_frames = self.front_camera.wait_for_frames()
+        front_frames = self._read_camera_frame("front")
         front_full = np.asanyarray(front_frames.get_color_frame().get_data())
         # max resolution (1920x1080) -> center crop 640x480, no resize
         y0 = (front_full.shape[0] - 480) // 2
@@ -136,6 +224,50 @@ class FrankaRobot(Robot):
             "gripper_grasped": gripper_grasped,
             "wrist": wrist,
             "front": front,
+        }
+
+    # -- collection health (camera + control-server liveness) ---------------
+    def _read_camera_frame(self, camera: str, timeout_ms: int = CAM_FRAME_TIMEOUT_MS):
+        """Wait (bounded) for one new frame from ``camera``.
+
+        Never hangs silently: if the stream delivers nothing within
+        ``timeout_ms`` we raise :class:`CameraFrameTimeout` so the recorder can
+        abort the take instead of writing stale frames. On success the per-camera
+        liveness timestamp used by the health heartbeat is updated.
+        """
+        pipeline = self._cam_streams[camera]
+        try:
+            frame = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+        except (RuntimeError, rs.error) as exc:
+            raise CameraFrameTimeout(camera, timeout_ms) from exc
+        self._cam_last_frame_t[camera] = time.perf_counter()
+        return frame
+
+    def camera_frame_ages(self) -> dict[str, float | None]:
+        """Seconds since each camera last delivered a frame (``None`` if never)."""
+        now = time.perf_counter()
+        return {
+            name: (None if last is None else now - last)
+            for name, last in self._cam_last_frame_t.items()
+        }
+
+    def probe(self) -> dict:
+        """Cheap control-server liveness probe (robotLab ZMQ ``ping``).
+
+        Returns ``{"ok", "error", "ms"}`` and never raises. A dead/unreachable
+        server is only confirmed after the robotLab client's command-socket
+        RCVTIMEO (10 s by default), so detection latency for a hard drop is
+        ~10 s -- the same bound the per-frame gripper RPCs already have.
+        """
+        t0 = time.perf_counter()
+        try:
+            ok = bool(self.robot.ping())
+        except Exception as exc:  # noqa: BLE001 - a probe must never raise
+            return {"ok": False, "error": str(exc), "ms": (time.perf_counter() - t0) * 1000.0}
+        return {
+            "ok": ok,
+            "error": None if ok else "no reply (client RCVTIMEO)",
+            "ms": (time.perf_counter() - t0) * 1000.0,
         }
 
     # -- gripper (manual-demo control) --------------------------------------

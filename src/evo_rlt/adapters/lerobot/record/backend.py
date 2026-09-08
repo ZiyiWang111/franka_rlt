@@ -108,6 +108,8 @@ from evo_rlt.adapters.lerobot.record.hil import (
     _predict_policy_action_with_acp_inference,  # noqa: F401
 )
 from evo_rlt.adapters.lerobot.record.loop import (
+    manual_demo_health_tick,
+    new_health_state,
     process_gripper_key_events,
     record_loop,
     record_manual_demo_loop,
@@ -842,6 +844,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
         )
+        # One health-watchdog dict per recording session, shared by every take
+        # and the idle windows between them, so a latched control-server/camera
+        # fault blocks the next take too. (Only manual_demo_mode uses it; the
+        # RLT/HIL pipeline has its own interruption semantics.)
+        health = new_health_state()
         if cfg.dataset.manual_demo_mode:
             if teleop is not None or policy is not None:
                 raise ValueError(
@@ -1064,10 +1071,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
             return recorded_episodes + 1
 
-        def _record_manual_demo_episode() -> None:
+        def _record_manual_demo_episode() -> dict | None:
             # Human guiding: frames are buffered one-behind so each stored frame's
             # action is the measured 6D delta toward the next frame's TCP pose.
-            record_manual_demo_loop(
+            return record_manual_demo_loop(
                 robot=robot,
                 dataset=dataset,
                 events=events,
@@ -1076,6 +1083,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 control_time_s=cfg.dataset.episode_time_s,
                 collector_policy_id_human=collector_policy_id_human,
                 play_sounds=cfg.play_sounds,
+                health=health,
             )
 
         def _run_manual_demo_episodes() -> int:
@@ -1084,7 +1092,25 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             Reset/wait windows are *not* recorded (no frame is added while waiting
             for ENTER). Only ENTER-started stretches are written; RIGHT saves,
             LEFT discards (no count), ESC stops. Returns the number of saved episodes.
+            A latched control-server/camera fault discards the partial take and
+            exits the recorder (code 1).
             """
+
+            def _abort_for_health() -> "None":
+                """A latched control-server/camera fault is fatal: discard any
+                partial episode and exit the recorder with code 1. ``SystemExit``
+                unwinds through the ``VideoEncodingManager`` context and
+                ``record()``'s ``finally``, so the normal cleanup (encoder flush,
+                dataset finalize, robot disconnect) still runs."""
+                logging.warning(
+                    "[HEALTH] discarding episode and exiting (server_down=%s camera_down=%s)",
+                    health["server_down"],
+                    health["camera_down"],
+                )
+                log_say("Discarding episode and exiting", cfg.play_sounds)
+                dataset.clear_episode_buffer()
+                raise SystemExit(1)
+
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["start_episode"] = False
@@ -1094,17 +1120,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "RIGHT ends & saves this episode; LEFT discards it; ESC quits.",
                     cfg.play_sounds,
                 )
-                while not events["start_episode"] and not events["stop_recording"]:
+                while not events["stop_recording"]:
                     # Gripper keys stay live between takes so the operator can
                     # open/close the Hand while re-positioning the object.
                     process_gripper_key_events(robot, events)
+                    manual_demo_health_tick(
+                        robot=robot, health=health, recording=False, play_sounds=cfg.play_sounds
+                    )
+                    # A latched control-server/camera fault is fatal: the server is
+                    # gone or a camera is stalled, so a take must not start (frames
+                    # would be stale/garbage) and the recorder exits instead.
+                    if health["server_down"] or health["camera_down"]:
+                        if events["start_episode"]:
+                            events["start_episode"] = False
+                        _abort_for_health()
+                    if events["start_episode"]:
+                        break
                     time.sleep(0.05)
                 if events["stop_recording"]:
                     break
                 events["exit_early"] = False
                 events["rerecord_episode"] = False
-                _record_manual_demo_episode()
+                ep_summary = _record_manual_demo_episode()
                 if events["stop_recording"]:
+                    if health["server_down"] or health["camera_down"]:
+                        # Health fault ended the take (control server down / camera
+                        # stalled): drop the partial episode and exit with code 1.
+                        _abort_for_health()
                     # ESC pressed mid-episode: drop the partial episode instead of saving it.
                     log_say("Quitting; discarding the partial episode", cfg.play_sounds)
                     dataset.clear_episode_buffer()
@@ -1117,6 +1159,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     continue
                 dataset.save_episode()
                 recorded_episodes += 1
+                if ep_summary is not None:
+                    logging.info(
+                        "Episode %d saved: %.2f s, %d frames | gripper_width=%.1f mm (grasped=%d) | "
+                        "joints(deg)=%s",
+                        recorded_episodes,
+                        ep_summary["duration_s"],
+                        ep_summary["num_frames"],
+                        ep_summary["gripper_width"] * 1000.0,
+                        int(ep_summary["gripper_grasped"]),
+                        " ".join(f"{v:+.1f}" for v in ep_summary["joints_deg"]),
+                    )
                 log_say(f"Episode {recorded_episodes}/{cfg.dataset.num_episodes} saved", cfg.play_sounds)
             return recorded_episodes
 
@@ -1207,6 +1260,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
 
 def main():
+    import os
+
+    import av
+
+    # Hide the SVT-AV1 "[config]" startup banner (keep warnings/errors): SVT-AV1
+    # writes directly to stderr via its own svt_log(), bypassing ffmpeg logging,
+    # so only the SVT_LOG env var can quiet it. Set before any episode so the
+    # encoder reads it at init.
+    os.environ.setdefault("SVT_LOG", "2")
+    # Hide the "[mp4 ...] Starting second pass: moving the moov atom ..." INFO
+    # line printed when the faststart remux finalizes each episode's mp4. This
+    # is a process-global ffmpeg-level filter that survives lerobot's
+    # av.logging.restore_default_callback() calls; WARNING/ERROR still print.
+    av.logging.set_libav_level(av.logging.WARNING)
     register_third_party_plugins()
     record()
 
