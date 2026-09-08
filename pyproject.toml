@@ -38,6 +38,7 @@ evo-rlt-train-rl-token = "evo_rlt.cli.train_rl_token:main"
 evo-rlt-collect-default = "evo_rlt.adapters.lerobot.record.cli:collect_default_main"
 evo-rlt-record = "evo_rlt.adapters.lerobot.record.cli:main"
 evo-rlt-verify-manual-demo = "evo_rlt.cli.verify_manual_demo:main"
+evo-rlt-review-manual-demo = "evo_rlt.cli.review_manual_demo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
