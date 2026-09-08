@@ -209,6 +209,8 @@ python -m lerobot.scripts.lerobot_train \
   --policy.path=<BASE_PI05_CHECKPOINT_DIR> \
   --policy.device=cuda \
   --policy.dtype=bfloat16 \
+  --policy.push_to_hub=false \
+  --policy.input_features=null \
   --batch_size=16 \
   --steps=30000 \
   --save_freq=5000 \
