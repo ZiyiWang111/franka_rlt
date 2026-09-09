@@ -62,6 +62,7 @@ def test_rlt_token_factory_yields_pi05_pipeline():
     assert [type(s).__name__ for s in pre.steps] == [
         "RenameObservationsProcessorStep",
         "AddBatchDimensionProcessorStep",
+        "RelativeActionsProcessorStep",
         "NormalizerProcessorStep",
         "Pi05PrepareStateTokenizerProcessorStep",
         "TokenizerProcessorStep",
