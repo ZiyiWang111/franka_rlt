@@ -887,6 +887,40 @@ def record_loop(
 """ ------------------------- manual-demo recording loop -------------------------"""
 
 
+GRIPPER_TARGET_WIDTH_ACTION = "gripper_target_width"
+
+
+def _build_manual_demo_action(
+    action_names: list[str],
+    from_pose: list[float],
+    to_pose: list[float] | None,
+    gripper_target_width: float,
+    compute_delta_action_fn: Callable | None = None,
+) -> dict[str, float]:
+    """Build a frame-aligned manual-demo action.
+
+    The TCP part points from the stored observation to the following
+    observation. The gripper RPC is blocking, so the width measured in that
+    following observation is the target associated with the stored frame. For
+    an episode's final frame, ``to_pose`` is None and only the TCP delta is
+    zeroed; the gripper target remains at its measured width.
+
+    ``action_names`` may describe a legacy 6D dataset. In that case the helper
+    returns only the TCP delta so old datasets can still be resumed explicitly.
+    """
+    if to_pose is None:
+        action = {name: 0.0 for name in action_names}
+    else:
+        if compute_delta_action_fn is None:
+            from evo_rlt.adapters.lerobot.franka_robot.pose_math import compute_delta_action
+
+            compute_delta_action_fn = compute_delta_action
+        action = compute_delta_action_fn(from_pose, to_pose)
+    if GRIPPER_TARGET_WIDTH_ACTION in action_names:
+        action[GRIPPER_TARGET_WIDTH_ACTION] = float(gripper_target_width)
+    return action
+
+
 def process_gripper_key_events(robot: Robot, events: dict) -> None:
     """Consume one-shot manual-demo gripper events and command the robot's Hand.
 
@@ -1073,9 +1107,10 @@ def record_manual_demo_loop(
 
     The operator drives the arm by hand (Desk Programming / Guiding mode); this
     loop only *reads* state and never calls ``robot.send_action``. Frames are
-    buffered one behind so that every stored frame's ``action`` is the measured
-    6D delta toward the *next* frame's measured TCP pose; the last frame carries
-    a zero action (``action[t] = delta(pose[t] -> pose[t+1])``). The episode ends
+    buffered one behind so that every stored frame's ``action`` contains the
+    measured 6D delta toward the *next* frame's measured TCP pose and, for the
+    7D Franka schema, that next frame's measured gripper width. The final frame
+    has a zero TCP delta and keeps its current gripper width. The episode ends
     when ``events["exit_early"]`` is set; the caller decides whether to save the
     buffer (RIGHT) or discard it (LEFT).
 
@@ -1092,8 +1127,6 @@ def record_manual_demo_loop(
         saved, or ``None`` when it was aborted by a health fault (the caller then
         discards the episode buffer).
     """
-    from evo_rlt.adapters.lerobot.franka_robot.pose_math import compute_delta_action
-
     _recovery_fh = None
     if dataset.root is not None:
         _recovery_fh = open(dataset.root / "recovery_frames.jsonl", "a")  # noqa: SIM115
@@ -1151,7 +1184,8 @@ def record_manual_demo_loop(
         "Recording manual demo: guide the arm. Press RIGHT to end and save, LEFT to discard.",
         play_sounds,
     )
-    pending = None  # (obs_frame, ee_pose) of the previous sample
+    action_names = list(dataset.features[ACTION]["names"])
+    pending = None  # (obs_frame, ee_pose, gripper_width) of the previous sample
     num_frames = 0
     _aborted = False  # set when a health fault ends the take without saving it
     last_obs = None  # raw observation of the most recent sample (for the summary)
@@ -1226,17 +1260,34 @@ def record_manual_demo_loop(
                 )
             pose = _ee_pose(obs)
             if pending is not None:
-                prev_obs_frame, prev_pose = pending
-                _add_frame(prev_obs_frame, compute_delta_action(prev_pose, pose))
+                prev_obs_frame, prev_pose, _ = pending
+                action = _build_manual_demo_action(
+                    action_names,
+                    prev_pose,
+                    pose,
+                    float(obs["gripper_width"]),
+                )
+                _add_frame(prev_obs_frame, action)
                 num_frames += 1
-            pending = (build_dataset_frame(dataset.features, obs, prefix=OBS_STR), pose)
+            pending = (
+                build_dataset_frame(dataset.features, obs, prefix=OBS_STR),
+                pose,
+                float(obs["gripper_width"]),
+            )
             precise_sleep(max(1.0 / fps - (time.perf_counter() - iter_start), 0.0))
     finally:
-        # Flush the trailing sample: it has no successor pose, so its action is
-        # zero. Skipped on a health abort -- the caller discards the whole
-        # buffer anyway and a fabricated zero-action frame would be misleading.
+        # Flush the trailing sample: it has no successor pose, so its TCP delta
+        # is zero while its gripper target stays at the current measured width.
+        # Skipped on a health abort because the caller discards the whole buffer.
         if not _aborted and pending is not None:
-            _add_frame(pending[0], _zero_action())
+            obs_frame, pose, gripper_width = pending
+            action = _build_manual_demo_action(
+                action_names,
+                pose,
+                None,
+                gripper_width,
+            )
+            _add_frame(obs_frame, action)
             num_frames += 1
         logging.info(
             "Manual demo episode finished: %d frames added%s.",

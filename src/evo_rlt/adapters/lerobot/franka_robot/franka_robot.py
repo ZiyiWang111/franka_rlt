@@ -100,7 +100,10 @@ class FrankaRobot(Robot):
 
     @property
     def action_features(self):
-        return {k: float for k in ["dx", "dy", "dz", "drx", "dry", "drz"]}
+        names = ["dx", "dy", "dz", "drx", "dry", "drz"]
+        if self.config.include_gripper_action:
+            names.append("gripper_target_width")
+        return {name: float for name in names}
 
     @property
     def is_connected(self):

@@ -206,7 +206,8 @@ class DatasetRecordConfig:
     # (Desk Programming/Guiding mode), presses ENTER to start an episode, RIGHT
     # to end and save it, LEFT to discard and re-record. The recorder only
     # reads state (wrist+front RGB, joints, joint velocities, TCP pose, gripper)
-    # and writes the measured 6D delta action; it never commands the robot.
+    # and writes the measured 6D TCP delta plus next measured gripper width; it
+    # never sends arm-motion commands to the robot.
     # Requires no policy/teleoperator and must not be combined with zero_action_mode.
     manual_demo_mode: bool = False
     # Manual-demo keyboard control of the Franka Hand: while an episode records
