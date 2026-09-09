@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import threading
 import time
@@ -11,9 +12,6 @@ from scipy.spatial.transform import Rotation
 from lerobot.robots.robot import Robot
 
 from .configuration_franka import FrankaRobotConfig
-
-sys.path.insert(0, "/home/embint/robotLab")
-from robots.franka.control_client import FrankaArmControllerClient
 
 # Steady-state: if a camera delivers no new frame for this long, treat it as
 # stalled (recorder aborts the take instead of writing stale/frozen frames).
@@ -55,6 +53,16 @@ class FrankaRobot(Robot):
     def __init__(self, config: FrankaRobotConfig):
         super().__init__(config)
         self.config = config
+        robotlab_path = os.environ.get("ROBOTLAB_PATH", config.robotlab_path)
+        if robotlab_path not in sys.path:
+            sys.path.insert(0, robotlab_path)
+        try:
+            from robots.franka.control_client import FrankaArmControllerClient
+        except ImportError as exc:
+            raise ImportError(
+                f"Cannot import robotLab Franka client from {robotlab_path!r}; "
+                "set --robotlab-path or ROBOTLAB_PATH on the robot host"
+            ) from exc
         self.robot = FrankaArmControllerClient(config.robot_ip)
         self._connected = False
         self._cmd_pose = None
@@ -130,7 +138,8 @@ class FrankaRobot(Robot):
             self._read_camera_frame("front", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
         self._connected = True
         self._cmd_pose = None
-        self._start_keepalive()
+        if self.config.enable_fci_keepalive:
+            self._start_keepalive()
 
     def disconnect(self):
         self._stop_keepalive()
@@ -289,6 +298,10 @@ class FrankaRobot(Robot):
         (width 0, ~40 N). Returns True if the Hand reports holding an object."""
         return bool(self.robot.close_gripper())
 
+    def resync_command_pose(self):
+        """Re-anchor the integrated TCP target to the next measured pose."""
+        self._cmd_pose = None
+
     def send_action(self, action):
         measured = np.asarray(self.robot.get_tool_pose(), dtype=float)
 
@@ -318,6 +331,20 @@ class FrankaRobot(Robot):
         dist = np.linalg.norm(pos_lead)
         if dist > MAX_POS_LEAD:
             self._cmd_pose[:3] = measured[:3] + pos_lead / dist * MAX_POS_LEAD
+
+        bounds = (self.config.workspace_min_xyz, self.config.workspace_max_xyz)
+        if (bounds[0] is None) != (bounds[1] is None):
+            raise ValueError("workspace_min_xyz and workspace_max_xyz must be set together")
+        if bounds[0] is not None and bounds[1] is not None:
+            lower = np.asarray(bounds[0], dtype=float)
+            upper = np.asarray(bounds[1], dtype=float)
+            if lower.shape != (3,) or upper.shape != (3,) or np.any(lower >= upper):
+                raise ValueError(f"invalid TCP workspace bounds: min={lower}, max={upper}")
+            if np.any(self._cmd_pose[:3] < lower) or np.any(self._cmd_pose[:3] > upper):
+                raise RuntimeError(
+                    f"refusing TCP target outside workspace: target={self._cmd_pose[:3]}, "
+                    f"min={lower}, max={upper}"
+                )
 
         measured_rot = Rotation.from_rotvec(measured[3:6])
         cmd_rot = Rotation.from_rotvec(self._cmd_pose[3:6])

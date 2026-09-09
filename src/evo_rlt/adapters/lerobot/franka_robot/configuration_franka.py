@@ -15,3 +15,9 @@ class FrankaRobotConfig(RobotConfig):
     # New manual-demo datasets include the next measured gripper width as the
     # seventh action. Set false only when resuming a legacy 6D dataset.
     include_gripper_action: bool = True
+    # Disable for strictly read-only live shadow inference. Motion-capable
+    # sessions keep it enabled so firmware 5.9.0 does not drop the FCI lease.
+    enable_fci_keepalive: bool = True
+    # Optional absolute TCP position guard in the robot base frame (metres).
+    workspace_min_xyz: tuple[float, float, float] | None = None
+    workspace_max_xyz: tuple[float, float, float] | None = None

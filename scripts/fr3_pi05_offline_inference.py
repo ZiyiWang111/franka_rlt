@@ -21,7 +21,7 @@ DEFAULT_DATASET_ROOT = PROJECT_ROOT / "datasets/franka_m1_manual_demo_state15_ac
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
     / "outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k"
-    / "checkpoints/005000/pretrained_model"
+    / "checkpoints/030000/pretrained_model"
 )
 
 # Hugging Face datasets creates lock files even when all dataset files are local.
@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--num-print-actions", type=int, default=5)
+    parser.add_argument(
+        "--save-action-chunk",
+        type=Path,
+        default=None,
+        help="Optional .npy path for the postprocessed [chunk_size, action_dim] prediction.",
+    )
     parser.add_argument(
         "--schema-only",
         action="store_true",
@@ -300,6 +306,11 @@ def main() -> None:
     np.set_printoptions(precision=6, suppress=True, linewidth=160)
     print(f"First {rows_to_print} action rows ({', '.join(action_names)}):")
     print(action_chunk[:rows_to_print].numpy())
+    if args.save_action_chunk is not None:
+        output_path = args.save_action_chunk.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_path, action_chunk.numpy())
+        print(f"Saved action chunk: {output_path}")
     if action_dim == 7:
         gripper = action_chunk[:, 6]
         print(
