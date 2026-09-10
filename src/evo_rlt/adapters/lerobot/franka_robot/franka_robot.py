@@ -33,6 +33,13 @@ CAM_WARMUP_FRAMES = 10
 # Idle gap renews.
 FCI_KEEPALIVE_INTERVAL_S = 20.0
 
+# A Hand command is rejected while the arm still owns the FCI motion channel.
+# stop_servo() is synchronous on the robotLab control client, but its PUSH state
+# cache can trail the stop response by one controller cycle.  Bound the cache
+# confirmation instead of relying on the server's 0.3 s servo-gap watchdog.
+GRIPPER_ARM_IDLE_TIMEOUT_S = 2.0
+GRIPPER_ARM_IDLE_POLL_S = 0.01
+
 
 class CameraFrameTimeout(RuntimeError):
     """Raised when a camera stream does not deliver a new frame in time.
@@ -129,13 +136,27 @@ class FrankaRobot(Robot):
 
     def connect(self, calibrate=True):
         self.robot.connect()
-        self.camera.start(self.camera_cfg)
-        self.front_camera.start(self.front_camera_cfg)
-        # Warm both pipelines; a camera that cannot deliver its first frames is
-        # a startup failure (raise), not a silent mid-take surprise.
-        for _ in range(CAM_WARMUP_FRAMES):
-            self._read_camera_frame("wrist", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
-            self._read_camera_frame("front", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
+        try:
+            self.camera.start(self.camera_cfg)
+            self.front_camera.start(self.front_camera_cfg)
+            # Warm both pipelines; a camera that cannot deliver its first frames is
+            # a startup failure (raise), not a silent mid-take surprise.
+            for _ in range(CAM_WARMUP_FRAMES):
+                self._read_camera_frame("wrist", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
+                self._read_camera_frame("front", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
+        except BaseException:
+            # The control connection was already acquired. Release it even
+            # though `_connected` is not set until all camera warm-up succeeds.
+            for pipeline in (self.camera, self.front_camera):
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+            try:
+                self.robot.disconnect()
+            except Exception:
+                logging.exception("failed to disconnect Franka after camera startup failure")
+            raise
         self._connected = True
         self._cmd_pose = None
         if self.config.enable_fci_keepalive:
@@ -293,10 +314,98 @@ class FrankaRobot(Robot):
         """Open the Franka Hand fully (blocking RPC). robotLab defaults apply."""
         return self.robot.open_gripper()
 
-    def close_gripper(self):
+    def close_gripper(self, width: float | None = None):
         """Force-controlled grasp (blocking RPC). robotLab defaults apply
-        (width 0, ~40 N). Returns True if the Hand reports holding an object."""
-        return bool(self.robot.close_gripper())
+        (~40 N). When a policy supplies an absolute target width, preserve it
+        so an empty close is not mistaken for a successful grasp at width 0."""
+        if width is None:
+            return bool(self.robot.close_gripper())
+        return bool(self.robot.close_gripper(width=float(width)))
+
+    def prepare_gripper_transition(self) -> None:
+        """End arm servo ownership before issuing a blocking Hand command.
+
+        robotLab deliberately refuses gripper actuation while ``is_running()``
+        is true.  Merely omitting one or two 30 Hz targets is insufficient: its
+        fallback servo-gap watchdog waits 0.3 s.  Explicitly stop the stream and
+        wait for the same state predicate used by robotLab's gripper guard.
+        """
+        self._stop_keepalive()
+        try:
+            if not self.robot.stop_servo():
+                raise RuntimeError("control server rejected stop_servo before gripper transition")
+            deadline = time.monotonic() + GRIPPER_ARM_IDLE_TIMEOUT_S
+            while self.robot.is_running():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "arm did not become idle after stop_servo; gripper command was not sent"
+                    )
+                time.sleep(GRIPPER_ARM_IDLE_POLL_S)
+            self._cmd_pose = None
+        except BaseException:
+            if self._connected and self.config.enable_fci_keepalive:
+                self._start_keepalive()
+            raise
+
+    def finish_gripper_transition(self) -> None:
+        """Restore idle-session renewal after the blocking Hand command."""
+        self._cmd_pose = None
+        if self._connected and self.config.enable_fci_keepalive:
+            self._start_keepalive()
+
+    def get_external_wrench_base(self) -> np.ndarray:
+        """Return cached raw base-frame external wrench without a control RPC."""
+        wrench = np.asarray(self.robot.get_tool_force_raw(), dtype=float)
+        if wrench.shape != (6,) or not np.isfinite(wrench).all():
+            raise RuntimeError(f"invalid external wrench from control server: {wrench}")
+        return wrench
+
+    def stop_and_retreat_up(self, *, distance_m: float, speed_m_s: float) -> dict:
+        """Stop policy servo and make one bounded deterministic base +Z retreat."""
+        if distance_m <= 0 or speed_m_s <= 0:
+            raise ValueError("retreat distance and speed must be positive")
+        self._stop_keepalive()
+        self._cmd_pose = None
+        try:
+            if not self.robot.stop_servo():
+                raise RuntimeError("control server rejected stop_servo after force trigger")
+            deadline = time.monotonic() + GRIPPER_ARM_IDLE_TIMEOUT_S
+            while self.robot.is_running():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("arm did not become idle after force-triggered stop")
+                time.sleep(GRIPPER_ARM_IDLE_POLL_S)
+
+            start_pose = np.asarray(self.robot.get_tool_pose(), dtype=float)
+            if start_pose.shape != (6,) or not np.isfinite(start_pose).all():
+                raise RuntimeError(f"invalid measured pose before force retreat: {start_pose}")
+            target_pose = start_pose.copy()
+            target_pose[2] += float(distance_m)
+
+            lower = self.config.workspace_min_xyz
+            upper = self.config.workspace_max_xyz
+            if lower is None or upper is None:
+                raise RuntimeError("force retreat requires explicit workspace bounds")
+            lower_xyz = np.asarray(lower, dtype=float)
+            upper_xyz = np.asarray(upper, dtype=float)
+            if np.any(target_pose[:3] < lower_xyz) or np.any(target_pose[:3] > upper_xyz):
+                raise RuntimeError(
+                    f"force retreat target outside workspace: target={target_pose[:3]}, "
+                    f"min={lower_xyz}, max={upper_xyz}; arm remains stopped"
+                )
+
+            measured_pose = self.robot.move_tool(target_pose.tolist(), speed=float(speed_m_s))
+            self._cmd_pose = None
+            return {
+                "start_pose": start_pose.tolist(),
+                "target_pose": target_pose.tolist(),
+                "measured_pose": list(measured_pose),
+                "distance_m": float(distance_m),
+                "speed_m_s": float(speed_m_s),
+            }
+        finally:
+            self._cmd_pose = None
+            if self._connected and self.config.enable_fci_keepalive:
+                self._start_keepalive()
 
     def resync_command_pose(self):
         """Re-anchor the integrated TCP target to the next measured pose."""

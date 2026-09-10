@@ -1,6 +1,6 @@
 # FR3 机器人主机 Agent Handoff
 
-更新时间：2026-09-09
+更新时间：2026-09-10
 
 ## 目标与部署结构
 
@@ -68,7 +68,8 @@ control_server -> FR3
 - `protocol.py`：ZMQ multipart wire format，使用 JSON header 和原始数组 bytes，
   不使用 pickle。
 - `state.py`：22D 命名 observation 到 15D 模型 state 的显式转换。
-- `execution.py`：TCP 向量限幅和夹爪状态机。
+- `execution.py`：跨 chunk 保持状态的 TCP 低通/速度/加速度整形、最终速度边界和
+  夹爪状态机。
 
 夹爪状态机约定：
 
@@ -78,6 +79,8 @@ control_server -> FR3
 - 中间 dead band 保持当前状态。
 - 默认需要连续两步预测相同变化才执行。
 - 从第一步变化候选开始就冻结 TCP。
+- 确认变化后先显式 `stop_servo()` 并等待 arm `is_running()==False`，再发送
+  blocking Hand 命令；不能依赖 control server 的 0.3 s servo-gap watchdog。
 - blocking gripper RPC 完成后丢弃 chunk 剩余动作、重置 TCP 积分目标并重新推理。
 
 ### Franka adapter changes
@@ -100,9 +103,9 @@ control_server -> FR3
 
 - `pyproject.toml` 的 `lerobot` extra 增加 `pyzmq>=26.0`。
 - `tests/test_fr3_remote_inference.py` 覆盖协议往返、schema、state 顺序、TCP
-  限幅、夹爪去抖，以及夹爪切换期间禁止 arm action。
-- 本机已运行相关测试：9 passed。
-- 尚未在机器人主机上导入 robotLab/RealSense，也尚未进行任何真机通信或动作。
+  限幅、低通与加速度边界、夹爪去抖，以及夹爪切换期间禁止 arm action。
+- 本机已运行相关测试：16 passed。
+- 已完成 shadow、夹爪和初步 integrated 真机测试；第二段的相对力保护尚待首次真机验证。
 
 ## 机器人主机需要同步什么
 
@@ -232,6 +235,89 @@ shadow 模式不得调用：
 
 进入 arm motion 前还需要用户根据真实清空工作区提供机器人 base frame 下的
 `workspace-min` 和 `workspace-max`。不要只用训练数据的 min/max 代替现场安全边界。
+
+### 5. 异步滚动执行与 VGA 夹取半程
+
+`--async-inference` 在主线程以 30 Hz 执行当前 action chunk 时，由单独线程采集下一次
+观测并请求推理。新结果不会从第 0 步重放：客户端按推理期间已经消费的控制 tick 跳过
+过期前缀，并用 `--chunk-blend-steps`（默认 6 步）将旧、新 chunk 在同一个全局控制
+tick 上对齐后平滑交叉融合 TCP 动作，避免直接切换产生速度突变。夹爪宽度不参与数值
+融合，始终采用最新 chunk 的离散开/合判断。`--max-action-age-s`、checkpoint 绑定和
+workspace 边界在异步模式下仍然生效。
+
+实际 TCP 命令在 chunk 融合后还会经过一个跨 chunk 保持状态的滤波器：默认低通系数
+`--action-low-pass-alpha 0.2`，平移加速度上限
+`--max-translation-accel-m-s2 0.30`，旋转加速度上限
+`--max-rotation-accel-rad-s2 0.75`。`--max-translation-m` 和
+`--max-rotation-rad` 仍表示每个控制步的最终速度边界；在 30 Hz 下分别乘以 30 即为
+每秒速度上限。夹爪 hold 或显式停止 servo 后滤波器从零速度重新起步。
+
+单 worker 双缓冲要连续切换，动作年龄预算至少需要约为一次完整观测+推理延迟的两倍：
+第一批结果激活时已消耗一次延迟，下一批结果还需要一次延迟。客户端用第一批实测延迟在
+任何运动前检查这一条件。当前约 0.55 s 的延迟使用 `--max-action-age-s 1.5`；同时客户端
+拒绝超过 50 步模型 horizon（30 Hz 时约 1.67 s）的设置。
+
+`--execute-steps` 在异步模式下是每个 chunk 可使用的最大前缀/推理延迟后备窗口，不代表
+客户端一定执行同一 chunk 的全部步数。新 chunk 就绪后成为主 chunk，但在默认 6 个
+控制步内仍融合旧 chunk 的同一时刻 TCP 动作，随后才完全采用新 chunk。
+
+仅测试“下降到 VGA 并闭合夹爪”时使用 `--stop-after-gripper-close`。该选项要求启动时夹爪
+已经完全打开且未抓取物体；第一次发出 close 后，无论 Hand 是否报告抓取成功，客户端都
+立即停止机械臂动作并退出。日志中的 `gripper_result` 用于区分抓到物体与空夹。
+
+### 6. 从已抓住 VGA 的状态执行第二段
+
+VGA 和主板不需要固定在某个绝对点，也不需要为它们提供单点坐标；模型继续使用训练时的
+完整任务文本和当前两幅图像判断后续动作。现场只需保证两者处于训练数据覆盖区域内，并用
+工作空间包住允许的整个第二段。当前第二段 base-frame 工作空间为：
+
+```text
+X: 0.496 .. 0.633 m
+Y: -0.272 .. 0.126 m
+Z: 0.1246 .. 0.5246 m
+```
+
+第二段使用 `arm-only`：第 7 维夹爪预测仍由模型返回，但客户端不会执行 open/close，因而
+保持人工建立的抓取状态。`--require-initial-grasp` 会在任何 TCP 动作前检查 Hand 必须报告
+正在抓取；仍使用训练时完整指令 `pick up the vga and insert into the motherboard`，不要
+改成训练中未出现的“只插入”指令。
+
+7 N 保护读取 FR3 的 base-frame `O_F_ext_hat_K` 模型估计值。启动时保持机械臂和 VGA
+静止约 0.5 s，客户端取 15 个样本的中位数作为相对基线；全 0 读数或最大基线波动达到
+阈值的一半会在运动前拒绝启动。执行期间每个 30 Hz 控制 tick 都先检查三轴合力相对基线
+的变化，达到 7 N 时先 `stop_servo()`，再以 0.03 m/s 向 base +Z 退回 0.05 m，然后退出。
+退回目标也必须位于上述 workspace 内。
+
+```bash
+python scripts/fr3_remote_robot_client.py \
+  --server tcp://10.0.40.163:5559 \
+  --robot-ip 172.16.0.2 \
+  --robotlab-path /home/embint/robotLab \
+  --mode arm-only \
+  --allow-motion \
+  --async-inference \
+  --require-initial-grasp \
+  --task "pick up the vga and insert into the motherboard" \
+  --workspace-min 0.496 -0.272 0.1246 \
+  --workspace-max 0.633 0.126 0.5246 \
+  --force-stop-n 7 \
+  --force-baseline-samples 15 \
+  --force-retreat-m 0.05 \
+  --force-retreat-speed-m-s 0.03 \
+  --execute-steps 30 \
+  --max-cycles 30 \
+  --max-action-age-s 1.5 \
+  --max-translation-m 0.001 \
+  --max-rotation-rad 0.005 \
+  --log /tmp/fr3_stage2.jsonl
+```
+
+这是保守的 host-side 保护，不是 1 kHz 硬实时碰撞保护：30 Hz 检查、状态缓存延迟和
+`O_F_ext_hat_K` 的模型误差都会带来触发误差，运动/姿态变化也可能造成安全侧的误触发。
+首次运行必须有人守在急停旁；看到 `Force guard calibrated` 后才会进入首次推理和动作。
+首次第二段测试使用有限的 `--max-cycles 30`，因为当前模型没有独立的任务完成信号；不要
+在尚未验证轨迹时使用无限运行的 `--max-cycles 0`。`arm-only` 也不会最终松开 VGA，本轮只
+验证搬运和插入方向；轨迹确认后再单独开放模型的夹爪动作。
 
 ## GPU server 启动参考
 
