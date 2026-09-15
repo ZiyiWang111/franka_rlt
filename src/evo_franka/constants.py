@@ -236,6 +236,9 @@ EXCURSION_FK_SAMPLES = 12  # FK samples per leg for the move-excursion diagnosti
 DEFAULT_TOOL_SPEED_M_S = 0.1  # waypoints without an explicit speed
 DEFAULT_MAX_ANGULAR_VEL_RAD_S = 0.4
 MIN_SEGMENT_TIME_S = 0.02  # below this no minimum_time is sent
+# Keep the final joint target active briefly after Ruckig reaches zero velocity.
+# This lets residual motion settle before the motion controller releases control.
+FINAL_WAYPOINT_HOLD_MS = 200
 
 # --- Segment pacing floor (move_tool_traj / move_until_force) -------------------
 # The lower floor that keeps the per-segment minimum-time math well-defined (named

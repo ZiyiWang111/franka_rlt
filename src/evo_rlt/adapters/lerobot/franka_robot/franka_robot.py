@@ -73,13 +73,17 @@ class FrankaRobot(Robot):
         self.camera_cfg.enable_stream(
             rs.stream.color, 640, 480, rs.format.rgb8, 30
         )
-        # Second camera: capture the full 1920x1080 field of view, then resize
-        # the whole image to 640x480 in get_observation (no center crop).
+        # The front stream resolution is configurable. Existing users keep the
+        # 1920x1080 default; ACT-RLT requests native 640x480 capture.
         self.front_camera = rs.pipeline()
         self.front_camera_cfg = rs.config()
         self.front_camera_cfg.enable_device(config.front_camera_serial)
         self.front_camera_cfg.enable_stream(
-            rs.stream.color, 1920, 1080, rs.format.rgb8, 30
+            rs.stream.color,
+            config.front_camera_width,
+            config.front_camera_height,
+            rs.format.rgb8,
+            30,
         )
         # Collection-health bookkeeping (see CAM_FRAME_TIMEOUT_MS / .camera_frame_ages)
         self._cam_streams = {"wrist": self.camera, "front": self.front_camera}
@@ -237,10 +241,14 @@ class FrankaRobot(Robot):
 
         front_frames = self._read_camera_frame("front")
         front_full = np.asanyarray(front_frames.get_color_frame().get_data())
-        # Preserve the complete field of view. This changes the 16:9 source to
-        # the dataset's existing 4:3 tensor shape, so the image is geometrically
-        # stretched rather than cropped.
-        front = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
+        if front_full.shape[:2] == (480, 640):
+            # ACT-RLT uses this path: the sensor already produced the dataset
+            # shape, so preserve the pixels without resize or crop.
+            front = front_full
+        else:
+            # Backwards-compatible path for the existing 1920x1080 stream:
+            # preserve the full view while resizing it to the 4:3 tensor.
+            front = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
 
         return {
             **{f"joint_{i}": float(q[i]) for i in range(7)},

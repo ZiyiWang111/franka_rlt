@@ -57,15 +57,12 @@ _INLINE = {"connect", "disconnect", "wait_until_ready"}
 _INTERRUPT = {"stop_move", "stop_servo", "stop_joints", "stop_tool",
               "stop_gripper", "recover", "reset_session"}
 _BLOCKING = _MOVES | _INLINE          # set busy + reply {accepted}; client polls
-# The TRAJECTORY move runs DURING data recording (collection forward/backward), so
-# its state-staleness is what corrupts the dataset -- route it SINGLE-THREADED
-# on the controller thread (issue async, poll is_running() inline) so the
-# interleaved state reads stay fresh. It is clean (branch-continuous IK
-# + _warn_and_recover run BEFORE the motion; no reflex-robust/limit-restore to
-# lose). Point-to-point move_joint/move_tool (homing/lift BETWEEN episodes, not
-# during recording) and move_until_force/impedance keep the legacy helper path,
-# preserving their reflex-robust retry + limit-restore -- their staleness is
-# harmless because nothing is recording then.
+# Trajectory moves run DURING data recording, so route them SINGLE-THREADED on
+# the controller thread (issue async, poll is_running() inline, then
+# finish_move/join) so state reads stay fresh and completion is truthful.
+# A caller may also explicitly request ``move_tool(..., is_async=True)``; it
+# needs the same tracked lifecycle. Blocking point-to-point moves keep the
+# legacy helper path used between episodes.
 _ASYNC_MOVES = {"move_tool_traj"}
 _MOVE_ENGAGE_GRACE_S = 0.20           # after issuing async, allow is_running() to come True
 _HEALTH_LOG_EVERY = 500               # state-loop cycles between health samples (~5 s @ 100 Hz)
@@ -308,9 +305,10 @@ class ControlServer:
 
     def _process(self, cmd: _Cmd):
         name = cmd.name
+        requested_async = bool(((cmd.params or {}).get("kwargs") or {}).get("is_async"))
         if name in _INLINE:
             self._run_inline(cmd)
-        elif name in _ASYNC_MOVES:
+        elif name in _ASYNC_MOVES or (name == "move_tool" and requested_async):
             self._start_move(cmd)              # single-threaded: issue async, poll inline
         elif name in _MOVES:
             self._spawn_move(cmd)              # legacy helper path: move_until_force/impedance

@@ -53,6 +53,7 @@ from evo_franka.constants import (
     DEFAULT_MAX_ANGULAR_VEL_RAD_S,
     DEFAULT_TOOL_SPEED_M_S,
     EXCURSION_FK_SAMPLES,
+    FINAL_WAYPOINT_HOLD_MS,
     FR3_MIN_RATED_JOINT_ACCEL_RAD_S2,
     GUARD_FORCE_THRESHOLD_N,
     IMPEDANCE_ROTATIONAL_STIFFNESS,
@@ -633,6 +634,8 @@ class MotionMixin:
             kwargs = {}
             if min_time_s > MIN_SEGMENT_TIME_S:
                 kwargs["minimum_time"] = Duration(int(math.ceil(min_time_s * 1000.0)))
+            if i + 1 == len(legs):
+                kwargs["hold_target_duration"] = Duration(FINAL_WAYPOINT_HOLD_MS)
             state = JointState(q.tolist())
             if blend > 0.0 and i + 1 < len(legs):   # intermediate + marked: pass through
                 v = self._passthrough_velocity(q, legs[i + 1][0], legs[i + 1][1], v_lim)

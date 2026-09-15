@@ -9,8 +9,12 @@ class FrankaRobotConfig(RobotConfig):
     robot_ip: str = "172.16.0.2"
     # wrist camera (640x480 native stream)
     camera_serial: str = "349622072679"
-    # Second camera: captured at 1920x1080, then full-frame resized to 640x480.
+    # Second camera. Existing pipelines retain the 1920x1080 default and resize
+    # to the dataset's 640x480 tensor; ACT-RLT overrides these to 640x480 so the
+    # sensor output is stored directly without geometric resizing.
     front_camera_serial: str = "233522075778"
+    front_camera_width: int = 1920
+    front_camera_height: int = 1080
     # New manual-demo datasets include the next measured gripper width as the
     # seventh action. Set false only when resuming a legacy 6D dataset.
     include_gripper_action: bool = True

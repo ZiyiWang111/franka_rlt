@@ -13,6 +13,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wrist-serial", required=True)
     parser.add_argument("--front-serial", required=True)
+    parser.add_argument("--wrist-width", type=int, default=640)
+    parser.add_argument("--wrist-height", type=int, default=480)
+    parser.add_argument("--front-width", type=int, default=1920)
+    parser.add_argument("--front-height", type=int, default=1080)
     parser.add_argument("--frames", type=int, default=5)
     parser.add_argument("--timeout-ms", type=int, default=5000)
     return parser
@@ -23,8 +27,14 @@ def main() -> int:
     if args.wrist_serial == args.front_serial:
         print("ERROR: wrist and front camera serials must be different", file=sys.stderr)
         return 2
-    if args.frames < 1 or args.timeout_ms < 1:
-        print("ERROR: --frames and --timeout-ms must be positive", file=sys.stderr)
+    dimensions = (
+        args.wrist_width,
+        args.wrist_height,
+        args.front_width,
+        args.front_height,
+    )
+    if args.frames < 1 or args.timeout_ms < 1 or any(value < 1 for value in dimensions):
+        print("ERROR: frame count, timeout and camera dimensions must be positive", file=sys.stderr)
         return 2
 
     detected = {
@@ -48,8 +58,8 @@ def main() -> int:
         return 1
 
     streams = (
-        ("wrist", args.wrist_serial, 640, 480),
-        ("front", args.front_serial, 1920, 1080),
+        ("wrist", args.wrist_serial, args.wrist_width, args.wrist_height),
+        ("front", args.front_serial, args.front_width, args.front_height),
     )
     running: list[tuple[str, rs.pipeline]] = []
     try:
@@ -77,9 +87,14 @@ def main() -> int:
                     f"{name} camera returned {actual_width}x{actual_height}, expected {width}x{height}"
                 )
             if name == "front":
+                processing = (
+                    "native, no resize/crop"
+                    if (actual_width, actual_height) == (640, 480)
+                    else "full-frame resize, no crop"
+                )
                 print(
                     f"camera OK: front native={actual_width}x{actual_height} frame={frame_number} "
-                    "-> recorder output=640x480 (full-frame resize, no crop)"
+                    f"-> recorder output=640x480 ({processing})"
                 )
             else:
                 print(

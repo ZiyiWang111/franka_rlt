@@ -232,6 +232,70 @@ def test_connect_and_state_stream():
         _teardown(srv, cli, th)
 
 
+def test_explicit_async_move_tool_uses_managed_completion_path():
+    """Async move_tool must be polled/joined, while blocking move_tool keeps its helper."""
+    srv = cs.ControlServer.__new__(cs.ControlServer)
+    routed = []
+    srv._start_move = lambda cmd: routed.append(("managed", cmd.name))
+    srv._spawn_move = lambda cmd: routed.append(("helper", cmd.name))
+
+    srv._process(cs._Cmd("move_tool", {"kwargs": {"is_async": True}}))
+    srv._process(cs._Cmd("move_tool", {"kwargs": {}}))
+    srv._process(cs._Cmd("move_tool_traj", {"kwargs": {}}))
+
+    assert routed == [
+        ("managed", "move_tool"),
+        ("helper", "move_tool"),
+        ("managed", "move_tool_traj"),
+    ]
+
+
+def test_managed_async_move_stays_busy_until_finish_move_joins():
+    class TrackedController:
+        def __init__(self):
+            self.running = True
+            self.issued = []
+            self.finish_calls = 0
+
+        def move_tool_traj(self, path, *, is_async):
+            self.issued.append((path, is_async))
+
+        def check_move_hang(self):
+            return None
+
+        def is_running(self):
+            return self.running
+
+        def finish_move(self):
+            self.finish_calls += 1
+            return True
+
+    srv = cs.ControlServer.__new__(cs.ControlServer)
+    srv._ctrl = TrackedController()
+    srv._servo_active = False
+    srv._move_active = None
+    srv._move_t0 = 0.0
+    srv._worker_result = None
+    srv._busy = True
+    srv._fault_detail = lambda: "test"
+    cmd = cs._Cmd("move_tool_traj", {"args": [[[0.1] * 9]], "kwargs": {}})
+
+    srv._start_move(cmd)
+    assert srv._busy and srv._move_active is cmd
+    assert srv._ctrl.issued == [([[0.1] * 9], True)]
+
+    srv._move_t0 = time.monotonic() - cs._MOVE_ENGAGE_GRACE_S - 0.01
+    srv._poll_active_move()
+    assert srv._busy and srv._ctrl.finish_calls == 0
+
+    srv._ctrl.running = False
+    srv._poll_active_move()
+    assert not srv._busy
+    assert srv._move_active is None
+    assert srv._ctrl.finish_calls == 1
+    assert srv._worker_result["success"] is True
+
+
 def test_blocking_move_returns_value():
     """A blocking move returns the controller's reached pose across the IPC."""
     srv, cli, th = _setup()

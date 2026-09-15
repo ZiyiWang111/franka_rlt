@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from evo_rlt.cli.review_manual_demo import analyze_dataframe
+import evo_rlt.cli.review_manual_demo as review_module
+from evo_rlt.cli.review_manual_demo import (
+    DEFAULT_DATASET_ROOT,
+    _parser,
+    _review_from_tail,
+    analyze_dataframe,
+)
 
 
 STATE_NAMES = ["ee_x", "ee_y", "ee_z", "gripper_grasped"]
@@ -48,3 +54,49 @@ def test_analyzer_flags_frozen_episode_but_not_complete_pick() -> None:
     assert "path<0.1m" in candidates[0].reasons
     assert "static_tail>=2s" in candidates[0].reasons
     assert "incomplete_pick/post_grasp<0.25m" in candidates[0].reasons
+
+
+def test_parser_defaults_to_act_rlt_001_latest_episode() -> None:
+    args = _parser().parse_args([])
+
+    assert args.root == DEFAULT_DATASET_ROOT
+    assert args.repo_id is None
+    assert args.episode_index is None
+    assert not args.suspicious_only
+
+
+def test_tail_review_descends_and_deletes_only_yes(monkeypatch, tmp_path) -> None:
+    state = {"total": 3}
+    visualized = []
+    deleted = []
+    answers = iter(["y", "n", "q"])
+
+    def fake_load_dataset(root):
+        total = state["total"]
+        frame = pd.DataFrame(
+            {
+                "episode_index": np.arange(total),
+                "timestamp": np.zeros(total),
+            }
+        )
+        return {"total_episodes": total, "fps": 15}, frame, b"snapshot"
+
+    def fake_delete(repo_id, root, rejected, output_root, snapshot, *, preserve_backup):
+        deleted.extend(rejected)
+        state["total"] -= 1
+        assert not preserve_backup
+        return root
+
+    monkeypatch.setattr(review_module, "_load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        review_module,
+        "_visualize_episode",
+        lambda episode_index, **kwargs: visualized.append(episode_index),
+    )
+    monkeypatch.setattr(review_module, "_apply_deletions", fake_delete)
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    _review_from_tail(repo_id="act_rlt_001", root=tmp_path, viz_command="viz")
+
+    assert visualized == [2, 1, 0]
+    assert deleted == [2]

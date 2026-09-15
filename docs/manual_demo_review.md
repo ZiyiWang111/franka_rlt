@@ -1,10 +1,23 @@
-# Review and remove suspicious manual-demo episodes
+# Review and remove manual-demo episodes
 
-`evo-rlt-review-manual-demo` scans a local LeRobot v3 dataset for episodes
-that are static, freeze at the end, stop far from the dominant task endpoint,
-or do not complete a pick-and-transport sequence. Candidates are reviewed one
-at a time with `lerobot-dataset-viz`; no episode is removed without a `y`
-answer and a final confirmation.
+With no arguments, `evo-rlt-review-manual-demo` opens the last episode in
+`datasets/act_rlt_001`. Close the viewer and answer `y` to delete it, `n` to
+keep it, or `q` to exit. After `y` or `n`, the tool opens the preceding episode
+and continues toward episode 0. Each `y` deletion is applied immediately.
+
+```bash
+evo-rlt-review-manual-demo
+```
+
+Use `--root` for another local dataset. `--repo-id` defaults to the dataset
+directory name:
+
+```bash
+evo-rlt-review-manual-demo --root /path/to/datasets/another_dataset
+```
+
+The optional suspicious scanner flags episodes that are static, freeze at the
+end, stop far from the dominant endpoint, or do not complete a pick sequence.
 
 Do not run the tool while the recorder is active. It refuses to continue when
 it sees an incomplete parquet file or detects that `meta/info.json` changed.
@@ -38,6 +51,7 @@ evo-rlt-review-manual-demo \
 evo-rlt-review-manual-demo \
   --repo-id embint/franka_stage1_initial \
   --root /home/embint/Evo-RLT/datasets/franka_stage1_initial \
+  --suspicious-only \
   --require-pick-sequence
 ```
 

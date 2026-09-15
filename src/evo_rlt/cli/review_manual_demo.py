@@ -1,9 +1,9 @@
-"""Find and interactively remove suspicious manual-demo episodes.
+"""Review and interactively remove local LeRobot dataset episodes.
 
-The scanner is intentionally high-recall: every flagged episode is shown with
-``lerobot-dataset-viz`` and is only removed after an explicit human decision.
-Deletion is performed once, after the review, because LeRobot must re-index the
-remaining episodes and re-encode/repack their videos.
+By default, the latest episode is shown with ``lerobot-dataset-viz``. After an
+explicit keep/delete decision, review continues toward older episodes until the
+operator quits. The original suspicious-episode scanner remains available as
+an optional mode.
 """
 from __future__ import annotations
 
@@ -20,6 +20,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+DEFAULT_DATASET_ROOT = Path(__file__).resolve().parents[3] / "datasets" / "act_rlt_001"
 
 
 @dataclass(frozen=True)
@@ -241,6 +244,30 @@ def _review_candidates(
     return rejected
 
 
+def _visualize_episode(
+    episode_index: int,
+    *,
+    repo_id: str,
+    root: Path,
+    viz_command: str,
+) -> None:
+    command = [
+        viz_command,
+        "--repo-id",
+        repo_id,
+        "--root",
+        str(root),
+        "--episode-index",
+        str(episode_index),
+        "--mode",
+        "local",
+    ]
+    print("Running: " + " ".join(command))
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        print(f"WARNING: visualizer exited with status {result.returncode}.")
+
+
 def _resolve_executable(command: str) -> str:
     resolved = shutil.which(command)
     if resolved is not None:
@@ -276,6 +303,8 @@ def _apply_deletions(
     rejected: list[int],
     output_root: Path | None,
     source_info_snapshot: bytes,
+    *,
+    preserve_backup: bool = True,
 ) -> Path:
     info_path = root / "meta" / "info.json"
     if info_path.read_bytes() != source_info_snapshot:
@@ -283,7 +312,7 @@ def _apply_deletions(
     total_episodes = int(json.loads(source_info_snapshot)["total_episodes"])
     if len(set(rejected)) >= total_episodes:
         raise ValueError("Refusing to remove every episode from the dataset")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     final_root = output_root if output_root is not None else root
     staging = final_root.with_name(f".{final_root.name}.filtering-{timestamp}-{os.getpid()}")
     if final_root != root and final_root.exists():
@@ -321,15 +350,110 @@ def _apply_deletions(
     except Exception:
         backup.rename(root)
         raise
-    print(f"Original dataset preserved at: {backup}")
+    if preserve_backup:
+        print(f"Original dataset preserved at: {backup}")
+    else:
+        shutil.rmtree(backup)
     return root
+
+
+def _review_from_tail(
+    *,
+    repo_id: str,
+    root: Path,
+    viz_command: str,
+    start_episode: int | None = None,
+) -> None:
+    """Review newest-to-oldest and apply each confirmed deletion immediately."""
+    cursor = start_episode
+    while True:
+        info, df, source_info_snapshot = _load_dataset(root)
+        total_episodes = int(info["total_episodes"])
+        if total_episodes <= 0:
+            print("Dataset has no episodes.")
+            return
+        if cursor is None:
+            cursor = total_episodes - 1
+        if cursor >= total_episodes:
+            raise ValueError(
+                f"Episode {cursor} does not exist; valid range is 0..{total_episodes - 1}"
+            )
+        if cursor < 0:
+            print("Reached the first episode; review complete.")
+            return
+
+        episode = df[df["episode_index"] == cursor]
+        if episode.empty:
+            raise RuntimeError(f"Episode {cursor} is missing from dataset parquet files")
+        duration = (
+            float(episode["timestamp"].max())
+            if "timestamp" in episode
+            else len(episode) / float(info["fps"])
+        )
+        print(
+            f"\n--- Episode {cursor} / {total_episodes - 1} ---\n"
+            f"frames={len(episode)}, duration={duration:.2f}s"
+        )
+        _visualize_episode(
+            cursor,
+            repo_id=repo_id,
+            root=root,
+            viz_command=viz_command,
+        )
+
+        while True:
+            answer = input(
+                "关闭可视化后，是否删除这个 episode？ "
+                "[y=删除并查看上一条 / n=保留并查看上一条 / q=退出] "
+            ).strip().lower()
+            if answer in {"y", "yes"}:
+                if total_episodes == 1:
+                    print("不能删除数据集中的唯一一条 episode；请选择 n 或 q。")
+                    continue
+                _apply_deletions(
+                    repo_id,
+                    root,
+                    [cursor],
+                    None,
+                    source_info_snapshot,
+                    preserve_backup=False,
+                )
+                print(f"Episode {cursor} deleted.")
+                cursor -= 1
+                break
+            if answer in {"n", "no", ""}:
+                print(f"Episode {cursor} kept.")
+                cursor -= 1
+                break
+            if answer in {"q", "quit"}:
+                print("Review stopped.")
+                return
+            print("请输入 y、n 或 q。")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-id", required=True, help="Dataset id passed to lerobot-dataset-viz")
-    parser.add_argument("--root", required=True, type=Path, help="Exact local dataset directory")
+    parser.add_argument(
+        "--repo-id",
+        help="Dataset id passed to lerobot-dataset-viz (default: dataset directory name)",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=DEFAULT_DATASET_ROOT,
+        help=f"Exact local dataset directory (default: {DEFAULT_DATASET_ROOT})",
+    )
     parser.add_argument("--viz-command", default="lerobot-dataset-viz")
+    parser.add_argument(
+        "--episode-index",
+        type=int,
+        help="First episode for descending review (default: latest episode)",
+    )
+    parser.add_argument(
+        "--suspicious-only",
+        action="store_true",
+        help="Use the original suspicious-episode review instead of descending review",
+    )
     parser.add_argument(
         "--scan-only", action="store_true", help="Print candidates without visualization/deletion"
     )
@@ -348,7 +472,19 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     root = args.root.expanduser().resolve()
+    repo_id = args.repo_id or root.name
     try:
+        if not args.suspicious_only and not args.scan_only:
+            if args.output_root is not None:
+                raise ValueError("--output-root requires --suspicious-only or --scan-only")
+            _review_from_tail(
+                repo_id=repo_id,
+                root=root,
+                viz_command=_resolve_executable(args.viz_command),
+                start_episode=args.episode_index,
+            )
+            return
+
         info, df, source_info_snapshot = _load_dataset(root)
         state_names = list(info["features"]["observation.state"]["names"])
         fps = float(info["fps"])
@@ -378,7 +514,7 @@ def main() -> None:
             return
         viz_command = _resolve_executable(args.viz_command)
         rejected = _review_candidates(
-            candidates, repo_id=args.repo_id, root=root, fps=fps, viz_command=viz_command
+            candidates, repo_id=repo_id, root=root, fps=fps, viz_command=viz_command
         )
         if rejected is None:
             print("Review aborted; dataset was not modified.")
@@ -392,7 +528,7 @@ def main() -> None:
             print("Cancelled; dataset was not modified.")
             return
         destination = _apply_deletions(
-            args.repo_id, root, rejected, args.output_root, source_info_snapshot
+            repo_id, root, rejected, args.output_root, source_info_snapshot
         )
         print(f"Done. Filtered dataset: {destination}")
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
