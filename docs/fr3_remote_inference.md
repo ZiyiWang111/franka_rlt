@@ -20,15 +20,22 @@ finite values.
 
 ## Install
 
-Install the repository on both machines:
+Install the inference dependencies on the GPU server:
 
 ```bash
 pip install -e '.[lerobot]'
 ```
 
-The robot host additionally needs its existing `pyrealsense2` and robotLab
-environment. The GPU server needs the final checkpoint and PaliGemma tokenizer
-cache; the robot host does not.
+Install the vendored Franka backend as well on the robot host:
+
+```bash
+pip install -e '.[lerobot,franka]'
+```
+
+The robot host additionally needs its existing `pyrealsense2` and RealSense
+system setup. It no longer needs a RobotLab checkout or `ROBOTLAB_PATH`. The GPU
+server needs the final checkpoint and PaliGemma tokenizer cache; the robot host
+does not.
 
 ## 1. Start the GPU inference server
 
@@ -54,7 +61,25 @@ python scripts/fr3_remote_robot_client.py \
 
 This exits before importing any Franka or RealSense module.
 
-## 3. Run live shadow inference
+## 3. Start Evo-RLT's Franka control server
+
+In a dedicated robot-host terminal, start the copied controller. This process
+owns franky/libfranka and the FCI session:
+
+```bash
+evo-franka-control-server --ip 172.16.0.2
+```
+
+Wait for it to connect, then verify the local IPC path from another terminal:
+
+```bash
+python -m evo_franka.control_client --ping
+```
+
+The expected result is `PONG`. Keep the control-server terminal running while
+using the remote client.
+
+## 4. Run live shadow inference
 
 The default is one cycle. It connects to the hardware and reads live inputs,
 but does not call `send_action`, `open_gripper`, or `close_gripper`. It also
@@ -81,9 +106,11 @@ arm-only      execute clipped TCP deltas and ignore gripper predictions
 integrated    execute both with arm hold and replanning at gripper transitions
 ```
 
-Initial integrated settings execute at most five of the 50 predicted steps,
-limit each translation vector to 5 mm and rotation vector to 0.03 rad, then
-request a fresh observation and action chunk. These limits are configurable.
+The vanilla loop synchronously predicts a chunk, executes the first eight rows
+in order at 15 Hz, then requests a fresh observation and chunk. It does not use
+async prefetch, time skipping, chunk blending, low-pass filtering, or
+acceleration shaping. Each translation vector still has a 5 mm hard bound and
+each rotation vector a 0.03 rad hard bound; these safety bounds are configurable.
 `arm-only` and `integrated` additionally require explicit base-frame bounds:
 
 ```text
@@ -100,5 +127,8 @@ The gripper action is an absolute target width in metres. Predictions at or
 below 0.040 m request close, predictions at or above 0.055 m request open, and
 the dead band preserves the current state. A transition requires two
 consecutive predictions. The arm is held from the first transition candidate;
-after the blocking gripper RPC, the remaining chunk is discarded and the TCP
-target is resynchronized before replanning.
+the confirmed command starts a native Franky Hand Future and returns immediately.
+While that Future runs, camera/robot observations and inference continue, but all
+resulting action chunks are discarded and the arm stays stopped. Width/grasped are
+explicitly last-known values during this interval. After completion, the TCP target
+is resynchronized and the first fresh observation is replanned before arm motion resumes.

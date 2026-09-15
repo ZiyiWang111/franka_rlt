@@ -4,7 +4,6 @@ from .execution import (
     GripperDecision,
     GripperStateMachine,
     RelativeForceGuard,
-    TcpActionFilter,
     clip_tcp_action,
 )
 from .protocol import ACTION_NAMES, CAMERA_NAMES, STATE_NAMES, PROTOCOL_VERSION
@@ -18,7 +17,6 @@ __all__ = [
     "PROTOCOL_VERSION",
     "RelativeForceGuard",
     "STATE_NAMES",
-    "TcpActionFilter",
     "clip_tcp_action",
     "observation_to_state15",
 ]

@@ -33,10 +33,14 @@ exec /workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python \
   --policy.dtype=bfloat16 \
   --policy.push_to_hub=false \
   --policy.input_features=null \
-  --batch_size=4 \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
+  --policy.optimizer_lr=5e-5 \
+  --policy.scheduler_decay_lr=5e-6 \
+  --batch_size=16 \
   --steps=30000 \
   --save_freq=5000 \
   --eval_freq=0 \
   --tolerance_s=0.04 \
-  --output_dir=/workspace/wangziyi/projects/franka_rlt/outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k \
-  --job_name=fr3_pi05_sft_60ep_state15_action7_bs4_30k
+  --output_dir=/workspace/wangziyi/projects/franka_rlt/outputs/fr3_pi05_sft_60ep_state15_action7_bs16_chunk10_lr2x_30k \
+  --job_name=fr3_pi05_sft_60ep_state15_action7_bs16_chunk10_lr2x_30k

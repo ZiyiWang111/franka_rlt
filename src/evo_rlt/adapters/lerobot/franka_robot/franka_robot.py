@@ -1,12 +1,11 @@
 import logging
-import os
-import sys
 import threading
 import time
 from pathlib import Path
 
 import pyrealsense2 as rs
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 from lerobot.robots.robot import Robot
@@ -22,9 +21,9 @@ CAM_WARMUP_TIMEOUT_MS = 5000
 CAM_WARMUP_FRAMES = 10
 
 # FCI session-lease renewal cadence. On firmware 5.9.0 a Franka FCI session with
-# no active control loop is terminated after ~55 s; the robotLab control server's
+# no active control loop is terminated after ~55 s; the Evo-RLT control server's
 # idle loop only *reads* state, and state reads do NOT renew the lease (only
-# control commands do). robotLab is out of our hands, so Evo-RLT renews it from
+# control commands do). Evo-RLT renews it from
 # here: a background thread sends one fire-and-forget servo_joint to the *current*
 # joint position this often while the arm is Idle, so the 1 kHz loop runs a few ms
 # and resets the lease. (Validated 2026-09-07: single ticks every 20 s survived
@@ -34,7 +33,7 @@ CAM_WARMUP_FRAMES = 10
 FCI_KEEPALIVE_INTERVAL_S = 20.0
 
 # A Hand command is rejected while the arm still owns the FCI motion channel.
-# stop_servo() is synchronous on the robotLab control client, but its PUSH state
+# stop_servo() is synchronous on the Evo-RLT control client, but its PUSH state
 # cache can trail the stop response by one controller cycle.  Bound the cache
 # confirmation instead of relying on the server's 0.3 s servo-gap watchdog.
 GRIPPER_ARM_IDLE_TIMEOUT_S = 2.0
@@ -60,16 +59,7 @@ class FrankaRobot(Robot):
     def __init__(self, config: FrankaRobotConfig):
         super().__init__(config)
         self.config = config
-        robotlab_path = os.environ.get("ROBOTLAB_PATH", config.robotlab_path)
-        if robotlab_path not in sys.path:
-            sys.path.insert(0, robotlab_path)
-        try:
-            from robots.franka.control_client import FrankaArmControllerClient
-        except ImportError as exc:
-            raise ImportError(
-                f"Cannot import robotLab Franka client from {robotlab_path!r}; "
-                "set --robotlab-path or ROBOTLAB_PATH on the robot host"
-            ) from exc
+        from evo_franka.control_client import FrankaArmControllerClient
         self.robot = FrankaArmControllerClient(config.robot_ip)
         self._connected = False
         self._cmd_pose = None
@@ -83,8 +73,8 @@ class FrankaRobot(Robot):
         self.camera_cfg.enable_stream(
             rs.stream.color, 640, 480, rs.format.rgb8, 30
         )
-        # second camera: max resolution (1920x1080), center-cropped to 640x480
-        # in get_observation (pure crop, no resize/interpolation)
+        # Second camera: capture the full 1920x1080 field of view, then resize
+        # the whole image to 640x480 in get_observation (no center crop).
         self.front_camera = rs.pipeline()
         self.front_camera_cfg = rs.config()
         self.front_camera_cfg.enable_device(config.front_camera_serial)
@@ -164,6 +154,13 @@ class FrankaRobot(Robot):
 
     def disconnect(self):
         self._stop_keepalive()
+        try:
+            if self._has_gripper:
+                motion = self.robot.get_gripper_motion_state()
+                if motion.get("status") == "running":
+                    self.robot.stop_gripper()
+        except Exception:
+            logging.exception("failed to stop asynchronous gripper motion during disconnect")
         for pipeline in (self.camera, self.front_camera):
             try:
                 pipeline.stop()
@@ -223,8 +220,9 @@ class FrankaRobot(Robot):
         dq = self.robot.get_joint_speeds()
         pose = self.robot.get_tool_pose()
 
-        # Gripper state is a control-server RPC (not in the 30 Hz snapshot);
-        # query once whether a Hand is attached, then only per frame when it is.
+        # Query once whether a Hand is attached. Width/grasped then come from the
+        # control-server PUSH snapshot, so a native async Hand command cannot
+        # block observation; values are last-known while the command is running.
         if self._has_gripper is None:
             self._has_gripper = self.robot.has_gripper()
         if self._has_gripper:
@@ -239,10 +237,10 @@ class FrankaRobot(Robot):
 
         front_frames = self._read_camera_frame("front")
         front_full = np.asanyarray(front_frames.get_color_frame().get_data())
-        # max resolution (1920x1080) -> center crop 640x480, no resize
-        y0 = (front_full.shape[0] - 480) // 2
-        x0 = (front_full.shape[1] - 640) // 2
-        front = front_full[y0 : y0 + 480, x0 : x0 + 640]
+        # Preserve the complete field of view. This changes the 16:9 source to
+        # the dataset's existing 4:3 tensor shape, so the image is geometrically
+        # stretched rather than cropped.
+        front = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
 
         return {
             **{f"joint_{i}": float(q[i]) for i in range(7)},
@@ -285,12 +283,11 @@ class FrankaRobot(Robot):
         }
 
     def probe(self) -> dict:
-        """Cheap control-server liveness probe (robotLab ZMQ ``ping``).
+        """Cheap control-server liveness probe (Evo-RLT ZMQ ``ping``).
 
         Returns ``{"ok", "error", "ms"}`` and never raises. A dead/unreachable
-        server is only confirmed after the robotLab client's command-socket
-        RCVTIMEO (10 s by default), so detection latency for a hard drop is
-        ~10 s -- the same bound the per-frame gripper RPCs already have.
+        server is only confirmed after the Evo-RLT client's command-socket
+        RCVTIMEO (10 s by default), so detection latency for a hard drop is ~10 s.
         """
         t0 = time.perf_counter()
         try:
@@ -311,24 +308,27 @@ class FrankaRobot(Robot):
     # recording thread (see record.loop.process_gripper_key_events), never from
     # the keyboard-listener thread: the client socket is single-threaded.
     def open_gripper(self):
-        """Open the Franka Hand fully (blocking RPC). robotLab defaults apply."""
+        """Open the Franka Hand fully (blocking RPC). Backend defaults apply."""
         return self.robot.open_gripper()
 
-    def close_gripper(self, width: float | None = None):
-        """Force-controlled grasp (blocking RPC). robotLab defaults apply
+    def close_gripper(self, width: float | None = None, force: float | None = None):
+        """Force-controlled grasp (blocking RPC). Backend defaults apply
         (~40 N). When a policy supplies an absolute target width, preserve it
         so an empty close is not mistaken for a successful grasp at width 0."""
-        if width is None:
-            return bool(self.robot.close_gripper())
-        return bool(self.robot.close_gripper(width=float(width)))
+        kwargs = {}
+        if width is not None:
+            kwargs["width"] = float(width)
+        if force is not None:
+            kwargs["force"] = float(force)
+        return bool(self.robot.close_gripper(**kwargs))
 
     def prepare_gripper_transition(self) -> None:
-        """End arm servo ownership before issuing a blocking Hand command.
+        """End arm servo ownership before starting an asynchronous Hand command.
 
-        robotLab deliberately refuses gripper actuation while ``is_running()``
-        is true.  Merely omitting one or two 30 Hz targets is insufficient: its
+        Evo-RLT deliberately refuses gripper actuation while ``is_running()``
+        is true. Merely omitting one or two 30 Hz targets is insufficient: its
         fallback servo-gap watchdog waits 0.3 s.  Explicitly stop the stream and
-        wait for the same state predicate used by robotLab's gripper guard.
+        wait for the same state predicate used by Evo-RLT's gripper guard.
         """
         self._stop_keepalive()
         try:
@@ -348,10 +348,37 @@ class FrankaRobot(Robot):
             raise
 
     def finish_gripper_transition(self) -> None:
-        """Restore idle-session renewal after the blocking Hand command."""
+        """Restore idle-session renewal after the async Hand Future completes."""
         self._cmd_pose = None
         if self._connected and self.config.enable_fci_keepalive:
             self._start_keepalive()
+
+    def start_gripper_transition(
+        self,
+        command: str,
+        width: float | None = None,
+        force: float | None = None,
+    ) -> dict:
+        """Stop the arm, start one native-Franky async Hand command, and return."""
+        self.prepare_gripper_transition()
+        try:
+            if command == "close":
+                if width is None:
+                    raise ValueError("an asynchronous close requires a target width")
+                kwargs = {"width": float(width)}
+                if force is not None:
+                    kwargs["force"] = float(force)
+                return self.robot.start_close_gripper(**kwargs)
+            if command == "open":
+                return self.robot.start_open_gripper()
+            raise ValueError(f"unsupported gripper transition: {command}")
+        except BaseException:
+            self.finish_gripper_transition()
+            raise
+
+    def get_gripper_transition_state(self) -> dict:
+        """Return the cached, non-blocking Hand Future state from the state stream."""
+        return self.robot.get_gripper_motion_state()
 
     def get_external_wrench_base(self) -> np.ndarray:
         """Return cached raw base-frame external wrench without a control RPC."""

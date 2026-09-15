@@ -1,7 +1,4 @@
-import io
-import json
-import time
-from types import SimpleNamespace
+import sys
 
 import numpy as np
 import pytest
@@ -9,7 +6,6 @@ import pytest
 from evo_rlt.adapters.lerobot.franka_remote.execution import (
     GripperStateMachine,
     RelativeForceGuard,
-    TcpActionFilter,
     clip_tcp_action,
 )
 from evo_rlt.adapters.lerobot.franka_remote.protocol import (
@@ -24,12 +20,10 @@ from evo_rlt.adapters.lerobot.franka_remote.protocol import (
     encode_ready_response,
 )
 from evo_rlt.adapters.lerobot.franka_remote.state import observation_to_state15
-import scripts.fr3_remote_robot_client as remote_client
 from scripts.fr3_remote_robot_client import (
-    AsyncInferenceResult,
     execute_action_chunk,
+    parse_args,
     require_expected_checkpoint,
-    run_async_control,
 )
 
 
@@ -75,9 +69,19 @@ def test_ready_response_checks_the_full_schema():
 
 
 def test_checkpoint_binding_is_exact():
-    require_expected_checkpoint("/models/030000/pretrained_model", "/models/030000/pretrained_model")
+    require_expected_checkpoint("/models/030000", "/models/030000")
     with pytest.raises(RuntimeError, match="checkpoint mismatch"):
-        require_expected_checkpoint("/models/029000/pretrained_model", "/models/030000/pretrained_model")
+        require_expected_checkpoint("/models/base", "/models/030000")
+
+
+def test_vanilla_defaults_match_openpi_droid_loop(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["fr3_remote_robot_client.py", "--server", "tcp://test"])
+    args = parse_args()
+    assert args.fps == 15.0
+    assert args.execute_steps == 8
+    assert not hasattr(args, "async_inference")
+    assert not hasattr(args, "chunk_blend_steps")
+    assert not hasattr(args, "action_low_pass_alpha")
 
 
 def test_observation_to_state15_drops_joint_velocities_in_the_expected_order():
@@ -106,45 +110,6 @@ def test_tcp_clip_preserves_direction_and_limits_vector_norms():
     assert np.linalg.norm([clipped[name] for name in ACTION_NAMES[3:6]]) <= 0.02000001
 
 
-def test_tcp_action_filter_low_passes_and_limits_acceleration_and_speed():
-    action_filter = TcpActionFilter(
-        fps=30.0,
-        low_pass_alpha=1.0,
-        max_translation_step_m=0.005,
-        max_rotation_step_rad=0.02,
-        max_translation_accel_m_s2=0.30,
-        max_rotation_accel_rad_s2=0.90,
-    )
-    action = np.asarray([0.02, 0, 0, 0.08, 0, 0, 0.076], dtype=np.float32)
-    first = action_filter.update(action)
-    second = action_filter.update(action)
-    assert first["dx"] == pytest.approx(0.30 / 30.0**2)
-    assert second["dx"] == pytest.approx(2.0 * 0.30 / 30.0**2)
-    assert first["drx"] == pytest.approx(0.90 / 30.0**2)
-    assert second["drx"] == pytest.approx(2.0 * 0.90 / 30.0**2)
-    for _ in range(100):
-        output = action_filter.update(action)
-    assert output["dx"] == pytest.approx(0.005)
-    assert output["drx"] == pytest.approx(0.02)
-
-
-def test_tcp_action_filter_reset_restarts_from_zero_velocity():
-    action_filter = TcpActionFilter(
-        fps=30.0,
-        low_pass_alpha=0.2,
-        max_translation_step_m=0.005,
-        max_rotation_step_rad=0.02,
-        max_translation_accel_m_s2=0.30,
-        max_rotation_accel_rad_s2=0.90,
-    )
-    action = np.asarray([0.005, 0, 0, 0, 0, 0, 0.076], dtype=np.float32)
-    first = action_filter.update(action)
-    action_filter.update(action)
-    action_filter.reset()
-    restarted = action_filter.update(action)
-    assert restarted == first
-
-
 def test_relative_force_guard_uses_translational_change_from_baseline():
     guard = RelativeForceGuard(
         baseline_wrench=np.asarray([1.0, -2.0, 3.0, 0.1, 0.2, 0.3]),
@@ -167,6 +132,7 @@ class _FakeRobot:
         self.transition_prepare_count = 0
         self.transition_finish_count = 0
         self.transition_prepared = False
+        self.gripper_motion = None
         self.external_wrench = np.zeros(6, dtype=np.float64)
         self.force_retreats = []
 
@@ -195,355 +161,101 @@ class _FakeRobot:
         self.transition_prepared = False
         self.transition_finish_count += 1
 
+    def start_gripper_transition(self, command, width=None):
+        assert not self.transition_prepared
+        self.transition_prepared = True
+        self.transition_prepare_count += 1
+        self.close_count += command == "close"
+        if command == "close":
+            self.close_widths.append(width)
+        self.gripper_motion = {
+            "command_id": 1, "command": command, "status": "running",
+            "result": None, "width": 0.076, "grasped": False,
+            "measurement_stale": True,
+        }
+        return dict(self.gripper_motion)
+
     def get_external_wrench_base(self):
         return self.external_wrench.copy()
 
     def stop_and_retreat_up(self, *, distance_m, speed_m_s):
         self.force_retreats.append((distance_m, speed_m_s))
-        return {
-            "start_pose": [0.0] * 6,
-            "target_pose": [0.0, 0.0, distance_m, 0.0, 0.0, 0.0],
-            "measured_pose": [0.0, 0.0, distance_m, 0.0, 0.0, 0.0],
-            "distance_m": distance_m,
-            "speed_m_s": speed_m_s,
-        }
+        return {"distance_m": distance_m, "speed_m_s": speed_m_s}
 
 
-def _test_action_filter(*, fps=1e9):
-    return TcpActionFilter(
-        fps=fps,
-        low_pass_alpha=1.0,
-        max_translation_step_m=0.005,
-        max_rotation_step_rad=0.03,
-        max_translation_accel_m_s2=1e20,
-        max_rotation_accel_rad_s2=1e20,
+def test_executor_sends_unfiltered_model_rows_in_order():
+    robot = _FakeRobot()
+    machine = GripperStateMachine(confirm_steps=2)
+    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
+    chunk[:3, 0] = [0.001, -0.002, 0.003]
+    records, replan, force_stopped = execute_action_chunk(
+        robot=robot,
+        chunk=chunk,
+        mode="arm-only",
+        execute_steps=3,
+        fps=1e9,
+        gripper=machine,
+        max_translation_m=0.005,
+        max_rotation_rad=0.03,
     )
+    assert not replan
+    assert not force_stopped
+    assert [action["dx"] for action in robot.arm_actions] == pytest.approx(
+        [0.001, -0.002, 0.003]
+    )
+    assert [record["step"] for record in records] == [0, 1, 2]
 
 
-def test_integrated_executor_freezes_arm_during_gripper_confirmation_and_command():
+def test_integrated_executor_starts_async_gripper_and_leaves_arm_held():
     robot = _FakeRobot()
     machine = GripperStateMachine(confirm_steps=2)
     machine.sync_from_observation(0.076, grasped=False)
     chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
     chunk[:, :6] = 0.003
     chunk[:, 6] = 0.019
-    records, replan = execute_action_chunk(
+    records, replan, force_stopped = execute_action_chunk(
         robot=robot,
         chunk=chunk,
         mode="integrated",
         execute_steps=5,
         fps=1e9,
         gripper=machine,
-        action_filter=_test_action_filter(),
+        max_translation_m=0.005,
+        max_rotation_rad=0.03,
     )
     assert replan
+    assert not force_stopped
     assert robot.arm_actions == []
     assert robot.close_count == 1
     assert robot.close_widths == [pytest.approx(0.019)]
-    assert robot.resync_count == 1
     assert robot.transition_prepare_count == 1
-    assert robot.transition_finish_count == 1
-    assert not robot.transition_prepared
-    assert records[-1]["gripper_command"] == "close"
-    assert records[-1]["arm_servo_stopped"] is True
+    assert robot.transition_finish_count == 0
+    assert robot.resync_count == 0
+    assert records[-1]["gripper_command_started"] == "close"
+    assert records[-1]["gripper_motion"]["status"] == "running"
+    # Completion is deliberately not claimed until the Future reports it.
+    assert machine.current == "open"
 
 
-def test_executor_refuses_expired_chunk_before_arm_action():
-    robot = _FakeRobot()
-    machine = GripperStateMachine(confirm_steps=2)
-    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-    with pytest.raises(TimeoutError, match="stale action chunk"):
-        execute_action_chunk(
-            robot=robot,
-            chunk=chunk,
-            mode="arm-only",
-            execute_steps=1,
-            fps=1e9,
-            gripper=machine,
-            action_filter=_test_action_filter(),
-            action_deadline=0.0,
-        )
-    assert robot.arm_actions == []
-
-
-def _async_args(**overrides):
-    values = {
-        "server": "tcp://unused:5559",
-        "timeout_s": 1.0,
-        "task": "pick",
-        "max_cycles": 2,
-        "execute_steps": 30,
-        "fps": 1e9,
-        "expected_checkpoint": "checkpoint",
-        "max_action_age_s": 1.0,
-        "mode": "arm-only",
-        "max_translation_m": 0.001,
-        "max_rotation_rad": 0.005,
-        "action_low_pass_alpha": 1.0,
-        "max_translation_accel_m_s2": 1e20,
-        "max_rotation_accel_rad_s2": 1e20,
-        "chunk_blend_steps": 6,
-        "open_threshold_m": 0.055,
-        "stop_after_gripper_close": False,
-        "require_initial_grasp": False,
-        "force_retreat_m": 0.05,
-        "force_retreat_speed_m_s": 0.03,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _async_sample(request_id, submitted_tick, chunk, *, age_s=0.0):
-    state = np.zeros(15, dtype=np.float32)
-    state[13] = 0.076
-    return AsyncInferenceResult(
-        request_id=request_id,
-        submitted_tick=submitted_tick,
-        observation_started=time.perf_counter() - age_s,
-        state=state,
-        response=InferenceResponse(
-            request_id=request_id,
-            action_chunk=chunk,
-            inference_ms=10.0,
-            checkpoint="checkpoint",
-        ),
-    )
-
-
-def _async_action_filter(args):
-    return TcpActionFilter(
-        fps=args.fps,
-        low_pass_alpha=args.action_low_pass_alpha,
-        max_translation_step_m=args.max_translation_m,
-        max_rotation_step_rad=args.max_rotation_rad,
-        max_translation_accel_m_s2=args.max_translation_accel_m_s2,
-        max_rotation_accel_rad_s2=args.max_rotation_accel_rad_s2,
-    )
-
-
-def test_async_replacement_skips_ticks_executed_while_inference_was_pending(monkeypatch):
-    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-    chunk[:, 0] = np.arange(ACTION_CHUNK_SHAPE[0], dtype=np.float32) / 10000.0
-
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.in_flight = False
-            self.pending = None
-            self.poll_count = 0
-
-        def submit(self, *, request_id, submitted_tick):
-            self.in_flight = True
-            self.pending = _async_sample(request_id, submitted_tick, chunk)
-
-        def wait(self):
-            self.in_flight = False
-            result, self.pending = self.pending, None
-            return result
-
-        def poll(self):
-            self.poll_count += 1
-            if self.pending is None or self.poll_count < 2:
-                return None
-            return self.wait()
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(remote_client, "AsyncInferenceWorker", FakeWorker)
-    robot = _FakeRobot()
-    log = io.StringIO()
-    args = _async_args(max_cycles=2, execute_steps=3)
-    run_async_control(
-        args=args,
-        robot=robot,
-        gripper=GripperStateMachine(confirm_steps=2),
-        action_filter=_async_action_filter(args),
-        log_stream=log,
-    )
-    entries = [json.loads(line) for line in log.getvalue().splitlines()]
-    assert entries[0]["executed"][0]["global_tick"] == 0
-    assert entries[1]["skipped_steps"] == 1
-    assert entries[1]["executed"][0]["step"] == 1
-
-
-def test_async_replacement_cross_fades_time_aligned_tcp_actions(monkeypatch):
-    first_chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-    first_chunk[:, 0] = 0.0008
-    second_chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-    second_chunk[:, 0] = -0.0008
-
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.in_flight = False
-            self.pending = None
-            self.poll_count = 0
-
-        def submit(self, *, request_id, submitted_tick):
-            self.in_flight = True
-            chunk = first_chunk if request_id == 1 else second_chunk
-            self.pending = _async_sample(request_id, submitted_tick, chunk)
-
-        def wait(self):
-            self.in_flight = False
-            result, self.pending = self.pending, None
-            return result
-
-        def poll(self):
-            self.poll_count += 1
-            if self.pending is None or self.poll_count < 2:
-                return None
-            return self.wait()
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(remote_client, "AsyncInferenceWorker", FakeWorker)
-    robot = _FakeRobot()
-    log = io.StringIO()
-    args = _async_args(max_cycles=2, execute_steps=4, chunk_blend_steps=2)
-    run_async_control(
-        args=args,
-        robot=robot,
-        gripper=GripperStateMachine(confirm_steps=2),
-        action_filter=_async_action_filter(args),
-        log_stream=log,
-    )
-    entries = [json.loads(line) for line in log.getvalue().splitlines()]
-    first_new_record = entries[1]["executed"][0]
-    assert first_new_record["step"] == 1
-    assert first_new_record["policy_predicted"][0] == pytest.approx(-0.0008)
-    assert first_new_record["predicted"][0] == pytest.approx(0.0, abs=1e-8)
-    assert first_new_record["chunk_blend"] == {
-        "from_request_id": 1,
-        "from_step": 1,
-        "to_request_id": 2,
-        "to_step": 1,
-        "alpha": 0.5,
-    }
-    assert robot.arm_actions[1]["dx"] == pytest.approx(0.0, abs=1e-8)
-
-
-def test_async_half_task_stops_immediately_after_close_command(monkeypatch):
-    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-    chunk[:, 6] = 0.019
-
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.in_flight = False
-            self.pending = None
-
-        def submit(self, *, request_id, submitted_tick):
-            self.in_flight = True
-            self.pending = _async_sample(request_id, submitted_tick, chunk)
-
-        def wait(self):
-            self.in_flight = False
-            result, self.pending = self.pending, None
-            return result
-
-        def poll(self):
-            return None
-
-        def close(self):
-            self.in_flight = False
-
-    monkeypatch.setattr(remote_client, "AsyncInferenceWorker", FakeWorker)
-    robot = _FakeRobot()
-    args = _async_args(
-        max_cycles=1,
-        mode="integrated",
-        stop_after_gripper_close=True,
-    )
-    run_async_control(
-        args=args,
-        robot=robot,
-        gripper=GripperStateMachine(confirm_steps=2),
-        action_filter=_async_action_filter(args),
-        log_stream=io.StringIO(),
-    )
-    assert robot.arm_actions == []
-    assert robot.close_count == 1
-    assert robot.close_widths == [pytest.approx(0.019)]
-
-
-def test_async_force_guard_stops_before_action_and_retreats(monkeypatch):
-    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-
-    class FakeWorker:
-        def __init__(self, **kwargs):
-            self.in_flight = False
-            self.pending = None
-
-        def submit(self, *, request_id, submitted_tick):
-            self.in_flight = True
-            self.pending = _async_sample(request_id, submitted_tick, chunk)
-
-        def wait(self):
-            self.in_flight = False
-            result, self.pending = self.pending, None
-            return result
-
-        def poll(self):
-            return None
-
-        def close(self):
-            self.in_flight = False
-
-    monkeypatch.setattr(remote_client, "AsyncInferenceWorker", FakeWorker)
+def test_force_guard_stops_before_next_model_action_and_retreats():
     robot = _FakeRobot()
     robot.external_wrench[2] = 8.0
-    args = _async_args(max_cycles=1)
-    log = io.StringIO()
-    run_async_control(
-        args=args,
+    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
+    records, replan, force_stopped = execute_action_chunk(
         robot=robot,
+        chunk=chunk,
+        mode="arm-only",
+        execute_steps=8,
+        fps=1e9,
         gripper=GripperStateMachine(confirm_steps=2),
-        action_filter=_async_action_filter(args),
-        log_stream=log,
-        force_guard=RelativeForceGuard(
-            baseline_wrench=np.zeros(6),
-            threshold_n=7.0,
-        ),
+        max_translation_m=0.005,
+        max_rotation_rad=0.03,
+        force_guard=RelativeForceGuard(baseline_wrench=np.zeros(6), threshold_n=7.0),
+        force_retreat_m=0.05,
+        force_retreat_speed_m_s=0.03,
     )
+    assert not replan
+    assert force_stopped
     assert robot.arm_actions == []
     assert robot.force_retreats == [(0.05, 0.03)]
-    entry = json.loads(log.getvalue())
-    assert entry["retire_reason"] == "force_guard_retreat"
-    assert entry["executed"][0]["force_guard"]["triggered"] is True
-
-
-def test_async_rejects_insufficient_double_buffer_budget_before_motion(monkeypatch):
-    chunk = np.zeros(ACTION_CHUNK_SHAPE, dtype=np.float32)
-
-    class SlowFakeWorker:
-        def __init__(self, **kwargs):
-            self.in_flight = False
-            self.pending = None
-
-        def submit(self, *, request_id, submitted_tick):
-            self.in_flight = True
-            self.pending = _async_sample(request_id, submitted_tick, chunk, age_s=0.55)
-
-        def wait(self):
-            self.in_flight = False
-            result, self.pending = self.pending, None
-            return result
-
-        def poll(self):
-            return None
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(remote_client, "AsyncInferenceWorker", SlowFakeWorker)
-    robot = _FakeRobot()
-    with pytest.raises(RuntimeError, match="too short for continuous async execution"):
-        args = _async_args(max_cycles=1, max_action_age_s=1.0)
-        run_async_control(
-            args=args,
-            robot=robot,
-            gripper=GripperStateMachine(confirm_steps=2),
-            action_filter=_async_action_filter(args),
-            log_stream=io.StringIO(),
-        )
-    assert robot.arm_actions == []
+    assert records[0]["force_guard"]["triggered"] is True

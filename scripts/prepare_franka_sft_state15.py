@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create an SFT dataset copy with joint velocities removed from state."""
+"""Create an SFT dataset copy with a selected Franka state layout."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 
 
 STATE_KEY = "observation.state"
+JOINT_NAMES = tuple(f"joint_{index}" for index in range(7))
 VELOCITY_NAMES = {f"joint_vel_{index}" for index in range(7)}
 EPISODE_STATE_STATS = (
     "min",
@@ -29,10 +30,49 @@ EPISODE_STATE_STATS = (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
+    parser.add_argument(
+        "--state-layout",
+        choices=("state15", "joint7"),
+        default="state15",
+        help=(
+            "Output state layout: state15 removes joint velocities; joint7 keeps "
+            "only joint_0..6 (default: state15)"
+        ),
+    )
     return parser.parse_args()
+
+
+def select_state_indices(state_names: list[str], state_layout: str) -> list[int]:
+    velocity_names = set(state_names) & VELOCITY_NAMES
+    if len(state_names) != 22 or velocity_names != VELOCITY_NAMES:
+        raise ValueError(
+            "Expected the raw 22D Franka state with joint_vel_0..6; "
+            f"got {len(state_names)} dimensions and velocities {sorted(velocity_names)}"
+        )
+
+    if state_layout == "state15":
+        keep_indices = [
+            index for index, name in enumerate(state_names) if name not in VELOCITY_NAMES
+        ]
+        if len(keep_indices) != 15:
+            raise ValueError(
+                f"Expected state 22 -> 15 dimensions, got 22 -> {len(keep_indices)}"
+            )
+        return keep_indices
+
+    if state_layout == "joint7":
+        missing = [name for name in JOINT_NAMES if name not in state_names]
+        duplicates = [name for name in JOINT_NAMES if state_names.count(name) != 1]
+        if missing or duplicates:
+            raise ValueError(
+                f"Expected exactly one joint_0..6; missing={missing}, duplicates={duplicates}"
+            )
+        return [state_names.index(name) for name in JOINT_NAMES]
+
+    raise ValueError(f"Unsupported state layout: {state_layout}")
 
 
 def replace_parquet(path: Path, table: pa.Table) -> None:
@@ -104,20 +144,8 @@ def main() -> None:
     info = json.loads(info_path.read_text())
     state_feature = info["features"][STATE_KEY]
     state_names = state_feature["names"]
-    velocity_names = set(state_names) & VELOCITY_NAMES
-    if velocity_names != VELOCITY_NAMES:
-        raise ValueError(
-            f"Expected joint_vel_0..6 in state, found {sorted(velocity_names)}"
-        )
-
-    keep_indices = [
-        index for index, name in enumerate(state_names) if name not in VELOCITY_NAMES
-    ]
+    keep_indices = select_state_indices(state_names, args.state_layout)
     kept_names = [state_names[index] for index in keep_indices]
-    if len(state_names) != 22 or len(kept_names) != 15:
-        raise ValueError(
-            f"Expected state 22 -> 15 dimensions, got {len(state_names)} -> {len(kept_names)}"
-        )
 
     shutil.copytree(source, destination)
 
@@ -146,6 +174,7 @@ def main() -> None:
     rewrite_json(stats_path, stats)
 
     print(f"Created {destination}")
+    print(f"Layout: {args.state_layout}")
     print(f"State: {len(state_names)} -> {len(kept_names)}")
     print("Kept:", ", ".join(kept_names))
 

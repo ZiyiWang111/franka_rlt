@@ -1,6 +1,6 @@
 # FR3 机器人主机 Agent Handoff
 
-更新时间：2026-09-10
+更新时间：2026-09-11
 
 ## 目标与部署结构
 
@@ -57,7 +57,8 @@ control_server -> FR3
   - `integrated`：执行 TCP 和夹爪。
 - 所有非 shadow 模式必须显式提供 `--allow-motion`。
 - `arm-only` 和 `integrated` 还必须显式提供工作空间上下界。
-- 默认每次只执行 50 步 chunk 的前 5 步，然后重新观察和推理。
+- 默认按 15 Hz 执行 50 步 chunk 的前 8 步，然后重新观察和推理。
+- 推理与动作执行完全同步，不做异步预取、过期前缀跳步、chunk 融合、低通或加速度整形。
 - 网络请求超时后不执行动作，REQ socket 会重建。
 - 可将 state、完整预测 chunk、实际执行动作和推理时间写入 JSONL。
 
@@ -68,8 +69,7 @@ control_server -> FR3
 - `protocol.py`：ZMQ multipart wire format，使用 JSON header 和原始数组 bytes，
   不使用 pickle。
 - `state.py`：22D 命名 observation 到 15D 模型 state 的显式转换。
-- `execution.py`：跨 chunk 保持状态的 TCP 低通/速度/加速度整形、最终速度边界和
-  夹爪状态机。
+- `execution.py`：每步 TCP 硬安全边界、相对力保护和夹爪状态机。
 
 夹爪状态机约定：
 
@@ -80,31 +80,41 @@ control_server -> FR3
 - 默认需要连续两步预测相同变化才执行。
 - 从第一步变化候选开始就冻结 TCP。
 - 确认变化后先显式 `stop_servo()` 并等待 arm `is_running()==False`，再发送
-  blocking Hand 命令；不能依赖 control server 的 0.3 s servo-gap watchdog。
-- blocking gripper RPC 完成后丢弃 chunk 剩余动作、重置 TCP 积分目标并重新推理。
+  Franky 原生异步 Hand 命令；不能依赖 control server 的 0.3 s servo-gap watchdog。
+- Hand Future 运行期间继续采集 observation 和推理，但保持 arm 停止并丢弃这些 action；
+  此时 width/grasped 是明确标记为 stale 的上一次可靠值。
+- Future 完成后才更新夹爪状态机、重置 TCP 积分目标，并用最新 observation 重新推理。
 
-### Franka adapter changes
+### Franka control backend and adapter changes
 
 文件：
 
+- `src/evo_franka/`
 - `src/evo_rlt/adapters/lerobot/franka_robot/configuration_franka.py`
 - `src/evo_rlt/adapters/lerobot/franka_robot/franka_robot.py`
 
 改动：
 
-- `robotLab` 路径可由 `robotlab_path` 或 `ROBOTLAB_PATH` 配置，不再只能使用硬编码路径。
+- RobotLab 的 Franka 控制后端已复制为独立的 `evo_franka` 包；运行时不再导入
+  RobotLab，也不需要 `ROBOTLAB_PATH`。
+- `evo-franka-control-server` 在独立进程中持有 franky/libfranka 和 FCI session；
+  adapter 通过复制进本项目的 ZMQ client 与它通信。
 - 增加 `enable_fci_keepalive`。远程 client 在 shadow 模式将它关闭，因此 shadow
   不会发出周期性 `servo_joint`。
 - 增加可选的 `workspace_min_xyz` / `workspace_max_xyz`。
 - TCP 积分目标超出 workspace 时拒绝发送。
-- 增加 `resync_command_pose()`，夹爪 blocking RPC 后重新锚定 TCP 目标。
+- 增加 Franky `open_async()` / `grasp_async()` 状态机、10 s 超时和状态快照；夹爪运动不再
+  阻塞 observation，arm 在 Future 完成前仍由底层互锁保持停止。
+- 增加 `resync_command_pose()`，夹爪 Future 完成后重新锚定 TCP 目标。
 
 ### Dependency and tests
 
-- `pyproject.toml` 的 `lerobot` extra 增加 `pyzmq>=26.0`。
-- `tests/test_fr3_remote_inference.py` 覆盖协议往返、schema、state 顺序、TCP
-  限幅、低通与加速度边界、夹爪去抖，以及夹爪切换期间禁止 arm action。
-- 本机已运行相关测试：16 passed。
+- `pyproject.toml` 增加 `franka` extra 与 `evo-franka-control-server` 入口。
+- `tests/test_fr3_remote_inference.py` 覆盖协议往返、schema、state 顺序、15 Hz / 8 步
+  默认配置、TCP 限幅、相对力保护、夹爪去抖，以及夹爪切换期间禁止 arm action。
+- `tests/test_franka_control_ipc.py` 用假控制器覆盖完整 ZMQ 控制链路；
+  `tests/test_franka_runtime_ik.py` 覆盖分支连续 IK。
+- 本机已运行相关测试：远程推理与 IK 12 passed，控制 IPC 9 passed。
 - 已完成 shadow、夹爪和初步 integrated 真机测试；第二段的相对力保护尚待首次真机验证。
 
 ## 机器人主机需要同步什么
@@ -116,18 +126,20 @@ control_server -> FR3
 ```text
 pyproject.toml
 scripts/fr3_remote_robot_client.py
+src/evo_franka/
 src/evo_rlt/adapters/lerobot/franka_remote/
 src/evo_rlt/adapters/lerobot/franka_robot/configuration_franka.py
 src/evo_rlt/adapters/lerobot/franka_robot/franka_robot.py
 docs/fr3_remote_inference.md
 docs/fr3_robot_host_agent_handoff.md
 tests/test_fr3_remote_inference.py
+tests/test_franka_control_ipc.py
+tests/test_franka_runtime_ik.py
 ```
 
 机器人主机还需保留它原有的：
 
-- `/home/embint/robotLab` 或实际 robotLab 路径。
-- robotLab control server 和 Python control client。
+- 可用的 Franky/FCI 系统环境；Python 依赖由 `.[franka]` 安装。
 - `pyrealsense2`、RealSense udev 配置和两个相机的 USB 连接。
 - 能够成功数采时使用的 Python/系统环境。
 
@@ -151,17 +163,25 @@ tests/test_fr3_remote_inference.py
 
 ```bash
 git status --short
-python -m pip install -e '.[lerobot]'
+python -m pip install -e '.[lerobot,franka]'
 python -c 'import zmq; print(zmq.__version__)'
+python -c 'import franky; print("franky OK")'
 python -c 'import pyrealsense2; print("pyrealsense2 OK")'
-test -d /home/embint/robotLab && echo 'robotLab OK'
 ```
 
-如果 robotLab 不在 `/home/embint/robotLab`，后续命令必须加入：
+不再需要 RobotLab 路径参数。先在机器人主机的独立终端启动本项目控制服务：
 
-```text
---robotlab-path /实际/robotLab/路径
+```bash
+evo-franka-control-server --ip 172.16.0.2
 ```
+
+在第二个终端确认：
+
+```bash
+python -m evo_franka.control_client --ping
+```
+
+输出必须为 `PONG`，并保持控制服务运行。
 
 ### 2. 只做 GPU server 网络检查
 
@@ -236,34 +256,20 @@ shadow 模式不得调用：
 进入 arm motion 前还需要用户根据真实清空工作区提供机器人 base frame 下的
 `workspace-min` 和 `workspace-max`。不要只用训练数据的 min/max 代替现场安全边界。
 
-### 5. 异步滚动执行与 VGA 夹取半程
+### 5. Vanilla 15 Hz 执行
 
-`--async-inference` 在主线程以 30 Hz 执行当前 action chunk 时，由单独线程采集下一次
-观测并请求推理。新结果不会从第 0 步重放：客户端按推理期间已经消费的控制 tick 跳过
-过期前缀，并用 `--chunk-blend-steps`（默认 6 步）将旧、新 chunk 在同一个全局控制
-tick 上对齐后平滑交叉融合 TCP 动作，避免直接切换产生速度突变。夹爪宽度不参与数值
-融合，始终采用最新 chunk 的离散开/合判断。`--max-action-age-s`、checkpoint 绑定和
-workspace 边界在异步模式下仍然生效。
+客户端参考 [OpenPI 官方 DROID 实机循环](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/main.py)：每次采集当前观测，同步请求一个 action chunk，
+然后按 15 Hz 原顺序执行前 8 步（约 0.53 s），再重新观测和推理。客户端不再包含异步
+worker、双缓冲、前缀跳步、chunk 融合、低通或加速度整形。
 
-实际 TCP 命令在 chunk 融合后还会经过一个跨 chunk 保持状态的滤波器：默认低通系数
-`--action-low-pass-alpha 0.2`，平移加速度上限
-`--max-translation-accel-m-s2 0.30`，旋转加速度上限
-`--max-rotation-accel-rad-s2 0.75`。`--max-translation-m` 和
-`--max-rotation-rad` 仍表示每个控制步的最终速度边界；在 30 Hz 下分别乘以 30 即为
-每秒速度上限。夹爪 hold 或显式停止 servo 后滤波器从零速度重新起步。
-
-单 worker 双缓冲要连续切换，动作年龄预算至少需要约为一次完整观测+推理延迟的两倍：
-第一批结果激活时已消耗一次延迟，下一批结果还需要一次延迟。客户端用第一批实测延迟在
-任何运动前检查这一条件。当前约 0.55 s 的延迟使用 `--max-action-age-s 1.5`；同时客户端
-拒绝超过 50 步模型 horizon（30 Hz 时约 1.67 s）的设置。
-
-`--execute-steps` 在异步模式下是每个 chunk 可使用的最大前缀/推理延迟后备窗口，不代表
-客户端一定执行同一 chunk 的全部步数。新 chunk 就绪后成为主 chunk，但在默认 6 个
-控制步内仍融合旧 chunk 的同一时刻 TCP 动作，随后才完全采用新 chunk。
+`--max-action-age-s` 只在开始执行 chunk 前检查这次观测加推理是否已经过期，不会在 chunk
+中途因时间经过而停止。保留的都是硬安全或硬件约束：明确 workspace、每步最大 TCP delta、
+checkpoint/schema 校验、夹爪切换前的 `stop_servo()`，以及可选的接触力停止。因为推理是
+同步的，每 8 步之间会出现一次推理等待；这是本版本有意保留的 vanilla 行为。
 
 仅测试“下降到 VGA 并闭合夹爪”时使用 `--stop-after-gripper-close`。该选项要求启动时夹爪
-已经完全打开且未抓取物体；第一次发出 close 后，无论 Hand 是否报告抓取成功，客户端都
-立即停止机械臂动作并退出。日志中的 `gripper_result` 用于区分抓到物体与空夹。
+已经完全打开且未抓取物体；第一次发出 close 后保持机械臂停止，等待异步 Hand Future
+完成，再退出。日志中的 `gripper_motion.result` 用于区分抓到物体与空夹。
 
 ### 6. 从已抓住 VGA 的状态执行第二段
 
@@ -283,8 +289,8 @@ Z: 0.1246 .. 0.5246 m
 改成训练中未出现的“只插入”指令。
 
 7 N 保护读取 FR3 的 base-frame `O_F_ext_hat_K` 模型估计值。启动时保持机械臂和 VGA
-静止约 0.5 s，客户端取 15 个样本的中位数作为相对基线；全 0 读数或最大基线波动达到
-阈值的一半会在运动前拒绝启动。执行期间每个 30 Hz 控制 tick 都先检查三轴合力相对基线
+静止约 1 s，客户端取 15 个样本的中位数作为相对基线；全 0 读数或最大基线波动达到
+阈值的一半会在运动前拒绝启动。执行期间每个 15 Hz 控制 tick 都先检查三轴合力相对基线
 的变化，达到 7 N 时先 `stop_servo()`，再以 0.03 m/s 向 base +Z 退回 0.05 m，然后退出。
 退回目标也必须位于上述 workspace 内。
 
@@ -292,10 +298,8 @@ Z: 0.1246 .. 0.5246 m
 python scripts/fr3_remote_robot_client.py \
   --server tcp://10.0.40.163:5559 \
   --robot-ip 172.16.0.2 \
-  --robotlab-path /home/embint/robotLab \
   --mode arm-only \
   --allow-motion \
-  --async-inference \
   --require-initial-grasp \
   --task "pick up the vga and insert into the motherboard" \
   --workspace-min 0.496 -0.272 0.1246 \
@@ -304,15 +308,14 @@ python scripts/fr3_remote_robot_client.py \
   --force-baseline-samples 15 \
   --force-retreat-m 0.05 \
   --force-retreat-speed-m-s 0.03 \
-  --execute-steps 30 \
+  --fps 15 \
+  --execute-steps 8 \
   --max-cycles 30 \
-  --max-action-age-s 1.5 \
-  --max-translation-m 0.001 \
-  --max-rotation-rad 0.005 \
+  --max-action-age-s 1.0 \
   --log /tmp/fr3_stage2.jsonl
 ```
 
-这是保守的 host-side 保护，不是 1 kHz 硬实时碰撞保护：30 Hz 检查、状态缓存延迟和
+这是保守的 host-side 保护，不是 1 kHz 硬实时碰撞保护：15 Hz 检查、状态缓存延迟和
 `O_F_ext_hat_K` 的模型误差都会带来触发误差，运动/姿态变化也可能造成安全侧的误触发。
 首次运行必须有人守在急停旁；看到 `Force guard calibrated` 后才会进入首次推理和动作。
 首次第二段测试使用有限的 `--max-cycles 30`，因为当前模型没有独立的任务完成信号；不要
