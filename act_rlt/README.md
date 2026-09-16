@@ -6,6 +6,19 @@ first component is the FR3 sample-space data collector.
 
 ## ACT training on a server
 
+For joint-angle-only state (7D), first create a separate dataset. This keeps
+the original dataset and videos intact and slices state statistics as well:
+
+```bash
+python act_rlt/prepare_joint_state.py --root datasets/act_rlt_001 \
+  --output datasets/act_rlt_001_state7
+python act_rlt/train.py --root datasets/act_rlt_001_state7 --output runs/act_state7
+```
+
+The resulting policy takes `joint_0` through `joint_6`, in that order, together
+with both cameras. Deployment must supply the same 7D state. Actions remain
+7D TCP deltas plus gripper width; with VAE disabled they are training targets only.
+
 Copy the finished `datasets/act_rlt_001` directory (including data, meta and
 videos) and `act_rlt/train.py` to the server. Activate a Python environment
 with LeRobot and its ACT dependencies installed (the local environment uses
@@ -49,6 +62,89 @@ All episodes are used; this script does not create a validation split.
 to that directory's name. `--output` is relative to the current working
 directory and must not exist yet; use a different output for each run.
 The final policy is at `OUTPUT/checkpoints/last/pretrained_model`.
+
+## Stage 1: ACT encoder hidden to RL Token
+
+Stage 1 freezes the trained ACT policy and reconstructs its main transformer
+encoder output with the existing Evo-RLT `RLTokenModule`. For the current
+two-camera VGA checkpoint the measured ACT hidden shape is `[B, 602, 768]`.
+The sequence length is discovered at runtime rather than configured: changing
+camera count, image resolution, or backbone stride can change it.
+
+The reconstruction bottleneck uses `encode_multi`, with shape `[B, 1, 768]`.
+The downstream Stage 2 Actor/Critic interface uses `encode`, which mean-pools
+RL tokens and returns `[B, 768]`.
+
+First inspect the generated LeRobot command:
+
+```bash
+python -m act_rlt.train_rl_token \
+  --root datasets/act_rlt_001_state7 \
+  --act-checkpoint outputs/act_rlt_001_state7_act \
+  --output outputs/act_rlt_001_stage1 \
+  --dry-run
+```
+
+Then train:
+
+```bash
+python -m act_rlt.train_rl_token \
+  --root datasets/act_rlt_001_state7 \
+  --act-checkpoint outputs/act_rlt_001_state7_act \
+  --output outputs/act_rlt_001_stage1
+```
+
+Defaults are batch size 8, 10,000 steps, AdamW at `2e-4`, cosine decay with
+200 warmup steps, gradient clipping at 1.0, FP32, and checkpoints every 2,000
+steps. Image augmentation is disabled. The ACT checkpoint and its saved
+normalization processors are the source of truth; ACT parameters are frozen
+and excluded from the Stage-1 checkpoint.
+
+On the first batch, training compares the encoder-only helper with an
+`ACT.forward()` hook and requires exact equality. This one-time check can be
+disabled with `--no-verify-extractor` after the implementation has been
+validated on a server.
+
+Resume the complete LeRobot state (RL Token weights, optimizer, scheduler,
+step, and RNG) from the `last` checkpoint with:
+
+```bash
+python -m act_rlt.train_rl_token \
+  --output outputs/act_rlt_001_stage1 \
+  --resume
+```
+
+## ACT inference (first version)
+
+Run from the repository root in the installed Evo-RLT environment. Start the
+existing control server separately, as for collection, and stop collection
+before connecting. Use the 7D-state checkpoint including its saved processors.
+
+```bash
+python -m act_rlt.infer \
+  --checkpoint outputs/act_rlt_001_state7_act \
+  --dry-run --duration 10
+```
+
+After the model and cameras warm up, Enter starts one episode; Ctrl+C stops it.
+Dry-run reads live observations and prints predictions without sending arm
+motion commands. Both cameras use native 640x480 RGB. Gripper commands are
+omitted in this version, so the current grasp is held.
+
+For motion, omit `--dry-run` and supply `--workspace-min X Y Z` and
+`--workspace-max X Y Z`: measured bounds for your task in base-frame metres.
+Position the arm in the collected start region before pressing Enter.
+The script stops after `--duration`; it does not detect task success or reset
+the arm automatically. Default limits are 2 mm translation and 0.02 rad
+rotation per step; `--max-step-m` and `--max-step-rad` override them.
+
+The loop runs at 15 Hz, using checkpoint action chunking (override with
+`--n-action-steps 1` for replanning every tick). Saved processors normalize
+observations and unnormalize actions; no augmentation is applied. Each delta
+is anchored to the measured TCP pose, using the shared body-frame rotation
+convention. Observation/inference latency above 0.5 seconds stops the run.
+Ctrl+C is handled when the current call returns; this is not a hard real-time
+emergency stop. Keep the robot's physical stop accessible during execution.
 
 ## Sample-space data collection
 

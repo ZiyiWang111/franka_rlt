@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+from act_rlt import register
+from act_rlt.act_encoder import (
+    capture_act_forward_encoder_hidden,
+    extract_act_encoder_hidden,
+    prepare_act_batch,
+)
+from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
+from evo_rlt.core.rl_token import RLTokenModule
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.factory import get_policy_class
+from lerobot.utils.constants import OBS_STATE
+
+
+ACT_CHECKPOINT = (
+    Path(__file__).resolve().parents[1]
+    / "outputs/act_rlt_001_state7_act/checkpoints/last/pretrained_model"
+)
+
+
+def test_policy_registers_with_lerobot_dynamic_factory() -> None:
+    register()
+    assert PreTrainedConfig.get_choice_class("act_rlt_token") is ACTRLTokenConfig
+    assert get_policy_class("act_rlt_token").__name__ == "ACTRLTokenPolicy"
+
+
+def test_stage1_and_stage2_rl_token_shapes_are_distinct() -> None:
+    module = RLTokenModule(
+        token_dim=16,
+        nhead=2,
+        num_enc_layers=1,
+        num_dec_layers=1,
+        ff_dim=32,
+        num_rl_tokens=1,
+    ).eval()
+    act_hidden = torch.randn(3, 11, 16)
+
+    assert module.encode_multi(act_hidden).shape == (3, 1, 16)
+    assert module.encode(act_hidden).shape == (3, 16)
+    assert module.reconstruction_loss(act_hidden).ndim == 0
+
+
+def test_config_defaults_to_confirmed_stage1_architecture() -> None:
+    config = ACTRLTokenConfig(
+        act_pretrained_path="/tmp/act",
+        device="cpu",
+        input_features={
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+            "observation.images.wrist": PolicyFeature(
+                type=FeatureType.VISUAL, shape=(3, 480, 640)
+            ),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+
+    assert config.rl_token_dim == 768
+    assert config.rl_token_enc_layers == 3
+    assert config.rl_token_dec_layers == 3
+    assert config.rl_token_ff_dim == 4096
+    assert config.rl_token_num_rl_tokens == 1
+    assert config.get_optimizer_preset().lr == pytest.approx(2e-4)
+    assert config.get_optimizer_preset().grad_clip_norm == pytest.approx(1.0)
+
+
+@pytest.mark.skipif(not ACT_CHECKPOINT.is_dir(), reason="local ACT checkpoint is unavailable")
+def test_real_act_encoder_only_helper_matches_forward_hook() -> None:
+    config = PreTrainedConfig.from_pretrained(ACT_CHECKPOINT, local_files_only=True)
+    config.device = "cpu"
+    policy = ACTPolicy.from_pretrained(
+        ACT_CHECKPOINT,
+        config=config,
+        local_files_only=True,
+        strict=True,
+    ).eval()
+    torch.manual_seed(7)
+    batch = {OBS_STATE: torch.randn(1, 7)}
+    for key, feature in config.image_features.items():
+        batch[key] = torch.randn(1, *feature.shape)
+    prepared = prepare_act_batch(policy, batch)
+
+    with torch.inference_mode():
+        extracted = extract_act_encoder_hidden(policy.model, prepared)
+        captured = capture_act_forward_encoder_hidden(policy.model, prepared)
+
+    assert extracted.shape == (1, 602, 768)  # empirical for this checkpoint, not an API constant
+    assert torch.equal(extracted, captured)
