@@ -114,6 +114,76 @@ python -m act_rlt.train_rl_token \
   --resume
 ```
 
+## Stage 2: online chunk Actor-Critic
+
+Stage 2 freezes ACT and the Stage-1 RL Token encoder, then trains a two-layer
+256-wide Actor and twin two-layer 256-wide critics. The first FR3 version uses
+the 768D RL token plus normalized 7D joint state, and predicts a four-step 6D
+TCP-delta chunk. The ACT reference is the first four arm actions from its
+`[B,16,7]` output; the gripper remains held outside the RL action space.
+
+Load and validate both checkpoints and the saved LeRobot processors without
+connecting to the robot:
+
+```bash
+python -m act_rlt.train_stage2 \
+  --stage1-checkpoint outputs/act_rlt_001_stage1 \
+  --act-checkpoint outputs/act_rlt_001_state7_act \
+  --output outputs/act_rlt_001_stage2 \
+  --dry-run
+```
+
+The confirmed scheduling semantics are:
+
+```text
+first 4,000 low-level steps: frozen ACT actions, replay collection, no updates
+next 10,000 online steps: one collected chunk -> one transition -> five critic updates
+actor update: every second critic update
+target critics: updated after every critic optimizer step
+```
+
+The current repository-faithful order executes the first Actor chunk before
+the first replay update, so the Actor is still randomly initialized at that
+boundary. Treat the initial motion run as an engineering validation and keep
+the physical stop available. If desired, add an explicit replay-only bootstrap
+as a separately reviewed deviation before longer training.
+
+Motion is guarded by both `--allow-motion` and explicit base-frame workspace
+bounds:
+
+```bash
+python -m act_rlt.train_stage2 \
+  --stage1-checkpoint outputs/act_rlt_001_stage1 \
+  --act-checkpoint outputs/act_rlt_001_state7_act \
+  --output outputs/act_rlt_001_stage2 \
+  --allow-motion \
+  --workspace-min X_MIN Y_MIN Z_MIN \
+  --workspace-max X_MAX Y_MAX Z_MAX
+```
+
+No orientation teaching or orientation argument is required. Before Episode 0,
+the program reads the current TCP rotation vector, samples a workspace XYZ,
+asks for one-time authorization, and moves there. Every sampled X/Y stays at
+least 2 cm inside the workspace boundaries; Z uses the full configured range.
+After each episode, the arm automatically retreats 1 cm along base-frame +Y and
+samples the next reset pose, then asks whether to accept it or sample again. During every
+warmup and online episode, `s` marks success, `f` marks failure, and `q` stops
+training. Inference stops after 5 seconds by default and, if no outcome was
+entered during motion, explicitly asks for `s`, `f`, or `q` before reset. Human
+action intervention is intentionally disabled; outcome labeling remains enabled.
+If an inference action is refused for crossing the TCP workspace, the episode
+is truncated and the arm proceeds to the next sampled reset pose instead of
+terminating training. A successfully executed prefix is retained; a refusal on
+the first action creates no replay transition.
+Checkpoints and replay are saved at episode boundaries and every 1,000 low-level
+steps. Resume with the same arguments plus `--resume`.
+
+`--total-env-steps` is a cumulative online target. To continue for another
+10,000 online steps after finishing 10,000, resume with
+`--total-env-steps 20000`; the existing replay, networks, optimizers, and update
+counters are retained. Resume permits changing only `warmup_steps` and this
+cumulative online target, with progress-safety checks.
+
 ## ACT inference (first version)
 
 Run from the repository root in the installed Evo-RLT environment. Start the
@@ -126,17 +196,30 @@ python -m act_rlt.infer \
   --dry-run --duration 10
 ```
 
-After the model and cameras warm up, Enter starts one episode; Ctrl+C stops it.
+After the model and cameras warm up, Enter starts an episode; the prompt returns
+after every episode so another dry-run can be started without reloading the model.
+Ctrl+C stops the session.
 Dry-run reads live observations and prints predictions without sending arm
 motion commands. Both cameras use native 640x480 RGB. Gripper commands are
 omitted in this version, so the current grasp is held.
 
 For motion, omit `--dry-run` and supply `--workspace-min X Y Z` and
 `--workspace-max X Y Z`: measured bounds for your task in base-frame metres.
-Position the arm in the collected start region before pressing Enter.
-The script stops after `--duration`; it does not detect task success or reset
-the arm automatically. Default limits are 2 mm translation and 0.02 rad
-rotation per step; `--max-step-m` and `--max-step-rad` override them.
+Before inference the script samples XYZ inside the workspace, keeping X and Y
+3 cm inside their respective boundaries, and moves there at 0.02 m/s. Z uses
+the full configured range. The default reset orientation is the frame-level
+mean TCP rotation vector from `datasets/act_rlt_001`:
+`[-2.19841545, 2.22703212, -0.03082950]` rad. Override these settings with
+`--reset-orientation RX RY RZ`, `--reset-xy-padding`, and `--reset-speed`.
+The first sampled move requires explicit authorization. At every sampled point,
+choose whether to start inference or move to a new sample. After each
+`--duration`, choose whether to return to that episode's measured start pose,
+move to a new sample, or quit; the process stays alive for subsequent episodes.
+Default action limits are 2 mm translation and 0.02 rad rotation per step;
+`--max-step-m` and `--max-step-rad` override them.
+At the end of every inference episode, an action-limit report prints the total
+number of evaluated steps and the counts/percentages that triggered the
+translation limit, rotation limit, either limit, or both limits.
 
 The loop runs at 15 Hz, using checkpoint action chunking (override with
 `--n-action-steps 1` for replanning every tick). Saved processors normalize

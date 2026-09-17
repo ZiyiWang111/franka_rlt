@@ -11,12 +11,15 @@ from evo_rlt.core.interfaces import (
     EPISODE_ID,
     EXEC_CHUNK_FLAT,
     IS_CRITICAL,
+    INTERVENTION,
     NEXT_REF_FLAT,
     NEXT_STATE_VEC,
     REF_CHUNK_FLAT,
     REWARD_SEQ,
     SOURCE,
     STATE_VEC,
+    TERMINATED,
+    TRUNCATED,
     ChunkTransition,
 )
 
@@ -65,4 +68,7 @@ class ReplayBuffer:
             SOURCE: torch.stack([t.source for t in batch]),
             EPISODE_ID: torch.stack([t.episode_id for t in batch]),
             IS_CRITICAL: torch.stack([t.is_critical for t in batch]),
+            INTERVENTION: torch.stack([t.intervention for t in batch]),
+            TERMINATED: torch.stack([t.terminated for t in batch]),
+            TRUNCATED: torch.stack([t.truncated for t in batch]),
         }

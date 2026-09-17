@@ -112,6 +112,8 @@ def _build_transition(
     source: int = 0,
     episode_id: int = -1,
     is_critical: float = 0.0,
+    terminated: bool | None = None,
+    truncated: bool = False,
 ) -> ChunkTransition:
     """Build a ChunkTransition, squeezing batch dims if present."""
     sq = lambda t: t.squeeze(0) if t.dim() > 1 and t.shape[0] == 1 else t
@@ -128,6 +130,8 @@ def _build_transition(
         source=torch.tensor(source),
         episode_id=torch.tensor(episode_id),
         is_critical=torch.tensor(is_critical),
+        terminated=torch.tensor(float(done if terminated is None else terminated)),
+        truncated=torch.tensor(float(truncated)),
     )
 
 

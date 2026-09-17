@@ -99,3 +99,36 @@ def capture_act_forward_encoder_hidden(
     if len(captured) != 1:
         raise RuntimeError(f"expected one ACT encoder output, captured {len(captured)}")
     return captured[0].transpose(0, 1).contiguous()
+
+
+def predict_act_chunk_with_encoder_hidden(
+    policy: ACTPolicy, batch: dict[str, Tensor]
+) -> tuple[Tensor, Tensor]:
+    """Run ACT once and return ``(action_chunk, encoder_hidden)``.
+
+    Stage 2 needs both ACT's action proposal and the exact encoder output used
+    to produce that proposal. Capturing the encoder during
+    :meth:`ACTPolicy.predict_action_chunk` avoids a second ResNet/transformer
+    forward and guarantees that both tensors come from the same observation.
+
+    Returns:
+        action_chunk: ``[B,H,A]`` in ACT's normalized action space.
+        encoder_hidden: ``[B,S,D]`` in the same token order as Stage 1.
+    """
+    if policy.training or policy.model.training:
+        raise RuntimeError("ACT must be in eval mode for Stage-2 extraction")
+
+    captured: list[Tensor] = []
+
+    def hook(_module, _args, output: Tensor) -> None:
+        captured.append(output.detach())
+
+    handle = policy.model.encoder.register_forward_hook(hook)
+    try:
+        action_chunk = policy.predict_action_chunk(batch)
+    finally:
+        handle.remove()
+    if len(captured) != 1:
+        raise RuntimeError(f"expected one ACT encoder output, captured {len(captured)}")
+    hidden = captured[0].transpose(0, 1).contiguous()
+    return action_chunk, hidden

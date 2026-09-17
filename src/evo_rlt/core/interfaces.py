@@ -23,6 +23,9 @@ ACTUAL_STEPS = "actual_steps"
 SOURCE = "source"
 EPISODE_ID = "episode_id"
 IS_CRITICAL = "is_critical"
+INTERVENTION = "intervention"
+TERMINATED = "terminated"
+TRUNCATED = "truncated"
 
 
 @dataclass
@@ -60,3 +63,5 @@ class ChunkTransition:
     source: torch.Tensor = field(default_factory=lambda: torch.tensor(0))
     episode_id: torch.Tensor = field(default_factory=lambda: torch.tensor(-1))
     is_critical: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
+    terminated: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
+    truncated: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))

@@ -34,6 +34,7 @@ def critic_loss(
     gamma: float,
     C: int,
     target_q_clip: float | None = 100.0,
+    target_action_clip: float | None = 1.0,
 ) -> torch.Tensor:
     """TD3-style chunk-level TD loss with correct truncated-chunk handling.
 
@@ -49,9 +50,12 @@ def critic_loss(
     actual_steps = batch.get("actual_steps")
 
     with torch.no_grad():
-        # Use deterministic mean for target action (TD3-style), clamped to [-1,1]
+        # Use the deterministic mean for the target action. Quantile-normalized
+        # policies use [-1, 1]; mean/std-normalized policies (including ACT-RLT)
+        # must be able to disable that clamp.
         mu_next, _ = actor.forward(x_next, ref_next)
-        mu_next = mu_next.clamp(-1.0, 1.0)
+        if target_action_clip is not None and target_action_clip > 0:
+            mu_next = mu_next.clamp(-target_action_clip, target_action_clip)
         q_next = target_critic.min_q(x_next, mu_next)
         if target_q_clip is not None and target_q_clip > 0:
             q_next = q_next.clamp(-target_q_clip, target_q_clip)
