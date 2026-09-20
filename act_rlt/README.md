@@ -158,13 +158,18 @@ python -m act_rlt.train_stage2 \
   --output outputs/act_rlt_001_stage2 \
   --allow-motion \
   --workspace-min X_MIN Y_MIN Z_MIN \
-  --workspace-max X_MAX Y_MAX Z_MAX
+  --workspace-max X_MAX Y_MAX Z_MAX \
+  --sample-min SAMPLE_X_MIN SAMPLE_Y_MIN SAMPLE_Z_MIN \
+  --sample-max SAMPLE_X_MAX SAMPLE_Y_MAX SAMPLE_Z_MAX
 ```
 
 No orientation teaching or orientation argument is required. Before Episode 0,
-the program reads the current TCP rotation vector, samples a workspace XYZ,
-asks for one-time authorization, and moves there. Every sampled X/Y stays at
-least 2 cm inside the workspace boundaries; Z uses the full configured range.
+the program reads the current TCP rotation vector, samples a reset XYZ,
+asks for one-time authorization, and moves there. Without a sample box, sampled
+X/Y stays at least 2 cm inside the workspace boundaries; Z uses the full
+configured range. The optional `--sample-min` / `--sample-max` pair instead
+selects reset poses from that exact box, which must lie inside the workspace.
+The workspace remains the hard safety boundary for every commanded TCP target.
 After each episode, the arm automatically retreats 1 cm along base-frame +Y and
 samples the next reset pose, then asks whether to accept it or sample again. During every
 warmup and online episode, `s` marks success, `f` marks failure, and `q` stops

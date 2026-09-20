@@ -20,6 +20,7 @@ concerns all catch against them, so they must be shared).
 from __future__ import annotations
 
 import franky
+from evo_franka.runtime_owner import require_owner
 from franky import (
     Affine,
     CartesianImpedanceMotion,
@@ -47,8 +48,18 @@ __all__ = [
     "CartesianPoseReaction", "CartesianStopMotion", "Duration", "Gripper",
     "JointMotion", "JointPositionReaction", "JointState", "JointStopMotion",
     "JointWaypoint", "JointWaypointMotion", "Measure", "RelativeDynamicsFactor",
-    "Robot", "_FRANKY_EXC", "_STATE_READ_EXC",
+    "Robot", "_FRANKY_EXC", "_STATE_READ_EXC", "create_robot", "create_gripper",
 ]
+
+
+def create_robot(robot_ip, *args, **kwargs):
+    require_owner(robot_ip)
+    return Robot(robot_ip, *args, **kwargs)
+
+
+def create_gripper(robot_ip, *args, **kwargs):
+    require_owner(robot_ip)
+    return Gripper(robot_ip, *args, **kwargs)
 
 # franky's libfranka-backed exceptions. A dropped UDP datagram surfaces as
 # NetworkException on a synchronous state read; a reflex/abort during a motion

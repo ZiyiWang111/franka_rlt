@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+from collections import deque
 import logging
 import os
 import queue
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,6 +50,8 @@ import zmq
 from evo_franka.driver import FrankaArmController
 from evo_franka.ipc_codec import jsonable as _jsonable
 from evo_franka import constants as C
+from evo_franka.runtime_owner import RuntimeOwner
+from evo_franka.errors import FrankaSessionLost
 
 logger = logging.getLogger("control_server")
 
@@ -129,6 +134,13 @@ class ControlServer:
         self._running = False
         self._ctx: Optional[zmq.Context] = None
         self._cmd_sock = None
+        self._controller_ready = threading.Event()
+        self._controller_error = None
+        self._session_fault = None
+        self._evidence = deque(maxlen=200)  # ~20 seconds at 10 Hz, no per-tick logging
+        self._last_evidence_ts = 0.0
+        self._last_cycle_ts = None
+        self._cycle_gap_max_ms = 0.0
 
     # -- lifecycle -----------------------------------------------------------
     def _build_controller(self) -> FrankaArmController:
@@ -145,19 +157,61 @@ class ControlServer:
         return ctrl
 
     def run(self):
+        owner = RuntimeOwner(self._ip)
+        owner.acquire()
+        previous_handlers = {}
+        self._running = True
+        try:
+            if threading.current_thread() is threading.main_thread():
+                def stop(signum, frame):
+                    self._running = False
+                    self._event.set()
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    previous_handlers[sig] = signal.signal(sig, stop)
+            self._run_owned()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            # Failed cleanup must not authorize a second server in this process.
+            if self._ctrl is None:
+                owner.release()
+
+    def _run_owned(self):
+        try:
+            self._serve_owned_loop()
+        finally:
+            self._running = False
+            self._event.set()
+            # Wait for ALL robot users before releasing the process ownership.
+            loop = getattr(self, "_controller_thread", None)
+            if loop is not None and loop.ident is not None:
+                loop.join()
+            try:
+                self._teardown()
+                self._ctrl = None
+            finally:
+                if self._cmd_sock is not None:
+                    self._safe(self._cmd_sock.close)
+                if self._ctx is not None:
+                    self._safe(self._ctx.term)
+            logger.info("control server stopped")
+
+    def _serve_owned_loop(self):
         self._ctx = zmq.Context()
         self._cmd_sock = self._ctx.socket(zmq.ROUTER)
         self._cmd_sock.setsockopt(zmq.RCVTIMEO, 200)
         self._cmd_sock.setsockopt(zmq.LINGER, 0)
         self._cmd_sock.bind(f"tcp://*:{self._cmd_port}")
         self._ctrl = self._build_controller()
-        self._running = True
-        logger.info("control server up: cmd tcp://*:%d  state tcp://*:%d  (FCI %s)",
-                    self._cmd_port, self._state_port, self._ip)
-
         loop = threading.Thread(target=self._controller_loop, daemon=True, name="controller")
+        self._controller_thread = loop
         loop.start()
         try:
+            self._controller_ready.wait()
+            if self._controller_error is not None:
+                raise self._controller_error
+            logger.info("control server up: pid=%d cmd tcp://*:%d  state tcp://*:%d  (FCI %s)",
+                        os.getpid(), self._cmd_port, self._state_port, self._ip)
             while self._running:
                 try:
                     parts = self._cmd_sock.recv_multipart()
@@ -170,13 +224,12 @@ class ControlServer:
                 if reply is not None:
                     self._cmd_sock.send_multipart(
                         [identity, b"", msgpack.packb(reply, use_bin_type=True)])
+            if self._controller_error is not None:
+                raise self._controller_error
         finally:
             self._running = False
             self._event.set()
-            loop.join(timeout=5.0)
-            self._safe(self._cmd_sock.close)
-            self._safe(self._ctx.term)
-            logger.info("control server stopped")
+            loop.join()
 
     # -- main thread: dispatch (never touches the controller) ----------------
     def _dispatch(self, raw) -> Optional[dict]:
@@ -234,21 +287,30 @@ class ControlServer:
 
     # -- controller thread ---------------------------------------------------
     def _controller_loop(self):
-        push = self._ctx.socket(zmq.PUSH)
-        push.setsockopt(zmq.SNDHWM, 2)
-        push.setsockopt(zmq.LINGER, 0)
-        push.bind(f"tcp://*:{self._state_port}")
+        push = None
         try:
+            push = self._ctx.socket(zmq.PUSH)
+            push.setsockopt(zmq.SNDHWM, 2)
+            push.setsockopt(zmq.LINGER, 0)
+            push.bind(f"tcp://*:{self._state_port}")
+            self._controller_ready.set()
             while self._running:
                 self._event.wait(timeout=self._interval)
                 self._event.clear()
+                if not self._running:
+                    break
+                now = time.monotonic()
+                if self._last_cycle_ts is not None:
+                    self._cycle_gap_max_ms = max(
+                        self._cycle_gap_max_ms, (now - self._last_cycle_ts) * 1000)
+                self._last_cycle_ts = now
 
                 # 1. latest streamed servo/speed target (coalesced)
                 stream = None
                 with self._streaming_lock:
                     if self._streaming is not None:
                         stream, self._streaming = self._streaming, None
-                if stream is not None and self._connected and not self._busy:
+                if stream is not None and self._connected and not self._busy and self._session_fault is None:
                     method, args, kwargs = stream
                     try:
                         getattr(self._ctrl, method)(*args, **kwargs)
@@ -265,6 +327,7 @@ class ControlServer:
                         self._servo_fault_seq += 1
                         self._servo_fault = {"method": method, "error": str(e),
                                              "error_type": type(e).__name__}
+                        self._err(e)
 
                 # 2. drain command queue
                 while True:
@@ -291,6 +354,7 @@ class ControlServer:
                 # 5. poll + push the latest state snapshot
                 if self._connected:
                     snap = self._read_snapshot()
+                    self._record_evidence()
                     with self._snap_lock:
                         self._snap = snap
                     try:
@@ -299,12 +363,25 @@ class ControlServer:
                         pass
                     if self._seq % _HEALTH_LOG_EVERY == 0:
                         self._log_health()
+        except BaseException as exc:
+            self._controller_error = exc
         finally:
-            self._safe(push.close)
-            self._teardown()
+            self._running = False
+            self._controller_ready.set()
+            if push is not None:
+                self._safe(push.close)
 
     def _process(self, cmd: _Cmd):
         name = cmd.name
+        if self._session_fault is not None and name not in {
+                "connect", "disconnect", "reset_session", "recover",
+                "stop_move", "stop_servo", "stop_joints", "stop_tool", "stop_gripper"}:
+            cmd.result = dict(self._session_fault)
+            if name in _BLOCKING:
+                self._worker_result = cmd.result
+                self._busy = False
+            cmd.event.set()
+            return
         requested_async = bool(((cmd.params or {}).get("kwargs") or {}).get("is_async"))
         if name in _INLINE:
             self._run_inline(cmd)
@@ -332,6 +409,8 @@ class ControlServer:
                     # starts from a READY robot (a fresh connect does this; an
                     # already-open one skipped it -> the next move hit Reflex).
                     self._heal_session(cmd.params)
+                self._session_fault = None
+                self._evidence.clear()
                 res = {"success": True, "value": None}
             elif name == "disconnect":
                 if self._connected:
@@ -393,6 +472,11 @@ class ControlServer:
         motion can never pin _busy forever."""
         cmd = self._move_active
         if cmd is None:
+            return
+        if self._session_fault is not None:
+            self._worker_result = dict(self._session_fault)
+            self._move_active = None
+            self._busy = False
             return
         # Hang cap: the DRIVER owns it (check_move_hang == the async twin of the
         # blocking _safe_move deadline). F4 deleted the server's re-implementation
@@ -474,6 +558,9 @@ class ControlServer:
         self._servo_active = False
         try:
             cmd.result = self._call(cmd.name, cmd.params)
+            if cmd.name in {"reset_session", "recover"}:
+                self._session_fault = None
+                self._evidence.clear()
         except Exception as e:
             cmd.result = self._err(e)
         cmd.event.set()
@@ -495,11 +582,22 @@ class ControlServer:
         return {"success": True, "value": _jsonable(value)}
 
     def _read_snapshot(self) -> dict:
+        if self._session_fault is not None:
+            return {**self._snap, "state_stale": True,
+                    "session_fault": self._session_fault,
+                    "is_running": False, "servo_fault": self._servo_fault,
+                    "servo_fault_seq": self._servo_fault_seq}
         ctrl, prev, snap = self._ctrl, self._snap, {}
 
         def rd(key, fn, default):
+            if self._session_fault is not None:
+                snap[key] = prev.get(key, default)
+                return
             try:
                 snap[key] = _jsonable(fn())
+            except FrankaSessionLost as exc:
+                self._err(exc)
+                snap[key] = prev.get(key, default)
             except Exception:
                 snap[key] = prev.get(key, default)
 
@@ -526,42 +624,56 @@ class ControlServer:
         # reply channel, and this one already reaches the client every tick.
         snap["servo_fault"] = self._servo_fault
         snap["servo_fault_seq"] = self._servo_fault_seq
+        snap["state_stale"] = self._session_fault is not None
+        snap["session_fault"] = self._session_fault
         self._seq += 1
         snap["seq"] = self._seq
         snap["ts"] = time.monotonic()
         return snap
 
     def _teardown(self):
-        try:
-            if self._ctrl is not None and self._connected:
-                self._ctrl.disconnect()
-        except Exception:
-            pass
+        if self._ctrl is not None:
+            if self._helper is not None and self._helper.is_alive():
+                self._ctrl.stop_move()
+                self._helper.join()
+            # Also clean up a partially failed connect(), before _connected was set.
+            self._ctrl.disconnect()
         self._connected = False
 
     def _err(self, e) -> dict:
+        result = {"success": False, "error": str(e), "error_type": type(e).__name__}
+        if isinstance(e, FrankaSessionLost):
+            self._session_fault = result
+            self._servo_active = False
         logger.error("command fault: %s: %s | %s", type(e).__name__, e, self._fault_detail())
-        return {"success": False, "error": str(e), "error_type": type(e).__name__}
+        logger.error("FCI pre-fault evidence: %s", json.dumps(list(self._evidence)))
+        return result
 
     def _fault_detail(self) -> str:
         """franky/libfranka context for a post-mortem: the actual reason a move
         aborted (current_errors / last_motion_errors) + the FCI success rate."""
-        r = getattr(self._ctrl, "robot", None)
-        if r is None:
-            return "robot=None"
-        bits = []
-        for getter in (
-            lambda: "mode=%s" % r.state.robot_mode,
-            lambda: "has_errors=%s" % bool(r.has_errors),
-            lambda: "ccsr=%.3f" % float(r.state.control_command_success_rate),
-            lambda: "current_errors=%s" % r.state.current_errors,
-            lambda: "last_motion_errors=%s" % r.state.last_motion_errors,
-        ):
-            try:
-                bits.append(getter())
-            except Exception:
-                pass
-        return " ".join(bits) or "no-detail"
+        cached = dict(getattr(self._ctrl, "_diagnostic_state", {}))
+        if not cached:
+            return "cached_state=unavailable"
+        cached["age_ms"] = round((time.monotonic() - cached["ts"]) * 1000, 1)
+        return "cached_state=" + json.dumps(cached)
+
+    def _record_evidence(self):
+        now = time.monotonic()
+        if self._session_fault is not None or now - self._last_evidence_ts < 0.1:
+            return
+        cached = dict(getattr(self._ctrl, "_diagnostic_state", {}))
+        if not cached:
+            return
+        cached.update(sample_wall_time=time.time(),
+                      age_ms=round((now - cached["ts"]) * 1000, 1),
+                      cycle_gap_max_ms=round(self._cycle_gap_max_ms, 2),
+                      busy=self._busy, servo_active=self._servo_active,
+                      command=self._move_active.name if self._move_active else None,
+                      state_fallbacks_total=getattr(self._ctrl, "state_fallbacks_total", 0))
+        self._evidence.append(cached)
+        self._last_evidence_ts = now
+        self._cycle_gap_max_ms = 0.0
 
     def _log_health(self) -> None:
         """Health watchdog on the ~5 s cadence of the caller. SILENT while the
@@ -570,18 +682,13 @@ class ControlServer:
         success-rate dropping while we are actually commanding (idle sends no
         commands, so a ~0 ccsr there is normal, not a fault). Dumps thread
         scheduling once (the RT check)."""
-        r = getattr(self._ctrl, "robot", None)
-        if r is None:
+        cached = getattr(self._ctrl, "_diagnostic_state", {})
+        if not cached or self._session_fault is not None:
             return
-        try:
-            ccsr = float(r.state.control_command_success_rate)
-            mode = r.state.robot_mode
-            errors = bool(r.has_errors)
-        except Exception:
-            return                       # state momentarily unreadable: not a verdict
+        ccsr, mode, errors = cached["ccsr"], cached["mode"], cached["has_errors"]
         busy = bool(self._busy)
         payload = "ccsr=%.3f mode=%s errors=%s busy=%s" % (ccsr, mode, errors, busy)
-        bad = errors or ((busy or self._servo_active) and ccsr < _HEALTH_CCSR_OK)
+        bad = errors or ("Move" in mode and (busy or self._servo_active) and ccsr < _HEALTH_CCSR_OK)
         if bad:
             if not self._health_bad:
                 self._health_bad = True

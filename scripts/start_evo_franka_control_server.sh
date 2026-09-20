@@ -19,11 +19,8 @@ else
 fi
 CONTROL_CORES="${CTRL_CORES:-$DEFAULT_CORES}"
 
-# Free the fixed ZMQ ports from either protocol version. The bracketed regexes
-# do not match these pkill command lines themselves.
-pkill -9 -f "[e]vo_franka\.control_server" 2>/dev/null || true
-pkill -9 -f "[r]obots\.franka\.control_server" 2>/dev/null || true
-sleep 2
+# Ownership is acquired atomically by the server before constructing a controller.
+# An occupied robot or port fails startup; never kill an existing controller.
 
 [[ -f "$CONTROL_LOG.prev" ]] && mv -f "$CONTROL_LOG.prev" "$CONTROL_LOG.prev2"
 [[ -f "$CONTROL_LOG" ]] && mv -f "$CONTROL_LOG" "$CONTROL_LOG.prev"
@@ -46,7 +43,7 @@ CONTROL_PID=$!
 echo "$CONTROL_PID" >"$CONTROL_PID_FILE"
 
 for _ in {1..30}; do
-    if grep -q "control server up" "$CONTROL_LOG" 2>/dev/null; then
+    if kill -0 "$CONTROL_PID" 2>/dev/null && grep -q "control server up: pid=${CONTROL_PID} " "$CONTROL_LOG" 2>/dev/null; then
         echo "evo_franka control server READY pid=${CONTROL_PID} cores=${CONTROL_CORES} rt=${RT_STATUS}"
         exit 0
     fi

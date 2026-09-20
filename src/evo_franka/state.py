@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from typing import Optional, Sequence
 
 import numpy as np
@@ -210,7 +211,20 @@ class StateMixin:
         'Guiding', 'UserStopped'). Routed through _read_with_fallback so a transient
         FCI UDP drop (NetworkException / RuntimeError 'Net Exception') retries and
         falls back to the last-known mode instead of crashing preflight."""
-        return str(self._read_with_fallback("robot_mode", lambda: self.robot.state.robot_mode))
+        def read_mode():
+            state = self.robot.state
+            # Reuse this existing read; diagnostics must never initiate I/O.
+            self._diagnostic_state = {
+                "ts": time.monotonic(),
+                "wall_time": time.time(),
+                "mode": str(state.robot_mode),
+                "ccsr": float(state.control_command_success_rate),
+                "current_errors": str(state.current_errors),
+                "last_motion_errors": str(state.last_motion_errors),
+                "has_errors": bool(state.current_errors),
+            }
+            return state.robot_mode
+        return str(self._read_with_fallback("robot_mode", read_mode))
 
     def is_user_stopped(self) -> bool:
         """True when the user-stop / enabling device is engaged. Motion is

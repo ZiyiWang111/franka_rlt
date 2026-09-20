@@ -235,6 +235,7 @@ def test_connect_and_state_stream():
 def test_explicit_async_move_tool_uses_managed_completion_path():
     """Async move_tool must be polled/joined, while blocking move_tool keeps its helper."""
     srv = cs.ControlServer.__new__(cs.ControlServer)
+    srv._session_fault = None
     routed = []
     srv._start_move = lambda cmd: routed.append(("managed", cmd.name))
     srv._spawn_move = lambda cmd: routed.append(("helper", cmd.name))
@@ -272,6 +273,7 @@ def test_managed_async_move_stays_busy_until_finish_move_joins():
 
     srv = cs.ControlServer.__new__(cs.ControlServer)
     srv._ctrl = TrackedController()
+    srv._session_fault = None
     srv._servo_active = False
     srv._move_active = None
     srv._move_t0 = 0.0

@@ -22,10 +22,13 @@ from evo_franka._franky import (
     Gripper,
     RelativeDynamicsFactor,
     Robot,
+    create_robot,
+    create_gripper,
     _FRANKY_EXC,
     _STATE_READ_EXC,
 )
 from evo_franka.errors import FrankaSessionLost, wrap_franky_exc
+from evo_franka.runtime_owner import OwnershipError, require_owner
 from evo_franka.constants import (
     ACCELERATION_DYNAMICS_FACTOR,
     CARTESIAN_IMPEDANCE,
@@ -106,6 +109,8 @@ class SessionMixin:
         """Open the FCI session. Requires (Desk): brakes open, user-stop
         released, Execution mode, FCI active, no other FCI process attached.
         The Hand gripper is connected automatically when present."""
+        require_owner(self.robot_ip)
+        self._diagnostic_state = {}
         self.robot = None  # never keep a stale handle through a retry
         robot = None
         last: Optional[Exception] = None
@@ -124,8 +129,10 @@ class SessionMixin:
         try:
             for _ in range(attempts):
                 try:
-                    robot = Robot(self.robot_ip)
+                    robot = create_robot(self.robot_ip)
                     break
+                except OwnershipError:
+                    raise
                 except (*_FRANKY_EXC, RuntimeError, OSError) as e:  # transient ProtocolException on a busy link
                     last = e
                     _time.sleep(CONNECT_RETRY_DELAY_S)
@@ -151,13 +158,15 @@ class SessionMixin:
     def _connect_hand(self) -> None:
         """Open the Hand channel. OPTIONAL: a cell can run without it."""
         try:
-            self.gripper = Gripper(self.robot_ip)
+            self.gripper = create_gripper(self.robot_ip)
             _ = float(self.gripper.width)  # probe the connection
             # A rebuilt Hand handle must never inherit a Future/state belonging
             # to the dead connection it replaced.
             for name in ("_gripper_future", "_gripper_motion", "_gripper_motion_seq"):
                 if hasattr(self, name):
                     delattr(self, name)
+        except OwnershipError:
+            raise
         except (*_FRANKY_EXC, RuntimeError, OSError) as e:  # the Hand is OPTIONAL -> run without it
             self.gripper = None
             print(f"[franka] gripper unavailable ({type(e).__name__}: {str(e)[:80]}); "

@@ -11,6 +11,7 @@ from typing import Optional
 
 from evo_franka._franky import NetworkException, _FRANKY_EXC
 from evo_franka.errors import FrankaGripperError
+from evo_franka.runtime_owner import OwnershipError
 from evo_franka.constants import (
     GRIPPER_ASYNC_TIMEOUT_S,
     GRIPPER_EPSILON_INNER_M,
@@ -201,11 +202,13 @@ class GripperMixin:
         if not ip:
             return False
         try:
-            from evo_franka._franky import Gripper
-            g = Gripper(ip)
+            from evo_franka._franky import create_gripper
+            g = create_gripper(ip)
             _ = float(g.width)      # probe: only swap in a LIVE handle
             self.gripper = g
             return True
+        except OwnershipError:
+            raise
         except Exception:  # noqa: BLE001
             return False
 
@@ -357,10 +360,12 @@ class FrankaGripperSession(GripperMixin):
     def connect(self) -> "FrankaGripperSession":
         """Open ONLY the Franka Hand channel (no ``franky.Robot``, no arm FCI). Raises
         FrankaGripperError if the Hand does not respond, so teleop surfaces one clean line."""
-        from evo_franka._franky import Gripper, _FRANKY_EXC  # cell-only import (franky)
+        from evo_franka._franky import create_gripper, _FRANKY_EXC
         try:
-            g = Gripper(self.robot_ip)
+            g = create_gripper(self.robot_ip)
             _ = float(g.width)  # probe the Hand connection so a dead link fails HERE
+        except OwnershipError:
+            raise
         except (*_FRANKY_EXC, RuntimeError, OSError) as e:
             self.gripper = None
             raise FrankaGripperError(

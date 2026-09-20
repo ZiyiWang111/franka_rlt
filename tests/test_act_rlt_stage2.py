@@ -25,6 +25,7 @@ from act_rlt.train_stage2 import (
     retreat_pose_along_positive_y,
     sample_workspace_pose,
     save_checkpoint,
+    validate_args,
 )
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.replay_buffer import ReplayBuffer
@@ -334,6 +335,39 @@ def test_automatic_reset_retreat_and_workspace_sample() -> None:
     assert (sampled[:2] <= upper[:2] - RESET_XY_MARGIN_M).all()
     assert lower[2] <= sampled[2] <= upper[2]
     assert np.allclose(sampled[3:], measured[3:])
+
+
+def test_automatic_reset_can_use_explicit_narrow_sample_box() -> None:
+    workspace_min = np.array([0.570, -0.223, 0.128])
+    workspace_max = np.array([0.710, -0.060, 0.180])
+    sample_min = np.array([0.630, -0.120, 0.130])
+    sample_max = np.array([0.670, -0.080, 0.175])
+    sampled = sample_workspace_pose(
+        workspace_min,
+        workspace_max,
+        np.array([0.1, 0.2, 0.3]),
+        sample_min=sample_min,
+        sample_max=sample_max,
+    )
+    assert (sampled[:3] >= sample_min).all()
+    assert (sampled[:3] <= sample_max).all()
+
+
+def test_stage2_parser_accepts_narrow_sample_box() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--stage1-checkpoint", "/tmp/stage1", "--act-checkpoint", "/tmp/act",
+            "--allow-motion",
+            "--workspace-min", "0.570", "-0.223", "0.128",
+            "--workspace-max", "0.710", "-0.060", "0.180",
+            "--sample-min", "0.630", "-0.120", "0.130",
+            "--sample-max", "0.670", "-0.080", "0.175",
+        ]
+    )
+    validate_args(parser, args)
+    assert args.sample_min == [0.630, -0.120, 0.130]
+    assert args.sample_max == [0.670, -0.080, 0.175]
 
 
 def test_workspace_sample_rejects_xy_box_without_two_centimetre_margins() -> None:

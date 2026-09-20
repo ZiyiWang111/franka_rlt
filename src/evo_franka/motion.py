@@ -317,18 +317,17 @@ class MotionMixin:
         dropped (FrankaSessionLost); a ControlException is a reflex/abort
         (FrankaReflex, kind inferred from the message); anything else is a generic
         rejection (FrankaMotionRefused)."""
-        mode = None
-        try:
-            mode = self.robot.state.robot_mode
-        except (*_FRANKY_EXC, RuntimeError):  # best-effort mode read for the message only;
-            pass                              # never let a failed diagnostic read mask the fault
+        # A failed link must not be read again merely to format its exception.
+        cached = getattr(self, "_diagnostic_state", {})
+        mode = cached.get("mode")
         # Whether this controller lives inside the dedicated control server (the
         # server stamps it at construction) -- the starved-control-path hint must
         # not prescribe an isolation this process already is.
         hosted = bool(getattr(self, "hosted_by_control_server", False))
         if isinstance(e, NetworkException):
             return FrankaSessionLost(
-                f"{prefix} [network/comms] (robot_mode={mode}): {e}\n  {_mode_hint(mode, e, hosted)}")
+                f"{prefix} [network/comms] (last_cached_robot_mode={mode}): {e}; "
+                "FCI session lost; cached mode is not the current robot state.")
         if isinstance(e, ControlException):
             return FrankaReflex(
                 f"{prefix} [control reflex] (robot_mode={mode}): {e}\n  {_mode_hint(mode, e, hosted)}",

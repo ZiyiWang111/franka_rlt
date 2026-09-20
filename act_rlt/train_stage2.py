@@ -67,8 +67,16 @@ def sample_workspace_pose(
     workspace_min: np.ndarray,
     workspace_max: np.ndarray,
     orientation: np.ndarray,
+    *,
+    sample_min: np.ndarray | None = None,
+    sample_max: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Sample XYZ with a 2 cm XY inset and a fixed validated orientation."""
+    """Sample a reset XYZ and retain a fixed validated orientation.
+
+    Without an explicit sample box, the safe workspace is used with a 2 cm
+    X/Y inset.  An explicit sample box is used exactly as supplied; the safe
+    workspace continues to constrain all robot commands independently.
+    """
     workspace_min = np.asarray(workspace_min, dtype=float)
     workspace_max = np.asarray(workspace_max, dtype=float)
     orientation = np.asarray(orientation, dtype=float)
@@ -81,14 +89,30 @@ def sample_workspace_pose(
         raise ValueError("invalid reset workspace bounds")
     if orientation.shape != (3,) or not np.isfinite(orientation).all():
         raise ValueError(f"invalid reset orientation: {orientation}")
-    sample_min = workspace_min.copy()
-    sample_max = workspace_max.copy()
-    sample_min[:2] += RESET_XY_MARGIN_M
-    sample_max[:2] -= RESET_XY_MARGIN_M
-    if np.any(sample_min[:2] >= sample_max[:2]):
-        raise ValueError(
-            "workspace X/Y spans must each exceed 4 cm for the 2 cm reset margin"
-        )
+    if (sample_min is None) != (sample_max is None):
+        raise ValueError("supply both sample_min and sample_max")
+    if sample_min is None:
+        sample_min = workspace_min.copy()
+        sample_max = workspace_max.copy()
+        sample_min[:2] += RESET_XY_MARGIN_M
+        sample_max[:2] -= RESET_XY_MARGIN_M
+        if np.any(sample_min[:2] >= sample_max[:2]):
+            raise ValueError(
+                "workspace X/Y spans must each exceed 4 cm for the 2 cm reset margin"
+            )
+    else:
+        sample_min = np.asarray(sample_min, dtype=float)
+        sample_max = np.asarray(sample_max, dtype=float)
+        if (
+            sample_min.shape != (3,)
+            or sample_max.shape != (3,)
+            or not np.isfinite(sample_min).all()
+            or not np.isfinite(sample_max).all()
+            or np.any(sample_min >= sample_max)
+        ):
+            raise ValueError("invalid reset sample bounds")
+        if np.any(sample_min < workspace_min) or np.any(sample_max > workspace_max):
+            raise ValueError("reset sample bounds must lie inside the safe workspace")
     return np.concatenate([np.random.uniform(sample_min, sample_max), orientation])
 
 
@@ -128,6 +152,8 @@ class FrankaInsertionStage2Env:
         episode_time_s: float,
         max_step_m: float,
         max_step_rad: float,
+        sample_min: tuple[float, float, float] | None = None,
+        sample_max: tuple[float, float, float] | None = None,
     ) -> None:
         self.robot = robot
         self.pre = preprocessor
@@ -145,6 +171,12 @@ class FrankaInsertionStage2Env:
         self.max_step_rad = max_step_rad
         self.workspace_min = np.asarray(robot.config.workspace_min_xyz, dtype=float)
         self.workspace_max = np.asarray(robot.config.workspace_max_xyz, dtype=float)
+        self.sample_min = (
+            None if sample_min is None else np.asarray(sample_min, dtype=float)
+        )
+        self.sample_max = (
+            None if sample_max is None else np.asarray(sample_max, dtype=float)
+        )
         if (
             self.workspace_min.shape != (3,)
             or self.workspace_max.shape != (3,)
@@ -209,6 +241,8 @@ class FrankaInsertionStage2Env:
                 self.workspace_min,
                 self.workspace_max,
                 self._reset_orientation,
+                sample_min=self.sample_min,
+                sample_max=self.sample_max,
             )
             if self._first_reset_move:
                 choice = input(
@@ -403,6 +437,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--front-camera", default="233522075778")
     parser.add_argument("--workspace-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
+    parser.add_argument(
+        "--sample-min",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help="optional reset-pose sampling lower bound inside the safe workspace",
+    )
+    parser.add_argument(
+        "--sample-max",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help="optional reset-pose sampling upper bound inside the safe workspace",
+    )
     parser.add_argument("--fps", type=float, default=15.0)
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--max-step-m", type=float, default=0.002)
@@ -429,12 +477,25 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
     if (args.workspace_min is None) != (args.workspace_max is None):
         parser.error("supply both workspace bounds")
+    if (args.sample_min is None) != (args.sample_max is None):
+        parser.error("supply both --sample-min and --sample-max")
     if args.workspace_min is not None:
         bounds = np.asarray([args.workspace_min, args.workspace_max], dtype=float)
         if not np.isfinite(bounds).all() or np.any(bounds[0] >= bounds[1]):
             parser.error("workspace bounds must be finite with min < max")
         if np.any(bounds[1, :2] - bounds[0, :2] <= 2 * RESET_XY_MARGIN_M):
             parser.error("workspace X/Y spans must each exceed 4 cm for 2 cm margins")
+        if args.sample_min is not None:
+            sample_bounds = np.asarray([args.sample_min, args.sample_max], dtype=float)
+            if (
+                not np.isfinite(sample_bounds).all()
+                or np.any(sample_bounds[0] >= sample_bounds[1])
+            ):
+                parser.error("sample bounds must be finite with min < max")
+            if np.any(sample_bounds[0] < bounds[0]) or np.any(sample_bounds[1] > bounds[1]):
+                parser.error("sample bounds must lie inside the safe workspace")
+    elif args.sample_min is not None:
+        parser.error("sample bounds require workspace bounds")
     positive = {
         "fps": args.fps,
         "episode-time": args.episode_time,
@@ -638,6 +699,8 @@ def main() -> int:
         episode_time_s=args.episode_time,
         max_step_m=args.max_step_m,
         max_step_rad=args.max_step_rad,
+        sample_min=None if args.sample_min is None else tuple(args.sample_min),
+        sample_max=None if args.sample_max is None else tuple(args.sample_max),
     )
     output.mkdir(parents=True, exist_ok=True)
     (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
