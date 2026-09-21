@@ -8,8 +8,9 @@ import torch
 from act_rlt import register
 from act_rlt.act_encoder import (
     capture_act_forward_encoder_hidden,
-    extract_act_encoder_hidden,
+    extract_act_encoder_hidden_and_pos,
     prepare_act_batch,
+    predict_act_chunk_with_encoder_hidden_and_pos,
 )
 from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
 from evo_rlt.core.rl_token import RLTokenModule
@@ -46,6 +47,22 @@ def test_stage1_and_stage2_rl_token_shapes_are_distinct() -> None:
     assert module.encode_multi(act_hidden).shape == (3, 1, 16)
     assert module.encode(act_hidden).shape == (3, 16)
     assert module.reconstruction_loss(act_hidden).ndim == 0
+
+
+def test_position_correspondence_changes_rl_token_output() -> None:
+    torch.manual_seed(11)
+    module = RLTokenModule(
+        token_dim=16, nhead=2, num_enc_layers=1, num_dec_layers=1, ff_dim=32
+    ).eval()
+    hidden = torch.randn(1, 11, 16)
+    pos = torch.randn(1, 11, 16)
+    permutation = torch.randperm(hidden.shape[1])
+    with torch.no_grad():
+        original = module.encode(hidden + pos)
+        permuted_hidden = module.encode(hidden[:, permutation] + pos)
+        permuted_pairs = module.encode((hidden + pos)[:, permutation])
+    assert (original - permuted_hidden).abs().max().item() > 1e-5
+    torch.testing.assert_close(original, permuted_pairs, atol=1e-6, rtol=1e-6)
 
 
 def test_config_defaults_to_confirmed_stage1_architecture() -> None:
@@ -85,10 +102,28 @@ def test_real_act_encoder_only_helper_matches_forward_hook() -> None:
     for key, feature in config.image_features.items():
         batch[key] = torch.randn(1, *feature.shape)
     prepared = prepare_act_batch(policy, batch)
+    decoder_positions = []
 
-    with torch.inference_mode():
-        extracted = extract_act_encoder_hidden(policy.model, prepared)
-        captured = capture_act_forward_encoder_hidden(policy.model, prepared)
+    def capture_decoder_pos(_module, _args, kwargs):
+        decoder_positions.append(kwargs["encoder_pos_embed"].detach())
+
+    handle = policy.model.decoder.register_forward_pre_hook(capture_decoder_pos, with_kwargs=True)
+
+    try:
+        with torch.inference_mode():
+            baseline_action = policy.predict_action_chunk(batch)
+            extracted, pos = extract_act_encoder_hidden_and_pos(policy.model, prepared)
+            captured = capture_act_forward_encoder_hidden(policy.model, prepared)
+            hooked_action, hooked_hidden, hooked_pos = predict_act_chunk_with_encoder_hidden_and_pos(
+                policy, batch
+            )
+    finally:
+        handle.remove()
 
     assert extracted.shape == (1, 602, 768)  # empirical for this checkpoint, not an API constant
     assert torch.equal(extracted, captured)
+    assert pos.shape == (1, 602, 768)
+    assert torch.equal(pos.transpose(0, 1), decoder_positions[0])
+    assert torch.equal(hooked_pos, pos)
+    assert torch.equal(hooked_hidden, extracted)
+    assert torch.equal(hooked_action, baseline_action)

@@ -29,7 +29,7 @@ def main() -> None:
         default=Path("outputs/act_rlt_001_state7_act"),
         help="ACT run, checkpoint, or pretrained_model directory",
     )
-    parser.add_argument("--output", type=Path, default=Path("outputs/act_rlt_001_stage1"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/act_rlt_001_stage1_pos"))
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)

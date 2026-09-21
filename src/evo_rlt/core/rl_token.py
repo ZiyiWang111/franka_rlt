@@ -108,6 +108,7 @@ class RLTokenModule(nn.Module):
         vla_tokens: torch.Tensor,
         dim_std: torch.Tensor | None = None,
         gamma: float = 0.0,
+        encoder_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """L_ro = E[|| (pred_i - z_bar_i) * D^{-gamma} ||^2].
 
@@ -116,7 +117,9 @@ class RLTokenModule(nn.Module):
         high-variance dims that otherwise dominate the gradient.
         """
         z_bar = vla_tokens.detach()
-        z_rl_multi = self.encode_multi(z_bar)
+        # The reconstruction target and teacher tokens remain the original
+        # hidden states even when the encoder consumes position-aware memory.
+        z_rl_multi = self.encode_multi(z_bar if encoder_tokens is None else encoder_tokens.detach())
         pred = self.decode(z_rl_multi, z_bar)
         diff = pred - z_bar
         if gamma > 0 and dim_std is not None:

@@ -66,7 +66,10 @@ The final policy is at `OUTPUT/checkpoints/last/pretrained_model`.
 ## Stage 1: ACT encoder hidden to RL Token
 
 Stage 1 freezes the trained ACT policy and reconstructs its main transformer
-encoder output with the existing Evo-RLT `RLTokenModule`. For the current
+encoder output with the existing Evo-RLT `RLTokenModule`. Its RL encoder reads
+`encoder_out + encoder_pos_embed`, using the same latent/state and camera
+positions that ACT supplies to its decoder. The reconstruction target remains
+`encoder_out`. For the current
 two-camera VGA checkpoint the measured ACT hidden shape is `[B, 602, 768]`.
 The sequence length is discovered at runtime rather than configured: changing
 camera count, image resolution, or backbone stride can change it.
@@ -81,7 +84,7 @@ First inspect the generated LeRobot command:
 python -m act_rlt.train_rl_token \
   --root datasets/act_rlt_001_state7 \
   --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1 \
+  --output outputs/act_rlt_001_stage1_pos \
   --dry-run
 ```
 
@@ -91,14 +94,16 @@ Then train:
 python -m act_rlt.train_rl_token \
   --root datasets/act_rlt_001_state7 \
   --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1
+  --output outputs/act_rlt_001_stage1_pos
 ```
 
 Defaults are batch size 8, 10,000 steps, AdamW at `2e-4`, cosine decay with
 200 warmup steps, gradient clipping at 1.0, FP32, and checkpoints every 2,000
 steps. Image augmentation is disabled. The ACT checkpoint and its saved
 normalization processors are the source of truth; ACT parameters are frozen
-and excluded from the Stage-1 checkpoint.
+and excluded from the Stage-1 checkpoint. Train into a new output directory;
+the prior unpositioned RL Token checkpoint must not be resumed or used with
+the position-aware input.
 
 On the first batch, training compares the encoder-only helper with an
 `ACT.forward()` hook and requires exact equality. This one-time check can be
@@ -110,7 +115,7 @@ step, and RNG) from the `last` checkpoint with:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --output outputs/act_rlt_001_stage1 \
+  --output outputs/act_rlt_001_stage1_pos \
   --resume
 ```
 
@@ -121,13 +126,18 @@ Stage 2 freezes ACT and the Stage-1 RL Token encoder, then trains a two-layer
 the 768D RL token plus normalized 7D joint state, and predicts a four-step 6D
 TCP-delta chunk. The ACT reference is the first four arm actions from its
 `[B,16,7]` output; the gripper remains held outside the RL action space.
+In v3, Actor and each Critic project token, joint state, and reference/executed
+action through separate Linear + LayerNorm + tanh branches of 128 dimensions
+each. The resulting 384D vector enters the 256-wide MLP. This gives the three
+inputs equal channel counts and bounded scales before fusion. Stage-1 weights,
+the reference action, and the Actor/Critic losses are unchanged.
 
 Load and validate both checkpoints and the saved LeRobot processors without
 connecting to the robot:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1 \
+  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
   --act-checkpoint outputs/act_rlt_001_state7_act \
   --output outputs/act_rlt_001_stage2 \
   --dry-run
@@ -144,7 +154,7 @@ target critics: updated after every critic optimizer step
 target actor: updated after every actor optimizer step
 ```
 
-Stage-2 v2 initializes the Actor by imitating the ACT reference before its first
+Stage-2 v3 initializes the Actor by imitating the ACT reference before its first
 robot action. `--bc-init-steps` and `--critic-init-steps` configure this boundary
 initialization; no environment steps are consumed and its duration is excluded
 from the episode timeout. The frozen ACT and RL Token encoder remain unchanged.
@@ -201,8 +211,10 @@ retain min/max); Actor statistics use only updates that actually train the Actor
 Gradient norms are measured before clipping. Non-finite gradients abort updates.
 
 Use a new output directory for a fresh run, without `--resume` or `--replay-from`.
-Old v1 learner checkpoints cannot be resumed as v2: their learned Q scale and
-missing target Actor are incompatible. New checkpoints include initialization
+Old v1/v2 learner checkpoints cannot be resumed as v3: the Actor/Critic network
+shape has changed. Use `--replay-from OLD/checkpoints/latest.pt` with a new
+output directory to reuse transitions while initializing a new learner.
+New checkpoints include initialization
 status, target Actor/Critic, optimizers and random states for exact learner resume.
 
 Motion is guarded by both `--allow-motion` and explicit base-frame workspace
@@ -210,7 +222,7 @@ bounds:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1 \
+  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
   --act-checkpoint outputs/act_rlt_001_state7_act \
   --output outputs/act_rlt_001_stage2 \
   --allow-motion \

@@ -17,11 +17,10 @@ from typing import Callable, Protocol
 import torch
 from torch import Tensor, nn
 
-from act_rlt.act_encoder import predict_act_chunk_with_encoder_hidden
+from act_rlt.act_encoder import predict_act_chunk_with_encoder_hidden_and_pos
 from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
 from act_rlt.modeling_act_rlt_token import ACTRLTokenPolicy
-from evo_rlt.core.actor import ChunkActor
-from evo_rlt.core.critic import TwinCritic
+from act_rlt.stage2_networks import Stage2ChunkActor, Stage2TwinCritic
 from evo_rlt.core.interfaces import (
     TRANSITION_SOURCE_RL_AUTONOMOUS,
     TRANSITION_SOURCE_WARMUP_VLA,
@@ -61,7 +60,8 @@ class ACTStage2Config:
 
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
-    actor_fixed_std: float = 0.05
+    fusion_dim: int = 128
+    actor_fixed_std: float = 0.1
     actor_ref_dropout_p: float = 0.5
     actor_lr: float = 3e-4
 
@@ -70,14 +70,14 @@ class ACTStage2Config:
     critic_lr: float = 3e-4
 
     gamma: float = 0.99
-    beta: float = 1.0
+    beta: float = 0.5
     tau: float = 0.005
     batch_size: int = 256
     utd_ratio: int = 5
     actor_update_interval: int = 2
     grad_clip_norm: float = 1.0
     target_q_clip: float = 1.0
-    learner_version: int = 2
+    learner_version: int = 3
     bc_init_steps: int = 1000
     critic_init_steps: int = 1000
     temporal_collection: bool = False
@@ -90,12 +90,12 @@ class ACTStage2Config:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if self.target_q_clip != 1.0 or self.learner_version != 2:
-            raise ValueError("Stage-2 v2 requires terminal-success targets in [0,1]")
+        if self.target_q_clip != 1.0 or self.learner_version != 3:
+            raise ValueError("Stage-2 v3 requires terminal-success targets in [0,1]")
         if self.bc_init_steps < 0 or self.critic_init_steps < 0:
             raise ValueError("initialization steps must be non-negative")
         if self.temporal_collection:
-            raise ValueError("v2 chunk TD learning requires temporal_collection=False")
+            raise ValueError("chunk TD learning requires temporal_collection=False")
         if not all(torch.isfinite(torch.tensor(v)) and v > 0 for v in (self.max_step_m, self.max_step_rad)):
             raise ValueError("physical action limits must be finite and positive")
         positive_ints = {
@@ -104,6 +104,7 @@ class ACTStage2Config:
             "proprio_dim": self.proprio_dim,
             "actor_hidden_dim": self.actor_hidden_dim,
             "actor_num_layers": self.actor_num_layers,
+            "fusion_dim": self.fusion_dim,
             "critic_hidden_dim": self.critic_hidden_dim,
             "critic_num_layers": self.critic_num_layers,
             "batch_size": self.batch_size,
@@ -173,16 +174,15 @@ class ACTStage2Policy(nn.Module):
         # optimizer parameters; the Stage-1 and ACT paths are checkpoint metadata.
         object.__setattr__(self, "_stage1", stage1)
 
-        self.actor = ChunkActor(
+        self.actor = Stage2ChunkActor(
             state_dim=config.state_dim,
+            proprio_dim=config.proprio_dim,
             chunk_dim=config.chunk_dim,
+            fusion_dim=config.fusion_dim,
             hidden_dim=config.actor_hidden_dim,
             num_layers=config.actor_num_layers,
             fixed_std=config.actor_fixed_std,
             ref_dropout_p=config.actor_ref_dropout_p,
-            activation="relu",
-            layer_norm=False,
-            residual=False,
         )
 
     def _load_stage1(self) -> ACTRLTokenPolicy:
@@ -239,8 +239,8 @@ class ACTStage2Policy(nn.Module):
         preprocessor. ACT and the RL Token encoder stay frozen and in eval mode.
         """
         self._stage1.eval()
-        full_ref, hidden = predict_act_chunk_with_encoder_hidden(self._stage1._act, batch)
-        z_rl = self._stage1.rl_token.encode(hidden.detach().float())
+        full_ref, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(self._stage1._act, batch)
+        z_rl = self._stage1.rl_token.encode(hidden.float() + pos.float())
         proprio = batch[OBS_STATE][:, : self.config.proprio_dim].float()
         state_vec = torch.cat([z_rl, proprio], dim=-1)
         ref = full_ref[:, : self.config.chunk_length, : self.config.action_dim].float()
@@ -288,14 +288,13 @@ class Stage2Learner:
     def __init__(self, policy: ACTStage2Policy, config: ACTStage2Config) -> None:
         self.policy = policy
         self.config = config
-        self.critic = TwinCritic(
+        self.critic = Stage2TwinCritic(
             state_dim=config.state_dim,
+            proprio_dim=config.proprio_dim,
             chunk_dim=config.chunk_dim,
+            fusion_dim=config.fusion_dim,
             hidden_dim=config.critic_hidden_dim,
             num_layers=config.critic_num_layers,
-            activation="relu",
-            layer_norm=False,
-            residual=False,
         ).to(config.device)
         self.target_critic = copy.deepcopy(self.critic).eval()
         self.target_actor = copy.deepcopy(policy.actor).eval()
@@ -457,7 +456,7 @@ class Stage2Learner:
 
     def state_dict(self) -> dict:
         return {
-            "learner_version": 2,
+            "learner_version": 3,
             "initialized": self.initialized,
             "target_actor": self.target_actor.state_dict(),
             "actor": self.policy.actor.state_dict(),
@@ -470,8 +469,8 @@ class Stage2Learner:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        if state.get("learner_version") != 2:
-            raise ValueError("legacy learner cannot resume as v2; use --replay-from for a fresh learner")
+        if state.get("learner_version") != 3:
+            raise ValueError("old Stage-2 network cannot resume as v3; use --replay-from for a fresh learner")
         self.target_actor.load_state_dict(state["target_actor"])
         self.initialized = bool(state["initialized"])
         self.policy.actor.load_state_dict(state["actor"])

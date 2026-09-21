@@ -542,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--replay-from", type=Path, help="reuse compatible replay with fresh Actor/Critic; new output required")
-    parser.add_argument("--prepare-only", action="store_true", help="initialize from replay and save v2 checkpoint without connecting robot")
+    parser.add_argument("--prepare-only", action="store_true", help="initialize from replay and save v3 checkpoint without connecting robot")
     parser.add_argument("--bc-init-steps", type=int, default=1000)
     parser.add_argument("--critic-init-steps", type=int, default=1000)
     parser.add_argument("--dry-run", action="store_true")
@@ -586,9 +586,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="cumulative online-step target after warmup; use 20000 to add 10000 after 10000",
     )
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--fusion-dim", type=int, default=128,
+                        help="width of each token, joint, and action input branch (default: 128)")
     parser.add_argument("--utd-ratio", type=int, default=5)
-    parser.add_argument("--beta", type=float, default=1.0,
-                        help="BC regularization coefficient in -Q + beta * BC (default: 1.0)")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="BC regularization coefficient in -Q + beta * BC (default: 0.5)")
+    parser.add_argument("--exploration-sigma", type=float, default=0.1,
+                        help="fixed normalized action standard deviation during collection (default: 0.1)")
     parser.add_argument("--save-every-env-steps", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     return parser
@@ -680,8 +684,11 @@ def load_checkpoint(
     replay: ReplayBuffer,
 ) -> OnlineStage2Metrics:
     saved = torch.load(path, map_location="cpu", weights_only=False)
-    if saved["learner"].get("learner_version") != 2:
-        raise ValueError("legacy Q learner: use --replay-from with a new output directory")
+    if saved["learner"].get("learner_version") != 3:
+        raise ValueError(
+            "old Stage-2 network cannot resume with balanced input fusion; "
+            "use --replay-from with a new output directory"
+        )
     saved_config = saved["config"]
     current_config = config.to_dict()
     # Checkpoints created before the real-time temporal collector existed have
@@ -862,8 +869,10 @@ def main() -> int:
         warmup_steps=args.warmup_steps,
         total_env_steps=args.total_env_steps,
         batch_size=args.batch_size,
+        fusion_dim=args.fusion_dim,
         utd_ratio=args.utd_ratio,
         beta=args.beta,
+        actor_fixed_std=args.exploration_sigma,
         seed=args.seed,
         temporal_ensemble_coeff=args.temporal_ensemble_coeff,
         bc_init_steps=args.bc_init_steps,
@@ -908,7 +917,7 @@ def main() -> int:
         metrics.actor_updates = learner.actor_updates
         save_checkpoint(output, config, learner, replay, metrics)
         (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
-        print(f"Prepared v2 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
+        print(f"Prepared v3 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
         return 0
 
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig

@@ -16,8 +16,10 @@ def prepare_act_batch(policy: ACTPolicy, batch: dict[str, Tensor]) -> dict[str, 
     return prepared
 
 
-def extract_act_encoder_hidden(model: ACT, batch: dict[str, Tensor | list[Tensor]]) -> Tensor:
-    """Run the frozen/eval ACT path through its main encoder and return [B,S,D].
+def extract_act_encoder_hidden_and_pos(
+    model: ACT, batch: dict[str, Tensor | list[Tensor]]
+) -> tuple[Tensor, Tensor]:
+    """Return ACT encoder output [B,S,D] and its decoder memory position [1,S,D].
 
     This mirrors the encoder-input construction in LeRobot 0.5.1 ACT.forward,
     stopping before the ACT action decoder. Sequence length S is derived from
@@ -79,7 +81,12 @@ def extract_act_encoder_hidden(model: ACT, batch: dict[str, Tensor | list[Tensor
     tokens = torch.stack(encoder_in_tokens, dim=0)
     positions = torch.stack(encoder_in_pos_embed, dim=0)
     hidden_sbd = model.encoder(tokens, pos_embed=positions)
-    return hidden_sbd.transpose(0, 1).contiguous()
+    return hidden_sbd.transpose(0, 1).contiguous(), positions.transpose(0, 1).contiguous()
+
+
+def extract_act_encoder_hidden(model: ACT, batch: dict[str, Tensor | list[Tensor]]) -> Tensor:
+    """Return the frozen ACT encoder output [B,S,D]."""
+    return extract_act_encoder_hidden_and_pos(model, batch)[0]
 
 
 def capture_act_forward_encoder_hidden(
@@ -132,3 +139,37 @@ def predict_act_chunk_with_encoder_hidden(
         raise RuntimeError(f"expected one ACT encoder output, captured {len(captured)}")
     hidden = captured[0].transpose(0, 1).contiguous()
     return action_chunk, hidden
+
+
+def predict_act_chunk_with_encoder_hidden_and_pos(
+    policy: ACTPolicy, batch: dict[str, Tensor]
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Capture ACT's action, encoder output and corresponding decoder memory position."""
+    if policy.training or policy.model.training:
+        raise RuntimeError("ACT must be in eval mode for Stage-2 extraction")
+
+    hidden_outputs: list[Tensor] = []
+    positions: list[Tensor] = []
+
+    def encoder_hook(_module, _args, output: Tensor) -> None:
+        hidden_outputs.append(output.detach())
+
+    def decoder_hook(_module, _args, kwargs) -> None:
+        positions.append(kwargs["encoder_pos_embed"].detach())
+
+    encoder_handle = policy.model.encoder.register_forward_hook(encoder_hook)
+    decoder_handle = policy.model.decoder.register_forward_pre_hook(decoder_hook, with_kwargs=True)
+    try:
+        action_chunk = policy.predict_action_chunk(batch)
+    finally:
+        encoder_handle.remove()
+        decoder_handle.remove()
+    if len(hidden_outputs) != 1 or len(positions) != 1:
+        raise RuntimeError(
+            f"expected one ACT encoder output and position, got {len(hidden_outputs)} and {len(positions)}"
+        )
+    hidden = hidden_outputs[0].transpose(0, 1).contiguous()
+    pos = positions[0].transpose(0, 1).contiguous()
+    if pos.shape[1:] != hidden.shape[1:] or pos.shape[0] not in (1, hidden.shape[0]):
+        raise RuntimeError(f"ACT position {tuple(pos.shape)} does not match hidden {tuple(hidden.shape)}")
+    return action_chunk, hidden, pos

@@ -11,7 +11,11 @@ import pytest
 import torch
 from torch import nn
 
-from act_rlt.act_encoder import predict_act_chunk_with_encoder_hidden
+from act_rlt.act_encoder import (
+    predict_act_chunk_with_encoder_hidden,
+    predict_act_chunk_with_encoder_hidden_and_pos,
+)
+from act_rlt.stage2_networks import ChunkInputFusion, Stage2ChunkActor, Stage2TwinCritic
 from act_rlt.stage2 import (
     ACTStage2Config,
     ChunkExecution,
@@ -31,7 +35,6 @@ from act_rlt.train_stage2 import (
     save_checkpoint,
     validate_args,
 )
-from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.utils import unflatten_chunk
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -53,6 +56,7 @@ def _config(**overrides) -> ACTStage2Config:
         "replay_capacity": 32,
         "actor_hidden_dim": 16,
         "critic_hidden_dim": 16,
+        "fusion_dim": 16,
         "bc_init_steps": 0,
         "critic_init_steps": 0,
     }
@@ -69,6 +73,12 @@ class _FakeACTModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = _FakeEncoder()
+        self.decoder = _FakeDecoder()
+
+
+class _FakeDecoder(nn.Module):
+    def forward(self, hidden, *, encoder_pos_embed):
+        return hidden
 
 
 class _FakeACTPolicy(nn.Module):
@@ -82,6 +92,7 @@ class _FakeACTPolicy(nn.Module):
         batch_size = batch["observation.state"].shape[0]
         tokens = torch.zeros(5, batch_size, 8)
         self.model.encoder(tokens)
+        self.model.decoder(tokens, encoder_pos_embed=torch.arange(5).view(5, 1, 1).expand(5, 1, 8))
         return torch.full((batch_size, 16, 7), 0.25)
 
 
@@ -96,14 +107,58 @@ def test_act_reference_and_hidden_come_from_one_forward() -> None:
     assert torch.equal(hidden, torch.ones_like(hidden))
 
 
+def test_act_reference_and_position_come_from_same_forward() -> None:
+    policy = _FakeACTPolicy().eval()
+    batch = {"observation.state": torch.zeros(2, 7)}
+    baseline = policy.predict_action_chunk(batch)
+    action, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(policy, batch)
+    assert policy.calls == 2
+    assert torch.equal(action, baseline)
+    assert hidden.shape == (2, 5, 8)
+    assert pos.shape == (1, 5, 8)
+    assert torch.equal(pos[0, :, 0], torch.arange(5))
+
+
 def test_actor_outputs_final_action_not_reference_plus_residual() -> None:
-    actor = ChunkActor(state_dim=775, chunk_dim=24, hidden_dim=16, num_layers=2)
+    actor = Stage2ChunkActor(
+        state_dim=775, proprio_dim=7, chunk_dim=24,
+        fusion_dim=16, hidden_dim=16, num_layers=2,
+    )
     for parameter in actor.parameters():
         nn.init.zeros_(parameter)
     state = torch.zeros(2, 775)
     reference = torch.ones(2, 24)
     mean, _ = actor(state, reference)
     assert torch.equal(mean, torch.zeros_like(mean))
+
+
+def test_stage2_fusion_gives_each_input_equal_width_and_bounded_scale() -> None:
+    fusion = ChunkInputFusion(state_dim=775, proprio_dim=7, chunk_dim=24, fusion_dim=16)
+    state = torch.randn(3, 775, requires_grad=True)
+    reference = torch.randn(3, 24, requires_grad=True)
+    features = fusion(state, reference)
+    assert features.shape == (3, 48)
+    assert torch.isfinite(features).all()
+    assert features.abs().max() <= 1
+    features.square().sum().backward()
+    assert state.grad is not None and torch.isfinite(state.grad).all()
+    assert reference.grad is not None and torch.isfinite(reference.grad).all()
+    assert state.grad[:, :768].abs().sum() > 0
+    assert state.grad[:, 768:].abs().sum() > 0
+    assert reference.grad.abs().sum() > 0
+
+
+def test_stage2_actor_and_twin_critic_use_balanced_production_shapes() -> None:
+    state = torch.randn(2, 775)
+    chunk = torch.randn(2, 24)
+    actor = Stage2ChunkActor(state_dim=775, proprio_dim=7, chunk_dim=24)
+    critic = Stage2TwinCritic(state_dim=775, proprio_dim=7, chunk_dim=24)
+    assert actor.fusion(state, chunk).shape == (2, 384)
+    mean, std = actor(state, chunk)
+    q1, q2 = critic(state, chunk)
+    assert mean.shape == std.shape == (2, 24)
+    assert q1.shape == q2.shape == (2, 1)
+    assert torch.isfinite(mean).all() and torch.isfinite(q1).all() and torch.isfinite(q2).all()
 
 
 def test_terminal_metrics_are_compact_while_json_fields_remain_available() -> None:
@@ -241,9 +296,11 @@ class _FakeStage2Policy(nn.Module):
     def __init__(self, config: ACTStage2Config):
         super().__init__()
         self.config = config
-        self.actor = ChunkActor(
+        self.actor = Stage2ChunkActor(
             config.state_dim,
+            config.proprio_dim,
             config.chunk_dim,
+            fusion_dim=config.fusion_dim,
             hidden_dim=config.actor_hidden_dim,
             num_layers=config.actor_num_layers,
             fixed_std=config.actor_fixed_std,
@@ -778,6 +835,20 @@ def test_stage2_checkpoint_restores_learner_replay_and_counters() -> None:
     assert restored_learner.actor_updates == learner.actor_updates
     assert restored_metrics.env_steps == metrics.env_steps
     assert restored_metrics.chunks == metrics.chunks
+
+
+def test_old_stage2_weights_require_fresh_learner() -> None:
+    config = _config()
+    learner = Stage2Learner(_FakeStage2Policy(config), config)
+    with TemporaryDirectory() as directory:
+        output = Path(directory)
+        save_checkpoint(output, config, learner, ReplayBuffer(config.replay_capacity), OnlineStage2Metrics())
+        path = output / "checkpoints/latest.pt"
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        state["learner"]["learner_version"] = 2
+        torch.save(state, path)
+        with pytest.raises(ValueError, match="--replay-from"):
+            load_checkpoint(path, config, learner, ReplayBuffer(config.replay_capacity))
 
 
 @pytest.mark.parametrize(

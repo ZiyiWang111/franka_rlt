@@ -15,7 +15,7 @@ from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
 
 from act_rlt.act_encoder import (
     capture_act_forward_encoder_hidden,
-    extract_act_encoder_hidden,
+    extract_act_encoder_hidden_and_pos,
     prepare_act_batch,
 )
 from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
@@ -110,11 +110,11 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         pass
 
-    def extract_act_hidden(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return frozen ACT encoder hidden states as dynamic [B,S,D]."""
+    def extract_act_hidden_and_pos(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Return frozen ACT hidden states and ACT's matching memory positions."""
         prepared = prepare_act_batch(self._act, batch)
         with torch.no_grad():
-            hidden = extract_act_encoder_hidden(self._act.model, prepared)
+            hidden, pos = extract_act_encoder_hidden_and_pos(self._act.model, prepared)
             if not self._encoder_equivalence_verified:
                 reference = capture_act_forward_encoder_hidden(self._act.model, prepared)
                 if not torch.equal(hidden, reference):
@@ -129,22 +129,31 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
             raise RuntimeError(
                 f"expected ACT hidden [B,S,{self.config.rl_token_dim}], got {tuple(hidden.shape)}"
             )
+        if pos.shape[1:] != hidden.shape[1:] or pos.shape[0] not in (1, hidden.shape[0]):
+            raise RuntimeError(f"ACT position {tuple(pos.shape)} does not match hidden {tuple(hidden.shape)}")
         if not self._logged_hidden_shape:
             log.info("ACT hidden shape entering RL Token: %s", tuple(hidden.shape))
             self._logged_hidden_shape = True
-        return hidden.to(dtype=torch.float32)
+        return hidden.float(), pos.float()
+
+    def extract_act_hidden(self, batch: dict[str, Tensor]) -> Tensor:
+        """Return frozen ACT encoder hidden states as dynamic [B,S,D]."""
+        return self.extract_act_hidden_and_pos(batch)[0]
 
     def encode_multi(self, batch: dict[str, Tensor]) -> Tensor:
         """Stage-1 bottleneck interface: return [B,N,D]."""
-        return self.rl_token.encode_multi(self.extract_act_hidden(batch))
+        hidden, pos = self.extract_act_hidden_and_pos(batch)
+        return self.rl_token.encode_multi(hidden + pos)
 
     def encode(self, batch: dict[str, Tensor]) -> Tensor:
         """Stage-2 Actor/Critic interface: mean-pool RL tokens to [B,D]."""
-        return self.rl_token.encode(self.extract_act_hidden(batch))
+        hidden, pos = self.extract_act_hidden_and_pos(batch)
+        return self.rl_token.encode(hidden + pos)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        hidden = self.extract_act_hidden(batch)
-        loss_recon = self.rl_token.reconstruction_loss(hidden)
+        hidden, pos = self.extract_act_hidden_and_pos(batch)
+        rl_memory = hidden + pos
+        loss_recon = self.rl_token.reconstruction_loss(hidden, encoder_tokens=rl_memory)
         loss = self.config.recon_weight * loss_recon
         return loss, {
             "loss": loss.detach().item(),
