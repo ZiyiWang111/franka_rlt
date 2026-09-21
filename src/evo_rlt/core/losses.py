@@ -23,6 +23,9 @@ def discounted_chunk_return(
     """
     C = reward_seq.shape[1]
     discounts = compute_discount_vector(gamma, C, device=reward_seq.device)
+    if actual_steps is not None:
+        mask = torch.arange(C, device=reward_seq.device)[None, :] < actual_steps[:, None]
+        reward_seq = reward_seq.masked_fill(~mask, 0)
     return (reward_seq * discounts.unsqueeze(0)).sum(dim=1, keepdim=True)
 
 

@@ -137,16 +137,73 @@ The confirmed scheduling semantics are:
 
 ```text
 first 4,000 low-level steps: frozen ACT actions, replay collection, no updates
+warmup boundary: 1,000 BC-only Actor updates, then 1,000 Critic-only updates
 next 10,000 online steps: one collected chunk -> one transition -> five critic updates
 actor update: every second critic update
 target critics: updated after every critic optimizer step
+target actor: updated after every actor optimizer step
 ```
 
-The current repository-faithful order executes the first Actor chunk before
-the first replay update, so the Actor is still randomly initialized at that
-boundary. Treat the initial motion run as an engineering validation and keep
-the physical stop available. If desired, add an explicit replay-only bootstrap
-as a separately reviewed deviation before longer training.
+Stage-2 v2 initializes the Actor by imitating the ACT reference before its first
+robot action. `--bc-init-steps` and `--critic-init-steps` configure this boundary
+initialization; no environment steps are consumed and its duration is excluded
+from the episode timeout. The frozen ACT and RL Token encoder remain unchanged.
+
+Success supplies a single terminal +1; other steps supply zero. The target is
+`sum(gamma**i * reward[i]) + gamma**actual_steps * (1-done) * clamp(min_target_Q, 0, 1)`.
+Unexecuted reward padding is masked. Truncations (including workspace refusals)
+are treated as episode ends with no bootstrap, matching this reset-based task.
+The deterministic target Actor supplies next actions. Both target actions and
+Actor-loss actions pass through differentiable copies of the robot's physical
+translation/rotation norm limits, using the saved ACT mean/std normalization.
+The online Actor still outputs final actions, with BC toward ACT and Gaussian
+exploration during collection. The Actor Q output itself is not hard-clipped.
+
+Stage 2 now uses persistent camera, inference, and servo threads by default.
+Each four-step proposal is executed intact, without temporal ensembling or
+mid-chunk replanning. No extra launch flag is needed. The legacy
+`--temporal-ensemble-coeff` field is accepted for checkpoint compatibility but
+does not enable blending.
+
+The workers run continuously across chunk boundaries while the main thread
+inserts completed transitions and performs the same five updates per online
+transition. Inference uses a separate Actor snapshot published between updates;
+it never reads partially updated parameters. Collection may lead learning by a
+few chunks. Warmup executes only ACT references with no learner updates and
+pauses at its step budget for BC/Critic initialization before Actor control.
+Workers also stop at episode boundaries and the online budget. Reset and human
+outcome prompts run only after the servo worker stops. A checkpoint contains
+consumed replay transitions; in-flight collection is not resumed after restart.
+
+The observation captured after the final command is encoded once and shared by
+the previous transition's next state and the following chunk's current state.
+Unlike ACT's optional early queue refill, this preserves a boundary observation
+instead of planning from a mid-chunk observation. Consequently camera + inference
+must fit the remaining control period to avoid a boundary gap. Late predictions
+hold the last target, never repeat a relative action or trigger a catch-up burst;
+an action queue wait over 0.5 seconds stops collection (2 seconds at startup).
+GPU contention from learning can still increase latency.
+
+`metrics.jsonl` reports `execution_mode=persistent_three_thread_fixed_chunk`,
+`max_command_interval_ms` (including chunk boundaries), `deadline_misses`,
+`max_lateness_ms`, and `boundary_inference_ms`. At 15 Hz the intended command
+interval is 66.7 ms. These measurements are needed to assess real robot timing.
+
+These are deliberate engineering changes from the earlier Evo-RLT adaptation:
+reward-aware target bounds, target Actor, boundary BC/Critic initialization,
+and matching physical action projection during learning. They are not claimed
+as exact paper reproduction or a guarantee of real-world success.
+
+`metrics.jsonl` includes Q1/Q2, replay and Actor Q, raw target Q, upper/lower
+clip fractions, TD targets/errors, reward, terminal fraction, BC loss and
+Actor-reference RMSE. Statistics average all UTD updates for each chunk (extrema
+retain min/max); Actor statistics use only updates that actually train the Actor.
+Gradient norms are measured before clipping. Non-finite gradients abort updates.
+
+Use a new output directory for a fresh run, without `--resume` or `--replay-from`.
+Old v1 learner checkpoints cannot be resumed as v2: their learned Q scale and
+missing target Actor are incompatible. New checkpoints include initialization
+status, target Actor/Critic, optimizers and random states for exact learner resume.
 
 Motion is guarded by both `--allow-motion` and explicit base-frame workspace
 bounds:
@@ -186,8 +243,8 @@ steps. Resume with the same arguments plus `--resume`.
 `--total-env-steps` is a cumulative online target. To continue for another
 10,000 online steps after finishing 10,000, resume with
 `--total-env-steps 20000`; the existing replay, networks, optimizers, and update
-counters are retained. Resume permits changing only `warmup_steps` and this
-cumulative online target, with progress-safety checks.
+counters are retained. Resume permits changing `warmup_steps`, this cumulative
+online target and `device`, with progress-safety checks.
 
 ## ACT inference (first version)
 

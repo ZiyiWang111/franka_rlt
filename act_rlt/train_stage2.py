@@ -192,6 +192,11 @@ class FrankaInsertionStage2Env:
         # move retains a one-time operator authorization but requires no teaching.
         self._needs_automatic_reset = True
         self._first_reset_move = True
+        self._runtime = None
+        self._episode_sampled_tcp_command_sum = np.zeros(6, dtype=float)
+        self._episode_reference_tcp_command_sum = np.zeros(6, dtype=float)
+        self._episode_mean_tcp_command_sum = np.zeros(6, dtype=float)
+        self._episode_tcp_target_comparison_steps = 0
 
     def _processed_observation(self) -> dict[str, torch.Tensor]:
         return self.pre(observation_frame(self.robot.get_observation()))
@@ -280,17 +285,119 @@ class FrankaInsertionStage2Env:
             print("Please enter s, f, or q.", flush=True)
 
     def reset(self, *, episode_id: int, warmup: bool) -> dict[str, torch.Tensor]:
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
         self._close_monitor()
         phase = "ACT WARMUP" if warmup else "RLT ACTOR"
         print(f"\nPreparing Episode {episode_id} [{phase}] with automatic reset.", flush=True)
         self._move_to_accepted_workspace_sample()
         self._needs_automatic_reset = False
         self.robot.resync_command_pose()
+        self._episode_sampled_tcp_command_sum.fill(0.0)
+        self._episode_reference_tcp_command_sum.fill(0.0)
+        self._episode_mean_tcp_command_sum.fill(0.0)
+        self._episode_tcp_target_comparison_steps = 0
         batch = self._processed_observation()
         self._episode_start = time.monotonic()
         self._monitor = OutcomeMonitor()
         print("Episode active: s=success, f=failure, q=stop training", flush=True)
         return batch
+
+    def _record_episode_action_comparison(self, result: ChunkExecution) -> None:
+        """Add executed command targets and emit an episode-end comparison.
+
+        A reference rollout is intentionally not executed on the robot.  The
+        reported endpoint difference is therefore the difference between the
+        *integrated, safety-bounded TCP command deltas* from the same episode
+        start, not a second measured physical rollout.
+        """
+        # Keep this helper usable by lightweight test environments which are
+        # intentionally constructed without running the hardware __init__.
+        for name in (
+            "_episode_sampled_tcp_command_sum",
+            "_episode_reference_tcp_command_sum",
+            "_episode_mean_tcp_command_sum",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, np.zeros(6, dtype=float))
+        if not hasattr(self, "_episode_tcp_target_comparison_steps"):
+            self._episode_tcp_target_comparison_steps = 0
+        sums = (
+            ("_sampled_tcp_command_sum", self._episode_sampled_tcp_command_sum),
+            ("_reference_tcp_command_sum", self._episode_reference_tcp_command_sum),
+            ("_mean_tcp_command_sum", self._episode_mean_tcp_command_sum),
+        )
+        for name, destination in sums:
+            value = np.asarray(result.info.pop(name, np.zeros(6)), dtype=float)
+            if value.shape != (6,) or not np.isfinite(value).all():
+                raise RuntimeError(f"invalid Stage-2 TCP command summary {name}: {value}")
+            destination += value
+        self._episode_tcp_target_comparison_steps += result.actual_steps
+        if not result.done:
+            return
+
+        def add_delta(prefix: str, delta: np.ndarray) -> None:
+            result.info[f"{prefix}_xyz_m"] = delta[:3].tolist()
+            result.info[f"{prefix}_translation_norm_mm"] = float(np.linalg.norm(delta[:3]) * 1000)
+            result.info[f"{prefix}_rotvec_rad"] = delta[3:].tolist()
+            result.info[f"{prefix}_rotation_norm_rad"] = float(np.linalg.norm(delta[3:]))
+
+        # This is the quantity that measures the net effect of sigma after
+        # physical de-normalization and safety clipping.
+        add_delta(
+            "episode_exploration_vs_actor_mean_tcp_target",
+            self._episode_sampled_tcp_command_sum - self._episode_mean_tcp_command_sum,
+        )
+        # Keep the learned-policy deviation separate from random exploration.
+        add_delta(
+            "episode_actor_mean_vs_reference_tcp_target",
+            self._episode_mean_tcp_command_sum - self._episode_reference_tcp_command_sum,
+        )
+        add_delta(
+            "episode_sampled_vs_reference_tcp_target",
+            self._episode_sampled_tcp_command_sum - self._episode_reference_tcp_command_sum,
+        )
+        result.info["episode_tcp_target_comparison_steps"] = self._episode_tcp_target_comparison_steps
+
+    def execute_policy_chunk(
+        self, policy: ACTStage2Policy, initial_batch: dict[str, torch.Tensor],
+        *, warmup: bool, remaining_steps: int,
+    ) -> ChunkExecution:
+        """Consume one result from the persistent fixed-chunk collector."""
+        from act_rlt.stage2_runtime import FixedChunkRuntime
+
+        if self._runtime is None:
+            self._runtime = FixedChunkRuntime(
+                self, policy, initial_batch, warmup=warmup, step_budget=remaining_steps
+            )
+        elif self._runtime.warmup != warmup:
+            raise RuntimeError("collector must pause at the warmup boundary")
+        self._runtime.publish_actor(policy.actor)
+        result = self._runtime.next_result()
+        self._record_episode_action_comparison(result)
+        if result.info["collector_paused"]:
+            self._runtime.close()
+            self._runtime = None
+
+        if result.info.get("timed_out"):
+            self._close_monitor()
+            key = self._prompt_outcome_after_timeout()
+            if key == "s":
+                result.reward_seq[result.actual_steps - 1] = 1.0
+                result.info["success"] = True
+                result.terminated = True
+            elif key == "f":
+                result.terminated = True
+            else:
+                result.truncated = result.stop_requested = True
+        if result.done:
+            self._close_monitor()
+            if not result.stop_requested and not result.info["workspace_violation"]:
+                self._retreat_after_outcome()
+            if not result.stop_requested:
+                self._needs_automatic_reset = True
+        return result
 
     def _normalize_executed_action(self, physical_full: torch.Tensor) -> torch.Tensor:
         """Map one safety-bounded physical 7D action back to ACT model space."""
@@ -320,7 +427,7 @@ class FrankaInsertionStage2Env:
         success = False
         workspace_violation = False
         workspace_error: str | None = None
-        last_batch: dict[str, torch.Tensor] | None = None
+        last_batch = None
         clipping_count = 0
 
         for index in range(self.config.chunk_length):
@@ -328,12 +435,11 @@ class FrankaInsertionStage2Env:
             normalized_full = full_reference[:, index, :].clone()
             normalized_full[:, : self.config.action_dim] = action_chunk[:, index, :]
             physical_full = self.post(normalized_full).detach().cpu().reshape(-1)
-            if physical_full.numel() != full_reference.shape[-1]:
-                raise RuntimeError(f"unexpected postprocessed action shape: {tuple(physical_full.shape)}")
-
-            command = bounded_action(
-                physical_full.numpy(), self.max_step_m, self.max_step_rad
-            )
+            if physical_full.numel() != self.config.action_dim + 1:
+                raise RuntimeError(
+                    f"unexpected Stage-2 physical action shape: {tuple(physical_full.shape)}"
+                )
+            command = bounded_action(physical_full.numpy(), self.max_step_m, self.max_step_rad)
             bounded_six = torch.tensor(list(command.values()), dtype=physical_full.dtype)
             if not torch.allclose(bounded_six, physical_full[: self.config.action_dim]):
                 clipping_count += 1
@@ -364,6 +470,7 @@ class FrankaInsertionStage2Env:
                 break
             executed[index] = normalized_executed
             actual_steps += 1
+
             time.sleep(max(0.0, self.period_s - (time.monotonic() - tick)))
             last_batch = self._processed_observation()
 
@@ -392,15 +499,12 @@ class FrankaInsertionStage2Env:
             if done:
                 self._close_monitor()
                 if not stop_requested and not workspace_violation:
-                    # Retreat immediately after the human outcome key, before
-                    # replay updates/checkpointing can delay extraction.
                     self._retreat_after_outcome()
                 if not stop_requested:
                     self._needs_automatic_reset = True
                 break
-
         if last_batch is None:
-            raise RuntimeError("chunk execution produced no next observation")
+            raise RuntimeError("action chunk executed zero steps without a next observation")
         return ChunkExecution(
             next_batch=last_batch,
             exec_chunk=executed,
@@ -418,8 +522,16 @@ class FrankaInsertionStage2Env:
             },
         )
 
+    def exclude_learning_time(self, seconds: float) -> None:
+        self._episode_start += seconds
+
     def close(self) -> None:
-        self._close_monitor()
+        try:
+            if self._runtime is not None:
+                self._runtime.close()
+                self._runtime = None
+        finally:
+            self._close_monitor()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -429,6 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=Path("outputs/act_rlt_001_stage2"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--replay-from", type=Path, help="reuse compatible replay with fresh Actor/Critic; new output required")
+    parser.add_argument("--prepare-only", action="store_true", help="initialize from replay and save v2 checkpoint without connecting robot")
+    parser.add_argument("--bc-init-steps", type=int, default=1000)
+    parser.add_argument("--critic-init-steps", type=int, default=1000)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-motion", action="store_true")
 
@@ -455,6 +571,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--max-step-m", type=float, default=0.002)
     parser.add_argument("--max-step-rad", type=float, default=0.02)
+    parser.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        metavar="M",
+        help="legacy checkpoint setting; Stage-2 always executes fixed chunks without temporal ensemble",
+    )
     parser.add_argument("--warmup-steps", type=int, default=4_000)
     parser.add_argument(
         "--total-env-steps",
@@ -464,14 +587,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--utd-ratio", type=int, default=5)
-    parser.add_argument("--beta", type=float, default=0.3)
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="BC regularization coefficient in -Q + beta * BC (default: 1.0)")
     parser.add_argument("--save-every-env-steps", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if not args.dry_run and not args.allow_motion:
+    if args.resume and args.replay_from:
+        parser.error("--resume and --replay-from are mutually exclusive")
+    if args.prepare_only and not (args.replay_from or args.resume):
+        parser.error("--prepare-only requires --replay-from or --resume")
+    if not args.dry_run and not args.prepare_only and not args.allow_motion:
         parser.error("real Stage-2 collection requires --allow-motion")
     if args.allow_motion and (args.workspace_min is None or args.workspace_max is None):
         parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
@@ -510,6 +638,9 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     invalid = [name for name, value in positive.items() if not np.isfinite(value) or value <= 0]
     if invalid:
         parser.error(f"these settings must be finite and positive: {invalid}")
+    if (not np.isfinite(args.temporal_ensemble_coeff)
+            or args.temporal_ensemble_coeff < 0):
+        parser.error("temporal-ensemble-coeff must be finite and non-negative")
 
 
 def save_checkpoint(
@@ -549,9 +680,17 @@ def load_checkpoint(
     replay: ReplayBuffer,
 ) -> OnlineStage2Metrics:
     saved = torch.load(path, map_location="cpu", weights_only=False)
+    if saved["learner"].get("learner_version") != 2:
+        raise ValueError("legacy Q learner: use --replay-from with a new output directory")
     saved_config = saved["config"]
     current_config = config.to_dict()
-    schedule_keys = {"warmup_steps", "total_env_steps"}
+    # Checkpoints created before the real-time temporal collector existed have
+    # no value for this inference-only setting. Adopt the requested runtime
+    # value without invalidating their learner/replay state.
+    saved_config.setdefault(
+        "temporal_ensemble_coeff", current_config["temporal_ensemble_coeff"]
+    )
+    schedule_keys = {"warmup_steps", "total_env_steps", "device"}
     incompatible = {
         key: (saved_config.get(key), current_config.get(key))
         for key in set(saved_config) | set(current_config)
@@ -593,6 +732,40 @@ def load_checkpoint(
     return OnlineStage2Metrics(**saved_metrics)
 
 
+def import_replay(path: Path, config: ACTStage2Config, replay: ReplayBuffer) -> OnlineStage2Metrics:
+    """Reuse data only. Learned weights, optimizers and old online counts are discarded."""
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("stage1_checkpoint", "act_checkpoint"):
+        if resolve_pretrained_model(saved["config"][key]) != resolve_pretrained_model(getattr(config, key)):
+            raise ValueError(f"replay {key} differs; latent/normalization spaces must match")
+    for key in ("chunk_length", "action_dim", "proprio_dim"):
+        if saved["config"][key] != getattr(config, key):
+            raise ValueError(f"replay {key} mismatch")
+    for transition in saved["replay"]:
+        expected = {"state_vec": (config.state_dim,), "next_state_vec": (config.state_dim,),
+                    "exec_chunk": (config.chunk_length, config.action_dim),
+                    "ref_chunk": (config.chunk_length, config.action_dim),
+                    "next_ref_chunk": (config.chunk_length, config.action_dim),
+                    "reward_seq": (config.chunk_length,)}
+        for key, shape in expected.items():
+            value = getattr(transition, key)
+            if tuple(value.shape) != shape or not torch.isfinite(value).all():
+                raise ValueError(f"invalid replay {key}")
+        k = int(transition.actual_steps)
+        rewards = transition.reward_seq
+        if (not 1 <= k <= config.chunk_length or float(transition.done) not in (0, 1)
+                or not ((rewards == 0) | (rewards == 1)).all()
+                or rewards.sum() > 1 or rewards[k:].any()
+                or (rewards.any() and (not bool(transition.done) or rewards[k-1] != 1))):
+            raise ValueError("replay violates sparse terminal-success reward contract")
+        replay.add(transition)
+    if len(replay) < config.batch_size:
+        raise ValueError("insufficient replay for initialization")
+    # Imported data replaces collection warmup; new online budget starts at zero.
+    print(f"Imported {len(replay)} transitions; resetting Actor/Critic and online counters", flush=True)
+    return OnlineStage2Metrics(warmup_env_steps=config.warmup_steps, env_steps=config.warmup_steps)
+
+
 def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkExecution) -> None:
     learner = metrics.last_learner
     record: dict[str, Any] = {
@@ -612,6 +785,7 @@ def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkE
         **execution.info,
     }
     if learner is not None:
+        record.update(learner.diagnostics)
         record.update(
             critic_loss=learner.critic_loss,
             actor_loss=learner.actor_loss,
@@ -620,7 +794,52 @@ def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkE
         )
     with (output / "metrics.jsonl").open("a") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
-    print(json.dumps(record, sort_keys=True), flush=True)
+    print(_format_terminal_metrics(record), flush=True)
+
+
+def _format_terminal_metrics(record: dict[str, Any]) -> str:
+    """Return the small live status line; JSONL retains every metric."""
+    def number(name: str, digits: int = 3) -> str | None:
+        value = record.get(name)
+        return None if value is None else f"{float(value):.{digits}f}"
+
+    phase = "WARMUP" if record.get("warmup") else "ONLINE"
+    parts = [
+        f"[{phase}]",
+        f"env={record['env_steps']}",
+        f"warm={record['warmup_env_steps']}",
+        f"online={record['online_env_steps']}",
+        f"ep={record['episodes']}",
+        f"succ={record['successes']}",
+        f"k={record['actual_steps']}",
+    ]
+    if record.get("workspace_violation"):
+        parts.append("WORKSPACE")
+    if record.get("safety_clip_steps"):
+        parts.append(f"clip={record['safety_clip_steps']}")
+    if record.get("done"):
+        outcome = "success" if record.get("success") else "stop" if record.get("stop_requested") else "end"
+        parts.append(f"DONE={outcome}")
+
+    losses = [
+        f"critic={value}" for value in [number("critic_loss")] if value is not None
+    ] + [f"actor={value}" for value in [number("actor_loss")] if value is not None]
+    if losses:
+        parts.append("loss(" + " ".join(losses) + ")")
+    q_values = []
+    for label, name in (("q1", "q1_mean"), ("q2", "q2_mean"),
+                        ("ref", "q_reference_mean"), ("deploy", "q_actor_deploy_mean")):
+        value = number(name)
+        if value is not None:
+            q_values.append(f"{label}={value}")
+    if q_values:
+        parts.append("Q(" + " ".join(q_values) + ")")
+    if record.get("done"):
+        exploration = number("episode_exploration_vs_actor_mean_tcp_target_translation_norm_mm", 2)
+        sampled_ref = number("episode_sampled_vs_reference_tcp_target_translation_norm_mm", 2)
+        if exploration is not None and sampled_ref is not None:
+            parts.append(f"Δtcp_mm(explore={exploration} sampled-ref={sampled_ref})")
+    return " ".join(parts)
 
 
 def main() -> int:
@@ -646,6 +865,11 @@ def main() -> int:
         utd_ratio=args.utd_ratio,
         beta=args.beta,
         seed=args.seed,
+        temporal_ensemble_coeff=args.temporal_ensemble_coeff,
+        bc_init_steps=args.bc_init_steps,
+        critic_init_steps=args.critic_init_steps,
+        max_step_m=args.max_step_m,
+        max_step_rad=args.max_step_rad,
     )
     print(json.dumps(config.to_dict(), indent=2, sort_keys=True), flush=True)
 
@@ -664,15 +888,27 @@ def main() -> int:
         preprocessor_overrides={"device_processor": {"device": config.device}},
     )
     learner = Stage2Learner(policy, config)
+    learner.configure_action_projection(post)
     replay = ReplayBuffer(config.replay_capacity)
     metrics = OnlineStage2Metrics()
     if args.resume:
         metrics = load_checkpoint(output / "checkpoints/latest.pt", config, learner, replay)
+    elif args.replay_from:
+        metrics = import_replay(args.replay_from, config, replay)
     if args.dry_run:
         print(
             "Dry run complete: checkpoints and saved processors loaded; robot not connected.",
             flush=True,
         )
+        return 0
+
+    if args.prepare_only:
+        learner.initialize(replay)
+        metrics.critic_updates = learner.critic_updates
+        metrics.actor_updates = learner.actor_updates
+        save_checkpoint(output, config, learner, replay, metrics)
+        (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
+        print(f"Prepared v2 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
         return 0
 
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
@@ -727,13 +963,17 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Interrupted by operator; saving recoverable state.", flush=True)
     finally:
-        env.close()
-        if robot.is_connected:
+        try:
+            env.close()
+        finally:
             try:
-                robot.robot.stop_move()
+                if robot.is_connected:
+                    try:
+                        robot.robot.stop_move()
+                    finally:
+                        robot.disconnect()
             finally:
-                robot.disconnect()
-        save_checkpoint(output, config, learner, replay, metrics)
+                save_checkpoint(output, config, learner, replay, metrics)
     return 0
 
 

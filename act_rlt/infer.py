@@ -1,7 +1,10 @@
 """Interactive ACT inference: sampled reset poses and repeatable 15 Hz episodes."""
 
 import argparse
+import queue
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +16,74 @@ TRAINING_TCP_ORIENTATION_MEAN_RAD = np.array(
 )
 DEFAULT_RESET_XY_PADDING_M = 0.03
 DEFAULT_RESET_SPEED_M_S = 0.02
+CONTROL_HZ = 15.0
+MAX_INFERENCE_S = 0.5
+
+
+@dataclass(frozen=True)
+class PreparedAction:
+    action: dict[str, float]
+    values: np.ndarray
+    translation_triggered: bool
+    rotation_triggered: bool
+
+
+class TemporalActionEnsembler:
+    """Blend overlapping ACT chunks that predict the same control timestep.
+
+    The paper defines ``w_i = exp(-m * i)`` with ``i=0`` assigned to the
+    oldest applicable prediction. We normalize those weights in log space:
+    ``log_w_i = -m*i`` and ``w_i = exp(log_w_i - logsumexp(log_w))``.
+    """
+
+    def __init__(self, chunk_size, coefficient):
+        if chunk_size <= 0:
+            raise ValueError("temporal ensemble chunk_size must be positive")
+        if not np.isfinite(coefficient) or coefficient < 0:
+            raise ValueError("temporal ensemble coefficient must be finite and non-negative")
+        self.chunk_size = int(chunk_size)
+        self.coefficient = float(coefficient)
+        self._chunks = []
+        self._lock = threading.Lock()
+
+    def add_chunk(self, start_step, values):
+        values = np.asarray(values, dtype=float)
+        if values.shape != (self.chunk_size, 7) or not np.isfinite(values).all():
+            raise ValueError(
+                f"expected temporal ensemble chunk ({self.chunk_size}, 7), got {values.shape}"
+            )
+        with self._lock:
+            self._chunks.append((int(start_step), values.copy()))
+            self._chunks.sort(key=lambda item: item[0])
+
+    def action_for(self, step, max_translation, max_rotation):
+        with self._lock:
+            # Chunks ending before this step can never contribute again.
+            self._chunks = [
+                item for item in self._chunks
+                if item[0] + self.chunk_size > step
+            ]
+            votes = [
+                values[step - start]
+                for start, values in self._chunks
+                if start <= step < start + self.chunk_size
+            ]
+        if not votes:
+            return None, 0
+
+        log_weights = -self.coefficient * np.arange(len(votes), dtype=float)
+        log_normalizer = np.logaddexp.reduce(log_weights)
+        weights = np.exp(log_weights - log_normalizer)
+        ensembled = np.sum(np.stack(votes) * weights[:, None], axis=0)
+        action, translation_triggered, rotation_triggered = bounded_action_with_triggers(
+            ensembled, max_translation, max_rotation
+        )
+        return PreparedAction(
+            action=action,
+            values=ensembled,
+            translation_triggered=translation_triggered,
+            rotation_triggered=rotation_triggered,
+        ), len(votes)
 
 
 def observation_frame(observation):
@@ -124,6 +195,20 @@ def build_parser():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--duration", type=float, default=10)
     parser.add_argument("--n-action-steps", type=int)
+    parser.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        metavar="M",
+        help="ACT paper exponential temporal-ensemble coefficient (default: 0.01)",
+    )
+    parser.add_argument(
+        "--no-temporal-ensemble",
+        action="store_const",
+        const=None,
+        dest="temporal_ensemble_coeff",
+        help="disable temporal ensembling and execute n-action-steps open loop",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--wrist-camera", default="349622072679")
@@ -153,6 +238,10 @@ def validate_args(parser, args):
         parser.error("reset-speed must be finite and positive")
     if not np.isfinite(args.reset_xy_padding) or args.reset_xy_padding < 0:
         parser.error("reset-xy-padding must be finite and non-negative")
+    if (args.temporal_ensemble_coeff is not None
+            and (not np.isfinite(args.temporal_ensemble_coeff)
+                 or args.temporal_ensemble_coeff < 0)):
+        parser.error("temporal-ensemble-coeff must be finite and non-negative")
     orientation = np.asarray(args.reset_orientation, dtype=float)
     if orientation.shape != (3,) or not np.isfinite(orientation).all():
         parser.error("reset-orientation must contain three finite rotation-vector values")
@@ -171,64 +260,309 @@ def validate_args(parser, args):
             )
 
 
+def _predict_action_chunk(policy, pre, post, observation, args) -> list[PreparedAction]:
+    """Run preprocessing once, then drain one ACT action chunk.
+
+    LeRobot's ``select_action`` performs a model forward only when its internal
+    action queue is empty. Reusing the same batch for the remaining calls avoids
+    recapturing, converting, and uploading images that the policy will ignore.
+    """
+    batch = pre(observation_frame(observation))
+    n_action_steps = int(policy.config.n_action_steps)
+    prepared = []
+    for _ in range(n_action_steps):
+        values = post(policy.select_action(batch)).detach().cpu().numpy().reshape(-1)
+        action, translation_triggered, rotation_triggered = bounded_action_with_triggers(
+            values, args.max_step_m, args.max_step_rad
+        )
+        prepared.append(PreparedAction(
+            action=action,
+            values=values.copy(),
+            translation_triggered=translation_triggered,
+            rotation_triggered=rotation_triggered,
+        ))
+    return prepared
+
+
+def _predict_full_action_chunk(policy, pre, post, observation) -> np.ndarray:
+    """Predict and unnormalize the full ACT chunk for temporal ensembling."""
+    batch = pre(observation_frame(observation))
+    values = post(policy.predict_action_chunk(batch)).detach().cpu().numpy()
+    values = np.asarray(values, dtype=float).reshape(-1, 7)
+    expected = int(policy.config.chunk_size)
+    if values.shape != (expected, 7) or not np.isfinite(values).all():
+        raise ValueError(f"expected ACT chunk ({expected}, 7), got {values.shape}")
+    return values
+
+
 def run_inference_episode(robot, policy, pre, post, args, torch):
+    """Run camera, ACT, and servo as three independently scheduled workers."""
     policy.reset()
-    start = time.monotonic()
-    ticks = 0
-    translation_triggers = 0
-    rotation_triggers = 0
-    either_triggers = 0
-    both_triggers = 0
-    try:
-        with torch.inference_mode():
-            while time.monotonic() - start < args.duration:
-                tick = time.monotonic()
+    n_action_steps = int(policy.config.n_action_steps)
+    temporal_coefficient = args.temporal_ensemble_coeff
+    temporal_ensembler = None
+    if temporal_coefficient is not None:
+        temporal_ensembler = TemporalActionEnsembler(
+            policy.config.chunk_size, temporal_coefficient
+        )
+    # Start producing the next chunk with half of the current chunk still buffered.
+    # This gives inference time to finish without keeping a full extra chunk stale.
+    low_watermark = max(0, n_action_steps // 2)
+    action_queue = queue.Queue(maxsize=max(2, n_action_steps + low_watermark))
+    log_queue = queue.SimpleQueue()
+
+    stop_event = threading.Event()
+    first_actions_ready = threading.Event()
+    refill_event = threading.Event()
+    temporal_request_event = threading.Event()
+    servo_finished = threading.Event()
+    observation_ready = threading.Condition()
+    latest_observation = {"seq": 0, "value": None}
+    latest_temporal_request = {"start_step": 0}
+    failures = []
+    failure_lock = threading.Lock()
+    stats = {
+        "ticks": 0,
+        "translation": 0,
+        "rotation": 0,
+        "either": 0,
+        "both": 0,
+        "deadline_misses": 0,
+        "max_lateness_s": 0.0,
+    }
+
+    def fail(exc):
+        with failure_lock:
+            if not failures:
+                failures.append(exc)
+        stop_event.set()
+        first_actions_ready.set()
+        refill_event.set()
+        temporal_request_event.set()
+        with observation_ready:
+            observation_ready.notify_all()
+
+    def camera_worker():
+        try:
+            while not stop_event.is_set():
                 observation = robot.get_observation()
-                values = post(policy.select_action(pre(observation_frame(observation))))
-                values = values.detach().cpu().numpy().reshape(-1)
-                action, translation_triggered, rotation_triggered = bounded_action_with_triggers(
-                    values, args.max_step_m, args.max_step_rad
-                )
-                elapsed = time.monotonic() - tick
-                if elapsed > 0.5:
-                    message = f"Observation/inference took {elapsed:.2f}s"
-                    if not args.dry_run:
-                        raise RuntimeError(message + "; stopping")
-                    print("WARNING: " + message + "; dry-run continues without real-time pacing")
-                if time.monotonic() - start >= args.duration:
+                with observation_ready:
+                    latest_observation["seq"] += 1
+                    latest_observation["value"] = observation
+                    observation_ready.notify_all()
+        except BaseException as exc:
+            fail(exc)
+
+    def inference_worker():
+        last_observation_seq = 0
+        try:
+            with torch.inference_mode():
+                while not stop_event.is_set():
+                    if temporal_ensembler is None:
+                        refill_event.wait()
+                        refill_event.clear()
+                    else:
+                        temporal_request_event.wait()
+                        temporal_request_event.clear()
+                    if stop_event.is_set():
+                        break
+                    if (temporal_ensembler is None and not action_queue.empty()
+                            and action_queue.qsize() > low_watermark):
+                        continue
+
+                    with observation_ready:
+                        observation_ready.wait_for(
+                            lambda: stop_event.is_set()
+                            or latest_observation["seq"] > last_observation_seq
+                        )
+                        if stop_event.is_set():
+                            break
+                        observation = latest_observation["value"]
+                        last_observation_seq = latest_observation["seq"]
+
+                    inference_start = time.monotonic()
+                    if temporal_ensembler is None:
+                        chunk = _predict_action_chunk(policy, pre, post, observation, args)
+                    else:
+                        start_step = latest_temporal_request["start_step"]
+                        chunk = _predict_full_action_chunk(policy, pre, post, observation)
+                    inference_elapsed = time.monotonic() - inference_start
+                    if inference_elapsed > MAX_INFERENCE_S:
+                        message = f"Preprocessing/inference took {inference_elapsed:.2f}s"
+                        if not args.dry_run:
+                            raise RuntimeError(message + "; stopping")
+                        log_queue.put("WARNING: " + message + "; dry-run continues")
+
+                    if temporal_ensembler is None:
+                        for prepared in chunk:
+                            while not stop_event.is_set():
+                                try:
+                                    action_queue.put(prepared, timeout=0.05)
+                                    break
+                                except queue.Full:
+                                    continue
+                    else:
+                        temporal_ensembler.add_chunk(start_step, chunk)
+                    if len(chunk) and not stop_event.is_set():
+                        first_actions_ready.set()
+        except BaseException as exc:
+            fail(exc)
+
+    def servo_worker():
+        try:
+            first_actions_ready.wait()
+            if stop_event.is_set():
+                return
+
+            period = 1.0 / CONTROL_HZ
+            start = time.monotonic()
+            deadline = start
+            end = start + args.duration
+            control_step = 0
+            while deadline < end and not stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining > 0 and stop_event.wait(remaining):
                     break
-                translation_triggers += int(translation_triggered)
-                rotation_triggers += int(rotation_triggered)
-                either_triggers += int(translation_triggered or rotation_triggered)
-                both_triggers += int(translation_triggered and rotation_triggered)
-                step_index = ticks
-                ticks += 1
+
+                now = time.monotonic()
+                lateness = max(0.0, now - deadline)
+                if lateness > 0.001:
+                    stats["deadline_misses"] += 1
+                    stats["max_lateness_s"] = max(stats["max_lateness_s"], lateness)
+
+                if temporal_ensembler is None:
+                    try:
+                        prepared = action_queue.get_nowait()
+                    except queue.Empty:
+                        refill_event.set()
+                        message = (
+                            "ACT action queue underrun at the 15 Hz servo deadline; "
+                            "stopping instead of repeating a relative action"
+                        )
+                        if not args.dry_run:
+                            raise RuntimeError(message)
+                        log_queue.put("WARNING: " + message + "; dry-run skips this tick")
+                        deadline += period
+                        control_step += 1
+                        continue
+                    if action_queue.qsize() <= low_watermark:
+                        refill_event.set()
+                    queue_status = f"queue={action_queue.qsize()}"
+                else:
+                    prepared, vote_count = temporal_ensembler.action_for(
+                        control_step, args.max_step_m, args.max_step_rad
+                    )
+                    if prepared is None:
+                        raise RuntimeError(
+                            "temporal ensemble has no prediction for the 15 Hz deadline; stopping"
+                        )
+                    queue_status = f"ensemble_votes={vote_count}"
+
+                stats["translation"] += int(prepared.translation_triggered)
+                stats["rotation"] += int(prepared.rotation_triggered)
+                stats["either"] += int(
+                    prepared.translation_triggered or prepared.rotation_triggered
+                )
+                stats["both"] += int(
+                    prepared.translation_triggered and prepared.rotation_triggered
+                )
+                step_index = stats["ticks"]
+                stats["ticks"] += 1
+
                 if not args.dry_run:
                     # Anchor each increment to current measured pose, matching training labels.
                     robot.resync_command_pose()
-                    robot.send_action(action)
-                if step_index % 15 == 0:
-                    print(f"t={time.monotonic()-start:.1f}s delta={list(action.values())} "
-                          f"gripper_prediction={values[6]:.4f}m (held)", flush=True)
-                time.sleep(max(0, 1 / 15 - (time.monotonic() - tick)))
+                    robot.send_action(prepared.action)
+                if step_index % int(CONTROL_HZ) == 0:
+                    log_queue.put(
+                        f"t={time.monotonic()-start:.1f}s "
+                        f"delta={list(prepared.action.values())} "
+                        f"gripper_prediction={prepared.values[6]:.4f}m (held) "
+                        f"{queue_status}"
+                    )
+                if temporal_ensembler is not None:
+                    latest_temporal_request["start_step"] = control_step + 1
+                    temporal_request_event.set()
+                deadline += period
+                control_step += 1
+        except BaseException as exc:
+            fail(exc)
+        finally:
+            stop_event.set()
+            refill_event.set()
+            temporal_request_event.set()
+            with observation_ready:
+                observation_ready.notify_all()
+            servo_finished.set()
+
+    threads = [
+        threading.Thread(target=camera_worker, daemon=True, name="act-camera"),
+        threading.Thread(target=inference_worker, daemon=True, name="act-inference"),
+        threading.Thread(target=servo_worker, daemon=True, name="act-servo"),
+    ]
+    if temporal_ensembler is None:
+        refill_event.set()
+    else:
+        temporal_request_event.set()
+    for thread in threads:
+        thread.start()
+
+    stop_error = None
+    try:
+        while not servo_finished.wait(timeout=0.1):
+            while True:
+                try:
+                    print(log_queue.get_nowait(), flush=True)
+                except queue.Empty:
+                    break
     finally:
-        denominator = max(ticks, 1)
+        stop_event.set()
+        first_actions_ready.set()
+        refill_event.set()
+        temporal_request_event.set()
+        with observation_ready:
+            observation_ready.notify_all()
+
+        # Stop the physical stream as soon as the fixed-rate publisher exits;
+        # camera shutdown can take up to its bounded frame timeout.
+        if robot.is_connected and not args.dry_run:
+            try:
+                if not robot.robot.stop_servo():
+                    stop_error = RuntimeError(
+                        "control server did not acknowledge stop_servo after inference"
+                    )
+                robot.resync_command_pose()
+            except BaseException as exc:
+                stop_error = exc
+
+        for thread in threads:
+            thread.join()
+        while True:
+            try:
+                print(log_queue.get_nowait(), flush=True)
+            except queue.Empty:
+                break
+
+        denominator = max(stats["ticks"], 1)
         print(
             "Action-limit report: "
-            f"steps={ticks}, "
-            f"max_step_m_triggered={translation_triggers} "
-            f"({100 * translation_triggers / denominator:.1f}%), "
-            f"max_step_rad_triggered={rotation_triggers} "
-            f"({100 * rotation_triggers / denominator:.1f}%), "
-            f"either={either_triggers} ({100 * either_triggers / denominator:.1f}%), "
-            f"both={both_triggers} ({100 * both_triggers / denominator:.1f}%)",
+            f"steps={stats['ticks']}, "
+            f"max_step_m_triggered={stats['translation']} "
+            f"({100 * stats['translation'] / denominator:.1f}%), "
+            f"max_step_rad_triggered={stats['rotation']} "
+            f"({100 * stats['rotation'] / denominator:.1f}%), "
+            f"either={stats['either']} ({100 * stats['either'] / denominator:.1f}%), "
+            f"both={stats['both']} ({100 * stats['both'] / denominator:.1f}%), "
+            f"deadline_misses={stats['deadline_misses']}, "
+            f"max_lateness_ms={1000 * stats['max_lateness_s']:.2f}",
             flush=True,
         )
         policy.reset()
-        if robot.is_connected and not args.dry_run:
-            if not robot.robot.stop_servo():
-                raise RuntimeError("control server did not acknowledge stop_servo after inference")
-            robot.resync_command_pose()
+
+    if failures:
+        raise failures[0]
+    if stop_error is not None:
+        raise stop_error
 
 
 def main():
@@ -257,8 +591,9 @@ def main():
         config.n_action_steps = args.n_action_steps
     if not 1 <= config.n_action_steps <= config.chunk_size:
         parser.error("n-action-steps must be between 1 and checkpoint chunk_size")
-    if config.temporal_ensemble_coeff is not None and config.n_action_steps != 1:
-        parser.error("Temporal ensembling requires n-action-steps=1")
+    # The three-thread runtime performs temporal ensembling over complete chunks
+    # itself, so it does not use LeRobot's select_action(n_action_steps=1) wrapper.
+    config.temporal_ensemble_coeff = args.temporal_ensemble_coeff
     policy = ACTPolicy.from_pretrained(
         checkpoint, config=config, local_files_only=True
     ).to(args.device).eval()

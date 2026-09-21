@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -26,7 +27,7 @@ from evo_rlt.core.interfaces import (
     TRANSITION_SOURCE_WARMUP_VLA,
     ChunkTransition,
 )
-from evo_rlt.core.losses import actor_loss, critic_loss
+from evo_rlt.core.losses import discounted_chunk_return
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.utils import flatten_chunk, soft_update, unflatten_chunk
 from lerobot.configs.policies import PreTrainedConfig
@@ -56,6 +57,7 @@ class ACTStage2Config:
     chunk_length: int = 4
     action_dim: int = 6
     proprio_dim: int = 7
+    temporal_ensemble_coeff: float = 0.01
 
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
@@ -68,13 +70,19 @@ class ACTStage2Config:
     critic_lr: float = 3e-4
 
     gamma: float = 0.99
-    beta: float = 0.3
+    beta: float = 1.0
     tau: float = 0.005
     batch_size: int = 256
     utd_ratio: int = 5
     actor_update_interval: int = 2
     grad_clip_norm: float = 1.0
-    target_q_clip: float | None = 100.0
+    target_q_clip: float = 1.0
+    learner_version: int = 2
+    bc_init_steps: int = 1000
+    critic_init_steps: int = 1000
+    temporal_collection: bool = False
+    max_step_m: float = 0.002
+    max_step_rad: float = 0.02
 
     replay_capacity: int = 200_000
     warmup_steps: int = 4_000
@@ -82,6 +90,14 @@ class ACTStage2Config:
     seed: int = 0
 
     def __post_init__(self) -> None:
+        if self.target_q_clip != 1.0 or self.learner_version != 2:
+            raise ValueError("Stage-2 v2 requires terminal-success targets in [0,1]")
+        if self.bc_init_steps < 0 or self.critic_init_steps < 0:
+            raise ValueError("initialization steps must be non-negative")
+        if self.temporal_collection:
+            raise ValueError("v2 chunk TD learning requires temporal_collection=False")
+        if not all(torch.isfinite(torch.tensor(v)) and v > 0 for v in (self.max_step_m, self.max_step_rad)):
+            raise ValueError("physical action limits must be finite and positive")
         positive_ints = {
             "chunk_length": self.chunk_length,
             "action_dim": self.action_dim,
@@ -108,6 +124,7 @@ class ACTStage2Config:
             "beta": self.beta,
             "tau": self.tau,
             "grad_clip_norm": self.grad_clip_norm,
+            "temporal_ensemble_coeff": self.temporal_ensemble_coeff,
         }.items():
             if not torch.isfinite(torch.tensor(value)):
                 raise ValueError(f"{name} must be finite")
@@ -115,6 +132,8 @@ class ACTStage2Config:
             raise ValueError("standard deviation and learning rates must be positive")
         if self.beta < 0 or self.grad_clip_norm <= 0:
             raise ValueError("beta must be non-negative and grad_clip_norm must be positive")
+        if self.temporal_ensemble_coeff < 0:
+            raise ValueError("temporal_ensemble_coeff must be non-negative")
         if not 0 < self.gamma <= 1 or not 0 < self.tau <= 1:
             raise ValueError("gamma and tau must be in (0, 1]")
         if not 0 <= self.actor_ref_dropout_p < 1:
@@ -260,6 +279,7 @@ class LearnerStepMetrics:
     actor_grad_norm: float | None
     critic_updates: int
     actor_updates: int
+    diagnostics: dict[str, float] = field(default_factory=dict)
 
 
 class Stage2Learner:
@@ -278,6 +298,10 @@ class Stage2Learner:
             residual=False,
         ).to(config.device)
         self.target_critic = copy.deepcopy(self.critic).eval()
+        self.target_actor = copy.deepcopy(policy.actor).eval()
+        self.target_actor.requires_grad_(False)
+        self.initialized = False
+        self.action_projection = lambda action: action
         for parameter in self.target_critic.parameters():
             parameter.requires_grad = False
         self.actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=config.actor_lr)
@@ -288,46 +312,126 @@ class Stage2Learner:
     def _batch_to_device(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         return {key: value.to(self.config.device) for key, value in batch.items()}
 
-    def update_once(self, replay: ReplayBuffer) -> LearnerStepMetrics:
+    def configure_action_projection(self, postprocessor) -> None:
+        """Differentiate through the same physical norm bounds as the robot.
+
+        ACT uses mean/std normalization. Recover its affine inverse from the
+        saved processor; reject non-affine processors rather than guessing.
+        """
+        with torch.no_grad():
+            probe = torch.stack([torch.zeros(7), torch.ones(7), torch.full((7,), 2.)]).to(self.config.device)
+            physical = postprocessor(probe).to(self.config.device)
+            offset, scale = physical[0, :6], physical[1, :6] - physical[0, :6]
+            if not torch.isfinite(physical).all() or (scale <= 0).any() or not torch.allclose(
+                physical[2, :6], offset + 2 * scale, atol=1e-6):
+                raise ValueError("Stage-2 requires affine ACT mean/std action normalization")
+
+        def project(action):
+            shaped = action.reshape(-1, self.config.chunk_length, 6)
+            physical = shaped * scale + offset
+            parts = []
+            for start, limit in ((0, self.config.max_step_m), (3, self.config.max_step_rad)):
+                part = physical[..., start:start + 3]
+                parts.append(part * (limit / part.norm(dim=-1, keepdim=True).clamp_min(1e-12)).clamp(max=1))
+            return ((torch.cat(parts, dim=-1) - offset) / scale).reshape_as(action)
+        self.action_projection = project
+
+    def initialize(self, replay: ReplayBuffer) -> None:
+        """Offline initialization at the warmup boundary, before Actor control."""
+        if self.initialized:
+            return
+        if len(replay) < self.config.batch_size:
+            raise ValueError("not enough replay for Actor/Critic initialization")
+        for step in range(self.config.bc_init_steps):
+            batch = self._batch_to_device(replay.sample(self.config.batch_size))
+            mu, _ = self.policy.actor(batch["state_vec"], batch["ref_chunk_flat"])
+            loss = (mu - batch["ref_chunk_flat"]).square().sum(-1).mean()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config.grad_clip_norm,
+                                          error_if_nonfinite=True)
+            self.actor_optimizer.step()
+            if step % 100 == 0:
+                print(f"BC initialization {step}/{self.config.bc_init_steps}: loss={loss.item():.5f}", flush=True)
+        self.target_actor.load_state_dict(self.policy.actor.state_dict())
+        for step in range(self.config.critic_init_steps):
+            metrics = self.update_once(replay, update_actor=False)
+            if step % 100 == 0:
+                print(f"Critic initialization {step}/{self.config.critic_init_steps}: {metrics.diagnostics}", flush=True)
+        self.initialized = True
+
+    def update_once(self, replay: ReplayBuffer, *, update_actor: bool = True) -> LearnerStepMetrics:
         batch = self._batch_to_device(replay.sample(self.config.batch_size))
         self.critic.train()
         self.policy.actor.train()
 
-        c_loss = critic_loss(
-            self.critic,
-            self.target_critic,
-            self.policy.actor,
-            batch,
-            gamma=self.config.gamma,
-            C=self.config.chunk_length,
-            target_q_clip=self.config.target_q_clip,
-            target_action_clip=None,
-        )
+        x, action = batch["state_vec"], batch["exec_chunk_flat"]
+        with torch.no_grad():
+            next_action, _ = self.target_actor(batch["next_state_vec"], batch["next_ref_flat"])
+            next_action = self.action_projection(next_action)
+            raw_next_q = self.target_critic.min_q(batch["next_state_vec"], next_action)
+            next_q = raw_next_q.clamp(0.0, 1.0)
+            reward = discounted_chunk_return(batch["reward_seq"], self.config.gamma, batch["actual_steps"])
+            target = reward + self.config.gamma ** batch["actual_steps"].float().unsqueeze(-1) * (
+                1 - batch["done"].unsqueeze(-1)) * next_q
+            if not torch.isfinite(target).all() or (target < 0).any() or (target > 1.00001).any():
+                raise ValueError("invalid terminal-success TD target; check reward/done in replay")
+        q1, q2 = self.critic(x, action)
+        c_loss = (q1 - target).square().mean() + (q2 - target).square().mean()
+        # Evaluate the frozen ACT reference on exactly the same replay states.
+        # This is diagnostic-only: reference actions are not substituted into
+        # either the TD loss or the Actor objective.
+        with torch.no_grad():
+            reference_q = self.critic.min_q(
+                x, self.action_projection(batch["ref_chunk_flat"])
+            )
+        diagnostics = {
+            "q1_mean": q1.detach().mean().item(), "q2_mean": q2.detach().mean().item(),
+            "q_replay_min": torch.minimum(q1, q2).detach().min().item(),
+            "q_replay_max": torch.maximum(q1, q2).detach().max().item(),
+            "q_reference_mean": reference_q.mean().item(),
+            "q_reference_max": reference_q.max().item(),
+            "target_q_raw_mean": raw_next_q.mean().item(),
+            "target_q_raw_max": raw_next_q.max().item(),
+            "target_q_clip_fraction": ((raw_next_q < 0) | (raw_next_q > 1)).float().mean().item(),
+            "target_q_clip_low_fraction": (raw_next_q < 0).float().mean().item(),
+            "target_q_clip_high_fraction": (raw_next_q > 1).float().mean().item(),
+            "td_target_mean": target.mean().item(), "td_target_max": target.max().item(),
+            "reward_mean": reward.mean().item(), "done_fraction": batch["done"].mean().item(),
+            "td_error_abs_mean": (q1.detach() - target).abs().mean().item(),
+        }
         self.critic_optimizer.zero_grad(set_to_none=True)
         c_loss.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.grad_clip_norm
+            self.critic.parameters(), self.config.grad_clip_norm, error_if_nonfinite=True
         )
         self.critic_optimizer.step()
         self.critic_updates += 1
 
         actor_loss_value: float | None = None
         actor_grad_value: float | None = None
-        if self.critic_updates % self.config.actor_update_interval == 0:
+        if update_actor and self.critic_updates % self.config.actor_update_interval == 0:
             critic_params = list(self.critic.parameters())
             for parameter in critic_params:
                 parameter.requires_grad_(False)
             try:
-                a_loss = actor_loss(
-                    self.policy.actor,
-                    self.critic,
-                    batch,
-                    beta=self.config.beta,
-                )
+                mu, _ = self.policy.actor(x, batch["ref_chunk_flat"], training=True)
+                actor_q = self.critic.min_q(x, self.action_projection(mu))
+                bc = (mu - batch["ref_chunk_flat"]).square().sum(-1).mean()
+                a_loss = -actor_q.mean() + self.config.beta * bc
+                diagnostics.update(q_actor_mean=actor_q.detach().mean().item(),
+                                   q_actor_max=actor_q.detach().max().item(),
+                                   bc_loss=bc.detach().item(),
+                                   actor_reference_rmse=(mu.detach()-batch["ref_chunk_flat"]).square().mean().sqrt().item())
+                with torch.no_grad():
+                    deployed_mu, _ = self.policy.actor(x, batch["ref_chunk_flat"])
+                    deployed_q = self.critic.min_q(x, self.action_projection(deployed_mu))
+                    diagnostics.update(q_actor_deploy_mean=deployed_q.mean().item(),
+                                       q_actor_deploy_max=deployed_q.max().item())
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 a_loss.backward()
                 actor_grad = torch.nn.utils.clip_grad_norm_(
-                    self.policy.actor.parameters(), self.config.grad_clip_norm
+                    self.policy.actor.parameters(), self.config.grad_clip_norm, error_if_nonfinite=True
                 )
                 self.actor_optimizer.step()
             finally:
@@ -336,6 +440,7 @@ class Stage2Learner:
             self.actor_updates += 1
             actor_loss_value = float(a_loss.detach().item())
             actor_grad_value = float(actor_grad)
+            soft_update(self.target_actor, self.policy.actor, self.config.tau)
 
         # Update targets after the online critic optimizer step.
         soft_update(self.target_critic, self.critic, self.config.tau)
@@ -347,10 +452,14 @@ class Stage2Learner:
             actor_grad_norm=actor_grad_value,
             critic_updates=self.critic_updates,
             actor_updates=self.actor_updates,
+            diagnostics=diagnostics,
         )
 
     def state_dict(self) -> dict:
         return {
+            "learner_version": 2,
+            "initialized": self.initialized,
+            "target_actor": self.target_actor.state_dict(),
             "actor": self.policy.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "target_critic": self.target_critic.state_dict(),
@@ -361,6 +470,10 @@ class Stage2Learner:
         }
 
     def load_state_dict(self, state: dict) -> None:
+        if state.get("learner_version") != 2:
+            raise ValueError("legacy learner cannot resume as v2; use --replay-from for a fresh learner")
+        self.target_actor.load_state_dict(state["target_actor"])
+        self.initialized = bool(state["initialized"])
         self.policy.actor.load_state_dict(state["actor"])
         self.critic.load_state_dict(state["critic"])
         self.target_critic.load_state_dict(state["target_critic"])
@@ -384,6 +497,13 @@ class ChunkExecution:
     intervention: bool = False
     stop_requested: bool = False
     info: dict = field(default_factory=dict)
+    # The real-time Stage-2 collector performs policy inference inside its
+    # inference worker. These fields carry the exact state/reference paired with
+    # the fixed executed chunk back to the generic learner loop.
+    state_vec: Tensor | None = None
+    ref_chunk: Tensor | None = None
+    next_state_vec: Tensor | None = None
+    next_ref_chunk: Tensor | None = None
 
 
 class Stage2Environment(Protocol):
@@ -428,6 +548,7 @@ def run_online_stage2(
     chunk triggers exactly ``utd_ratio`` critic updates, independent of C.
     """
     metrics = initial_metrics or OnlineStage2Metrics()
+
     if metrics.online_env_steps >= config.total_env_steps:
         return metrics
     # A mid-episode checkpoint resumes from a fresh physical reset, so allocate
@@ -443,17 +564,48 @@ def run_online_stage2(
     # Match Evo-RLT's two-loop semantics: total_env_steps is the online budget
     # after warmup, not a combined warmup + online limit.
     while metrics.online_env_steps < config.total_env_steps:
+        metrics.last_learner = None
         warmup = metrics.warmup_env_steps < config.warmup_steps
+        if not warmup and not learner.initialized:
+            initialization_start = time.monotonic()
+            learner.initialize(replay)
+            exclude_time = getattr(env, "exclude_learning_time", None)
+            if exclude_time is not None:
+                exclude_time(time.monotonic() - initialization_start)
         policy.eval()
-        with torch.inference_mode():
-            state_vec, ref_chunk, full_ref = policy.encode_and_reference(batch)
-            action_chunk = (
-                ref_chunk
-                if warmup
-                else policy.actor_chunk(state_vec, ref_chunk, deterministic=False)
+        execute_policy_chunk = getattr(env, "execute_policy_chunk", None)
+        if callable(execute_policy_chunk):
+            remaining_steps = (
+                config.warmup_steps - metrics.warmup_env_steps if warmup
+                else config.total_env_steps - metrics.online_env_steps
             )
-
-        execution = env.execute_chunk(action_chunk, full_ref)
+            execution = execute_policy_chunk(
+                policy, batch, warmup=warmup, remaining_steps=remaining_steps
+            )
+            required = {
+                "state_vec": execution.state_vec,
+                "ref_chunk": execution.ref_chunk,
+                "next_state_vec": execution.next_state_vec,
+                "next_ref_chunk": execution.next_ref_chunk,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise RuntimeError(f"real-time Stage-2 execution omitted metadata: {missing}")
+            state_vec = execution.state_vec
+            ref_chunk = execution.ref_chunk
+            next_state = execution.next_state_vec
+            next_ref = execution.next_ref_chunk
+        else:
+            with torch.inference_mode():
+                state_vec, ref_chunk, full_ref = policy.encode_and_reference(batch)
+                action_chunk = (
+                    ref_chunk
+                    if warmup
+                    else policy.actor_chunk(state_vec, ref_chunk, deterministic=False)
+                )
+            execution = env.execute_chunk(action_chunk, full_ref)
+            with torch.inference_mode():
+                next_state, next_ref, _ = policy.encode_and_reference(execution.next_batch)
         if not 0 <= execution.actual_steps <= config.chunk_length:
             raise RuntimeError(
                 f"actual_steps must be in [0,{config.chunk_length}], got {execution.actual_steps}"
@@ -481,9 +633,6 @@ def run_online_stage2(
                 warmup=metrics.warmup_env_steps < config.warmup_steps,
             )
             continue
-
-        with torch.inference_mode():
-            next_state, next_ref, _ = policy.encode_and_reference(execution.next_batch)
 
         transition = ChunkTransition(
             state_vec=_unbatch_cpu(state_vec),
@@ -514,8 +663,20 @@ def run_online_stage2(
         # Confirmed timing: no updates for a chunk that started in warmup.
         # Confirmed UTD: G updates per collected chunk, never G*C.
         if not warmup and len(replay) >= config.batch_size:
+            updates = []
             for _ in range(config.utd_ratio):
-                metrics.last_learner = learner.update_once(replay)
+                updates.append(learner.update_once(replay))
+            metrics.last_learner = updates[-1]
+            for name in ("critic_loss", "actor_loss", "critic_grad_norm", "actor_grad_norm"):
+                values = [getattr(u, name) for u in updates if getattr(u, name) is not None]
+                setattr(metrics.last_learner, name, sum(values) / len(values) if values else None)
+            keys = set().union(*(u.diagnostics for u in updates))
+            metrics.last_learner.diagnostics = {
+                key: (max if key.endswith("_max") else min if key.endswith("_min") else
+                      lambda values: sum(values) / len(values))(
+                          [u.diagnostics[key] for u in updates if key in u.diagnostics])
+                for key in keys
+            }
             metrics.critic_updates = learner.critic_updates
             metrics.actor_updates = learner.actor_updates
 

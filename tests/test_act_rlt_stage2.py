@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import time
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -21,6 +24,7 @@ from act_rlt.train_stage2 import (
     RESET_RETREAT_Y_M,
     RESET_XY_MARGIN_M,
     build_parser,
+    _format_terminal_metrics,
     load_checkpoint,
     retreat_pose_along_positive_y,
     sample_workspace_pose,
@@ -49,6 +53,8 @@ def _config(**overrides) -> ACTStage2Config:
         "replay_capacity": 32,
         "actor_hidden_dim": 16,
         "critic_hidden_dim": 16,
+        "bc_init_steps": 0,
+        "critic_init_steps": 0,
     }
     values.update(overrides)
     return ACTStage2Config(**values)
@@ -98,6 +104,137 @@ def test_actor_outputs_final_action_not_reference_plus_residual() -> None:
     reference = torch.ones(2, 24)
     mean, _ = actor(state, reference)
     assert torch.equal(mean, torch.zeros_like(mean))
+
+
+def test_terminal_metrics_are_compact_while_json_fields_remain_available() -> None:
+    line = _format_terminal_metrics({
+        "warmup": False, "env_steps": 12, "warmup_env_steps": 4,
+        "online_env_steps": 8, "episodes": 2, "successes": 1,
+        "actual_steps": 4, "done": True, "success": True,
+        "workspace_violation": False, "safety_clip_steps": 0,
+        "critic_loss": 0.25, "actor_loss": None, "q1_mean": 0.2,
+        "q2_mean": 0.3, "q_reference_mean": 0.1,
+        "episode_exploration_vs_actor_mean_tcp_target_translation_norm_mm": 1.2,
+        "episode_sampled_vs_reference_tcp_target_translation_norm_mm": 2.3,
+    })
+    assert line == (
+        "[ONLINE] env=12 warm=4 online=8 ep=2 succ=1 k=4 DONE=success "
+        "loss(critic=0.250) Q(q1=0.200 q2=0.300 ref=0.100) "
+        "Δtcp_mm(explore=1.20 sampled-ref=2.30)"
+    )
+
+
+def test_v2_targets_clip_high_q_and_mask_terminal_bootstrap():
+    config = _config(batch_size=3)
+    learner = Stage2Learner(_FakeStage2Policy(config), config)
+    batch = {
+        "state_vec": torch.zeros(3, 775), "next_state_vec": torch.zeros(3, 775),
+        "exec_chunk_flat": torch.zeros(3, 24), "ref_chunk_flat": torch.zeros(3, 24),
+        "next_ref_flat": torch.zeros(3, 24), "reward_seq": torch.tensor([[0.,0,0,0], [0,1,0,0], [0,0,0,0]]),
+        "actual_steps": torch.tensor([4,2,1]), "done": torch.tensor([0.,1,1]),
+    }
+    for network in (learner.critic, learner.target_critic):
+        for parameter in network.parameters():
+            nn.init.zeros_(parameter)
+    for q in (learner.target_critic.q1, learner.target_critic.q2):
+        q.net[-1].bias.data.fill_(90.)
+    metrics = learner.update_once(SimpleNamespace(sample=lambda n: batch))
+    expected = torch.tensor([0.99**4, 0.99, 0.])
+    assert metrics.critic_loss == pytest.approx(2 * expected.square().mean().item())
+    assert metrics.diagnostics["target_q_clip_fraction"] == 1
+    assert metrics.diagnostics["td_target_mean"] == pytest.approx(expected.mean().item())
+    assert metrics.diagnostics["q_reference_mean"] == pytest.approx(0.0)
+    assert metrics.diagnostics["q_reference_max"] == pytest.approx(0.0)
+    assert all(p.grad is None for p in learner.target_actor.parameters())
+    assert all(p.grad is None for p in learner.target_critic.parameters())
+
+
+def test_v2_projection_matches_physical_norm_clip_and_has_gradients():
+    from act_rlt.infer import bounded_action
+    config = _config()
+    learner = Stage2Learner(_FakeStage2Policy(config), config)
+    scale = torch.tensor([.01,.02,.03,.04,.05,.06,1.])
+    offset = torch.tensor([.001,0.,0.,0.,0.,0.,0.])
+    learner.configure_action_projection(lambda x: x * scale + offset)
+    action = torch.ones(1,24, requires_grad=True)
+    projected = learner.action_projection(action)
+    physical = projected.reshape(4,6) * scale[:6] + offset[:6]
+    expected = list(bounded_action((scale+offset).numpy(), .002, .02).values())
+    torch.testing.assert_close(physical[0], torch.tensor(expected, dtype=torch.float32))
+    projected.sum().backward()
+    assert torch.isfinite(action.grad).all()
+
+
+def test_v2_bc_initialization_reduces_reference_error_and_roundtrips():
+    torch.manual_seed(123)
+    config = _config(bc_init_steps=1000)
+    policy = _FakeStage2Policy(config)
+    learner = Stage2Learner(policy, config)
+    batch = {"state_vec": torch.zeros(1,775), "ref_chunk_flat": torch.full((1,24), .1)}
+    class Replay:
+        def __len__(self): return 1
+        def sample(self, n): return batch
+    before = (policy.actor(batch["state_vec"], batch["ref_chunk_flat"])[0] - .1).square().mean()
+    learner.initialize(Replay())
+    after = (policy.actor(batch["state_vec"], batch["ref_chunk_flat"])[0] - .1).square().mean()
+    assert after < before * .1
+    restored = Stage2Learner(_FakeStage2Policy(config), config)
+    restored.load_state_dict(learner.state_dict())
+    assert restored.initialized
+    for p, q in zip(restored.target_actor.parameters(), policy.actor.parameters()):
+        torch.testing.assert_close(p, q)
+
+
+def test_discounted_return_masks_unexecuted_padding():
+    from evo_rlt.core.losses import discounted_chunk_return
+    value = discounted_chunk_return(torch.tensor([[0.,1.,99.,99.]]), .99, torch.tensor([2]))
+    assert value.item() == pytest.approx(.99)
+
+
+def test_v2_critic_learns_terminal_success_and_failure():
+    torch.manual_seed(7)
+    config = _config(batch_size=2, critic_lr=.003)
+    learner = Stage2Learner(_FakeStage2Policy(config), config)
+    states = torch.zeros(2,775)
+    states[1,0] = 1
+    batch = {"state_vec": states, "next_state_vec": states,
+             "exec_chunk_flat": torch.zeros(2,24), "ref_chunk_flat": torch.zeros(2,24),
+             "next_ref_flat": torch.zeros(2,24), "done": torch.ones(2),
+             "actual_steps": torch.ones(2, dtype=torch.long),
+             "reward_seq": torch.tensor([[0.,0,0,0],[1.,0,0,0]])}
+    replay = SimpleNamespace(sample=lambda n: batch)
+    for _ in range(600):
+        learner.update_once(replay, update_actor=False)
+    q1,q2 = learner.critic(states,batch["exec_chunk_flat"])
+    for q in (q1,q2):
+        torch.testing.assert_close(q.flatten(), torch.tensor([0.,1.]), atol=.05, rtol=0)
+    assert learner.actor_updates == 0
+
+
+def test_v2_resume_reproduces_next_update():
+    import copy
+    config = _config(actor_ref_dropout_p=.5)
+    first = Stage2Learner(_FakeStage2Policy(config), config)
+    batch = {"state_vec": torch.zeros(1,775), "next_state_vec": torch.zeros(1,775),
+             "exec_chunk_flat": torch.zeros(1,24), "ref_chunk_flat": torch.ones(1,24),
+             "next_ref_flat": torch.ones(1,24), "done": torch.ones(1),
+             "actual_steps": torch.ones(1, dtype=torch.long),
+             "reward_seq": torch.tensor([[1.,0,0,0]])}
+    replay = SimpleNamespace(sample=lambda n: batch)
+    first.update_once(replay)
+    second = Stage2Learner(_FakeStage2Policy(config), config)
+    second.load_state_dict(copy.deepcopy(first.state_dict()))
+    rng = torch.get_rng_state()
+    a = first.update_once(replay)
+    torch.set_rng_state(rng)
+    b = second.update_once(replay)
+    assert a == b
+    for model_a,model_b in ((first.policy.actor, second.policy.actor),
+                            (first.critic, second.critic),
+                            (first.target_actor, second.target_actor),
+                            (first.target_critic, second.target_critic)):
+        for p,q in zip(model_a.parameters(), model_b.parameters()):
+            torch.testing.assert_close(p,q,rtol=0,atol=0)
 
 
 class _FakeStage2Policy(nn.Module):
@@ -269,6 +406,211 @@ def test_environment_converts_workspace_refusal_to_truncation() -> None:
     assert result.done and result.truncated and not result.terminated
     assert result.info["workspace_violation"] is True
     assert env.robot.robot.stopped is True
+
+
+def _threaded_env(config, *, camera_delay=.003, period=.02, refusal_at=None):
+    class Robot:
+        def __init__(self):
+            self.stops = 0
+            self.robot = SimpleNamespace(stop_servo=self.stop_servo)
+            self.sent_at = []
+
+        def stop_servo(self):
+            self.stops += 1
+            return True
+
+        def get_observation(self):
+            time.sleep(camera_delay)
+            return {"observation.state": torch.zeros(1, 7)}
+
+        def resync_command_pose(self):
+            pass
+
+        def send_action(self, command):
+            if refusal_at is not None and len(self.sent_at) == refusal_at:
+                raise RuntimeError("refusing TCP target outside workspace: test")
+            self.sent_at.append(time.monotonic())
+
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.config = config
+    env.robot = Robot()
+    env.pre = lambda observation: observation
+    env.post = lambda action: action
+    env.period_s = period
+    env.episode_time_s = 10
+    env.max_step_m = .002
+    env.max_step_rad = .02
+    env._monitor = SimpleNamespace(poll=lambda: None, close=lambda: None)
+    env._episode_start = time.monotonic()
+    env._runtime = None
+    env._normalize_executed_action = lambda action: action[:config.action_dim]
+    return env
+
+
+def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+    config = _config()
+    env = _threaded_env(config)
+    policy = _FakeStage2Policy(config).eval()
+    calls = []
+
+    def encode(batch):
+        time.sleep(.003)
+        calls.append(len(calls))
+        return (
+            torch.full((1, config.state_dim), float(len(calls))),
+            torch.full((1, 4, 6), .1), torch.full((1, 16, 7), .1),
+        )
+    policy.encode_and_reference = encode
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        runtime = FixedChunkRuntime(env, policy, {}, warmup=True, step_budget=12)
+        try:
+            first = runtime.next_result()
+            workers = tuple(runtime.threads)
+            # Simulate replay updates/checkpoint IO taking longer than a chunk.
+            time.sleep(.13)
+            assert len(env.robot.sent_at) > 4
+            second = runtime.next_result()
+            third = runtime.next_result()
+            assert tuple(runtime.threads) == workers
+        finally:
+            runtime.close()
+    assert len(calls) == 4  # initial state + one next state per chunk, no duplicates
+    assert len(env.robot.sent_at) == 12
+    torch.testing.assert_close(first.next_state_vec, second.state_vec)
+    torch.testing.assert_close(second.next_state_vec, third.state_vec)
+    torch.testing.assert_close(first.next_ref_chunk, second.ref_chunk)
+    assert all(x.actual_steps == 4 for x in (first, second, third))
+    assert not first.info["collector_paused"]
+    assert third.info["collector_paused"]
+    assert env.robot.stops == 1
+    assert max(np.diff(env.robot.sent_at)) < .08
+    assert min(np.diff(env.robot.sent_at)) > .01
+    assert all(not thread.is_alive() for thread in workers)
+
+
+def test_default_online_loop_uses_persistent_collection_and_respects_phase_budget():
+    config = _config(warmup_steps=4, total_env_steps=4)
+    env = _threaded_env(config)
+    env.reset = lambda **kwargs: {"observation.state": torch.zeros(1, 7)}
+    policy = _FakeStage2Policy(config)
+    learner = Stage2Learner(policy, config)
+    replay = ReplayBuffer(config.replay_capacity)
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        try:
+            metrics = run_online_stage2(policy, learner, env, replay, config)
+        finally:
+            env.close()
+    assert metrics.warmup_env_steps == 4
+    assert metrics.online_env_steps == 4
+    assert metrics.critic_updates == 5
+    assert len(env.robot.sent_at) == 8
+    assert [int(t.source) for t in replay.buffer] == [1, 2]
+
+
+@pytest.mark.parametrize("refusal_at", [0, 2])
+def test_threaded_workspace_refusal_preserves_only_executed_actions(refusal_at):
+    config = _config()
+    env = _threaded_env(config, refusal_at=refusal_at)
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        try:
+            result = env.execute_policy_chunk(
+                _FakeStage2Policy(config), {"observation.state": torch.zeros(1, 7)},
+                warmup=True, remaining_steps=8
+            )
+        finally:
+            env.close()
+    assert result.actual_steps == refusal_at
+    assert result.done and result.truncated
+    assert result.info["workspace_violation"]
+    assert torch.count_nonzero(result.exec_chunk[refusal_at:]) == 0
+    assert len(env.robot.sent_at) == refusal_at
+    assert env.robot.stops == 1
+
+
+def test_threaded_inference_failure_stops_servo_and_joins_workers():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+    config = _config()
+    env = _threaded_env(config)
+    policy = _FakeStage2Policy(config)
+    policy.encode_and_reference = lambda batch: (_ for _ in ()).throw(RuntimeError("bad inference"))
+    runtime = FixedChunkRuntime(env, policy, {}, warmup=True, step_budget=8)
+    with pytest.raises(RuntimeError, match="bad inference"):
+        runtime.next_result()
+    with pytest.raises(RuntimeError, match="bad inference"):
+        runtime.close()
+    assert env.robot.stops == 1
+    assert not env.robot.sent_at
+    assert all(not thread.is_alive() for thread in runtime.threads)
+
+
+@pytest.mark.parametrize("outcome", ["s", "f", "q", "timeout"])
+def test_threaded_outcome_stops_before_prompt_or_retreat(outcome):
+    config = _config()
+    env = _threaded_env(config)
+    env._monitor.poll = lambda: None if outcome == "timeout" else outcome
+    calls = []
+
+    def after_stop(name):
+        assert env.robot.stops == 1
+        calls.append(name)
+        return "s"
+
+    env._retreat_after_outcome = lambda: after_stop("retreat")
+    env._prompt_outcome_after_timeout = lambda: after_stop("prompt")
+    if outcome == "timeout":
+        env._episode_start -= 100
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        try:
+            result = env.execute_policy_chunk(
+                _FakeStage2Policy(config), {"observation.state": torch.zeros(1, 7)},
+                warmup=True, remaining_steps=8,
+            )
+        finally:
+            env.close()
+    assert result.actual_steps == 1
+    assert result.done
+    assert result.reward_seq.sum().item() == int(outcome in {"s", "timeout"})
+    assert result.stop_requested == (outcome == "q")
+    assert calls == ([] if outcome == "q" else ["prompt", "retreat"] if outcome == "timeout" else ["retreat"])
+    # Warmup executes the ACT reference exactly, so all three endpoint
+    # comparisons must be zero after one completed episode.
+    assert result.info["episode_tcp_target_comparison_steps"] == 1
+    assert result.info["episode_exploration_vs_actor_mean_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
+    assert result.info["episode_actor_mean_vs_reference_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
+    assert result.info["episode_sampled_vs_reference_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
+
+
+def test_late_boundary_prediction_is_logged_without_repeating_or_bursting_actions():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+    config = _config()
+    env = _threaded_env(config, period=.02)
+    policy = _FakeStage2Policy(config)
+    encode = policy.encode_and_reference
+    calls = 0
+
+    def delayed_encode(batch):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            time.sleep(.06)
+        return encode(batch)
+
+    policy.encode_and_reference = delayed_encode
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        runtime = FixedChunkRuntime(
+            env, policy, {"observation.state": torch.zeros(1, 7)},
+            warmup=True, step_budget=8,
+        )
+        try:
+            first, second = runtime.next_result(), runtime.next_result()
+        finally:
+            runtime.close()
+    assert first.info["boundary_inference_ms"] >= 60
+    assert second.info["max_command_interval_ms"] >= 60
+    assert second.info["deadline_misses"] >= 1
+    assert len(env.robot.sent_at) == 8
+    assert min(np.diff(env.robot.sent_at)) > .01
 
 
 def test_callback_observes_completed_episode_and_warmup_phase() -> None:

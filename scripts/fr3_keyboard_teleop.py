@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--motion-detect-m", type=float, default=0.0002)
     parser.add_argument("--gripper-width-m", type=float, default=0.0)
-    parser.add_argument("--gripper-force-n", type=float, default=40.0)
+    parser.add_argument("--gripper-force-n", type=float, default=55.0)
     parser.add_argument("--waypoints-file", type=Path, default=DEFAULT_WAYPOINTS_FILE)
     parser.add_argument("--waypoint-speed-m-s", type=float, default=0.03)
     parser.add_argument(
