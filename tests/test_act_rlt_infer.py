@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import time
 from pathlib import Path
@@ -7,15 +8,22 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from act_rlt.infer import (
-    DEFAULT_RESET_XY_PADDING_M,
+    RESIDUAL_LIMIT_M,
+    ResidualMotionAccumulator,
     TemporalActionEnsembler,
-    TRAINING_TCP_ORIENTATION_MEAN_RAD,
     bounded_action,
     bounded_action_with_triggers,
+    build_parser,
+    checkpoint_camera_shapes,
+    centered_bounds,
+    confirm_centered_bounds,
+    move_to_next_sample,
     observation_frame,
     resolve_checkpoint,
+    robot_camera_kwargs,
     run_inference_episode,
     sample_workspace_pose,
+    validate_args,
 )
 
 
@@ -29,6 +37,150 @@ def test_state_selection_and_rgb_conversion():
     assert frame["observation.images.wrist"].shape == (3, 480, 640)
     np.testing.assert_allclose(frame["observation.images.wrist"][:, 0, 0], [1, 128/255, 0])
     assert len(frame) == 3
+
+
+def test_single_wrist_camera_uses_checkpoint_resolution_without_front():
+    config = SimpleNamespace(
+        input_features={
+            "observation.state": SimpleNamespace(shape=(7,)),
+            "observation.images.wrist": SimpleNamespace(shape=(3, 720, 1280)),
+        },
+        output_features={"action": SimpleNamespace(shape=(7,))},
+    )
+    cameras = checkpoint_camera_shapes(config)
+    assert cameras == {"wrist": (720, 1280, 3)}
+    kwargs = robot_camera_kwargs(
+        cameras, SimpleNamespace(wrist_camera="wrist-serial", front_camera="front-serial")
+    )
+    assert kwargs["camera_width"] == 1280
+    assert kwargs["camera_height"] == 720
+    assert kwargs["enable_wrist_camera"] is True
+    assert kwargs["enable_front_camera"] is False
+
+    observation = {f"joint_{i}": 0.0 for i in range(7)}
+    observation["wrist"] = np.zeros((720, 1280, 3), dtype=np.uint8)
+    frame = observation_frame(observation, cameras)
+    assert set(frame) == {"observation.state", "observation.images.wrist"}
+    assert frame["observation.images.wrist"].shape == (3, 720, 1280)
+
+
+def test_checkpoint_camera_shapes_preserves_legacy_two_camera_contract():
+    config = SimpleNamespace(
+        input_features={
+            "observation.state": SimpleNamespace(shape=(7,)),
+            "observation.images.wrist": SimpleNamespace(shape=(3, 480, 640)),
+            "observation.images.front": SimpleNamespace(shape=(3, 480, 640)),
+        },
+        output_features={"action": SimpleNamespace(shape=(7,))},
+    )
+    assert checkpoint_camera_shapes(config) == {
+        "wrist": (480, 640, 3), "front": (480, 640, 3)
+    }
+
+
+def test_fps_cli_accepts_30_and_rejects_faster_camera_rate():
+    parser = build_parser()
+    valid = parser.parse_args(["--checkpoint", "model", "--fps", "30", "--dry-run"])
+    validate_args(parser, valid)
+    assert valid.fps == 30
+    assert parser.parse_args(["--checkpoint", "model"]).fps == 30
+    assert parser.parse_args(["--checkpoint", "model"]).residual_control is False
+    assert parser.parse_args(
+        ["--checkpoint", "model", "--residual-control"]
+    ).residual_control is True
+    invalid = parser.parse_args(["--checkpoint", "model", "--fps", "31", "--dry-run"])
+    with TestCase().assertRaises(SystemExit):
+        validate_args(parser, invalid)
+
+
+def test_motion_cli_uses_confirmed_center_instead_of_workspace_arguments():
+    parser = build_parser()
+    validate_args(parser, parser.parse_args(["--checkpoint", "model"]))
+    with TestCase().assertRaises(SystemExit):
+        parser.parse_args(["--checkpoint", "model", "--workspace-min", "0", "0", "0"])
+
+
+def test_centered_sample_and_workspace_offsets():
+    pose = [0.4, -0.2, 0.3, 1, 2, 3]
+    sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
+    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.295])
+    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.305])
+    np.testing.assert_allclose(workspace_min, [0.3, -0.3, 0.27])
+    np.testing.assert_allclose(workspace_max, [0.5, -0.1, 0.31])
+    sampled = sample_workspace_pose(
+        sample_min, sample_max, [1, 2, 3],
+        0.0, np.random.default_rng(0),
+    )
+    assert np.all(sampled[:3] >= sample_min)
+    assert np.all(sampled[:3] <= sample_max)
+    np.testing.assert_allclose(sampled[3:], [1, 2, 3])
+    with TestCase().assertRaisesRegex(ValueError, "invalid measured TCP pose"):
+        centered_bounds([0, 0, float("nan"), 0, 0, 0])
+
+
+def test_next_sample_transition_lifts_measured_tcp_one_cm_in_base_z():
+    calls = []
+    current = [0.40, -0.20, 0.30, 1.0, 2.0, 3.0]
+
+    def move_tool(pose, *, speed):
+        calls.append((pose, speed))
+        return pose
+
+    robot = SimpleNamespace(
+        robot=SimpleNamespace(get_tool_pose=lambda: current, move_tool=move_tool),
+        resync_command_pose=lambda: None,
+    )
+    target = [0.42, -0.18, 0.305, 4.0, 5.0, 6.0]
+
+    measured = move_to_next_sample(robot, target, 0.02)
+
+    assert calls == [
+        ([0.40, -0.20, 0.31, 1.0, 2.0, 3.0], 0.02),
+        (target, 0.02),
+    ]
+    np.testing.assert_allclose(measured, target)
+
+
+def test_confirm_centered_bounds_only_enables_limits_after_enter():
+    config = SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None)
+    robot = SimpleNamespace(
+        config=config,
+        robot=SimpleNamespace(get_tool_pose=lambda: [0.4, -0.2, 0.3, 1, 2, 3]),
+    )
+    with patch("builtins.input", return_value="q"):
+        assert confirm_centered_bounds(robot) is None
+    assert config.workspace_min_xyz is None
+    assert config.workspace_max_xyz is None
+
+    with patch("builtins.input", return_value=""):
+        sample_min, sample_max, orientation = confirm_centered_bounds(robot)
+    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.295])
+    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.305])
+    np.testing.assert_allclose(orientation, [1, 2, 3])
+    np.testing.assert_allclose(config.workspace_min_xyz, [0.3, -0.3, 0.27])
+    np.testing.assert_allclose(config.workspace_max_xyz, [0.5, -0.1, 0.31])
+
+
+def test_enter_captures_latest_tcp_pose_including_orientation():
+    config = SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None)
+    poses = iter([
+        [0.4, -0.2, 0.3, 1, 2, 3],  # preview before Enter
+        [0.5, -0.1, 0.4, 4, 5, 6],  # measured when Enter is pressed
+    ])
+    robot = SimpleNamespace(config=config, robot=SimpleNamespace(get_tool_pose=lambda: next(poses)))
+    with patch("builtins.input", return_value=""):
+        sample_min, sample_max, orientation = confirm_centered_bounds(robot)
+    np.testing.assert_allclose(sample_min, [0.48, -0.12, 0.395])
+    np.testing.assert_allclose(sample_max, [0.52, -0.08, 0.405])
+    np.testing.assert_allclose(orientation, [4, 5, 6])
+    np.testing.assert_allclose(config.workspace_min_xyz, [0.4, -0.2, 0.37])
+    np.testing.assert_allclose(config.workspace_max_xyz, [0.6, 0, 0.41])
+
+
+def test_reset_orientation_is_not_a_cli_argument():
+    parser = build_parser()
+    with TestCase().assertRaises(SystemExit):
+        parser.parse_args(["--checkpoint", "model", "--reset-orientation", "1", "2", "3"])
 
 
 def test_checkpoint_resolution():
@@ -69,20 +221,20 @@ def test_invalid_action_is_rejected():
         bounded_action([0] * 6, 0.002, 0.02)
 
 
-def test_workspace_sample_has_three_centimetre_xy_padding_and_mean_orientation():
+def test_workspace_sample_has_optional_xy_padding_and_fixed_orientation():
     lower = np.array([0.3, -0.3, 0.1])
     upper = np.array([0.7, 0.2, 0.5])
     sampled = sample_workspace_pose(
         lower,
         upper,
-        TRAINING_TCP_ORIENTATION_MEAN_RAD,
-        DEFAULT_RESET_XY_PADDING_M,
+        [1, 2, 3],
+        0.03,
         np.random.default_rng(0),
     )
     assert np.all(sampled[:2] >= lower[:2] + 0.03)
     assert np.all(sampled[:2] <= upper[:2] - 0.03)
     assert lower[2] <= sampled[2] <= upper[2]
-    np.testing.assert_allclose(sampled[3:], [-2.19841545, 2.22703212, -0.03082950])
+    np.testing.assert_allclose(sampled[3:], [1, 2, 3])
 
 
 def test_workspace_sample_rejects_box_too_narrow_for_padding():
@@ -90,7 +242,7 @@ def test_workspace_sample_rejects_box_too_narrow_for_padding():
         sample_workspace_pose(
             [0, 0, 0],
             [0.06, 0.2, 0.3],
-            TRAINING_TCP_ORIENTATION_MEAN_RAD,
+            [1, 2, 3],
             0.03,
             np.random.default_rng(0),
         )
@@ -130,15 +282,35 @@ class _FakeRobot:
         self.is_connected = True
         self.sent_at = []
         self.stop_calls = 0
+        self.resync_calls = 0
+        self.pose = np.zeros(6, dtype=float)
+        self._cmd_pose = None
 
     def get_observation(self):
         time.sleep(0.002)
         return {"frame": len(self.sent_at)}
 
     def resync_command_pose(self):
-        pass
+        self.resync_calls += 1
+        self._cmd_pose = None
 
-    def send_action(self, action):
+    def get_tool_pose(self):
+        return self.pose.tolist()
+
+    def get_joint_angles(self):
+        return [0.0] * 7
+
+    def get_tool_force_raw(self):
+        return [0.0] * 6
+
+    def send_action(self, action, *, position_residual_xyz=None):
+        translation = (
+            np.array(list(action.values())[:3])
+            if position_residual_xyz is None else np.asarray(position_residual_xyz)
+        )
+        self._cmd_pose = self.pose.copy()
+        self._cmd_pose[:3] += translation
+        self.pose = self._cmd_pose.copy()
         self.sent_at.append(time.monotonic())
 
     def stop_servo(self):
@@ -172,14 +344,127 @@ class _FakePolicy:
         return _FakeTensor(values)
 
 
-def _threaded_args(duration=0.32, dry_run=False, temporal_ensemble_coeff=None):
+def _threaded_args(
+    duration=0.32, dry_run=False, temporal_ensemble_coeff=None, fps=15,
+    residual_control=False,
+):
     return SimpleNamespace(
         duration=duration,
         dry_run=dry_run,
         max_step_m=0.002,
         max_step_rad=0.02,
         temporal_ensemble_coeff=temporal_ensemble_coeff,
+        fps=fps,
+        residual_control=residual_control,
     )
+
+
+def _xyz_action(dx=0.0, dy=0.0, dz=0.0):
+    return dict(dx=dx, dy=dy, dz=dz, drx=0.0, dry=0.0, drz=0.0)
+
+
+def test_residual_accumulates_unexecuted_small_actions_and_subtracts_motion():
+    controller = ResidualMotionAccumulator()
+    measured = np.zeros(6)
+    first, stalled = controller.step(measured, _xyz_action(dz=-0.000058), 0.0)
+    second, _ = controller.step(measured, _xyz_action(dz=-0.000058), 1 / 30)
+    np.testing.assert_allclose(first, [0, 0, -0.000058])
+    np.testing.assert_allclose(second, [0, 0, -0.000116])
+    assert not stalled
+
+    measured[2] = -0.00008
+    third, _ = controller.step(measured, _xyz_action(dz=-0.000058), 2 / 30)
+    np.testing.assert_allclose(third, [0, 0, -0.000094])
+
+
+def test_residual_clips_each_axis_to_three_tenths_millimetre():
+    controller = ResidualMotionAccumulator()
+    residual, _ = controller.step(
+        np.zeros(6), _xyz_action(dx=0.002, dy=-0.002, dz=-0.002), 0.0
+    )
+    np.testing.assert_allclose(
+        residual, [RESIDUAL_LIMIT_M, -RESIDUAL_LIMIT_M, -RESIDUAL_LIMIT_M]
+    )
+
+
+def test_z_stall_clears_downward_residual_and_latches_for_episode():
+    controller = ResidualMotionAccumulator()
+    measured = np.zeros(6)
+    triggered = []
+    for tick in range(10):
+        residual, newly_stalled = controller.step(
+            measured, _xyz_action(dz=-0.000058), tick / 30
+        )
+        triggered.append(newly_stalled)
+    assert sum(triggered) == 1
+    assert controller.z_stalled
+    assert residual[2] == 0
+
+    residual, newly_stalled = controller.step(
+        measured, _xyz_action(dz=-0.000058), 10 / 30
+    )
+    assert residual[2] == 0 and not newly_stalled
+    residual, _ = controller.step(measured, _xyz_action(dz=0.00012), 11 / 30)
+    assert residual[2] > 0  # Retraction is still allowed.
+    assert controller.z_stalled
+    residual, _ = controller.step(measured, _xyz_action(dz=-0.000058), 12 / 30)
+    assert residual[2] >= 0  # A later negative command cannot re-arm insertion.
+
+
+def test_z_stall_does_not_trigger_when_measured_tcp_descends():
+    controller = ResidualMotionAccumulator()
+    for tick in range(15):
+        measured = np.array([0, 0, -tick * 0.000058, 0, 0, 0])
+        residual, triggered = controller.step(
+            measured, _xyz_action(dz=-0.000058), tick / 30
+        )
+        assert not triggered
+    assert not controller.z_stalled
+    np.testing.assert_allclose(residual[2], -0.000058)
+
+
+def test_z_stall_window_also_triggers_at_15_hz():
+    controller = ResidualMotionAccumulator()
+    triggered = []
+    for tick in range(5):
+        _, newly_stalled = controller.step(
+            np.zeros(6), _xyz_action(dz=-0.000058), tick / 15
+        )
+        triggered.append(newly_stalled)
+    assert triggered == [False, False, False, False, True]
+
+
+def test_franka_residual_target_uses_offset_and_preserves_workspace_guard():
+    from evo_rlt.adapters.lerobot.franka_robot.franka_robot import FrankaRobot
+
+    sent = []
+    hardware = SimpleNamespace(
+        get_tool_pose=lambda: [0, 0, 0, 0, 0, 0],
+        servo_tool=lambda pose: sent.append(pose),
+    )
+    robot = SimpleNamespace(
+        robot=hardware,
+        config=SimpleNamespace(
+            workspace_min_xyz=(-0.001, -0.001, -0.001),
+            workspace_max_xyz=(0.001, 0.001, 0.001),
+        ),
+        _cmd_pose=None,
+    )
+    action = _xyz_action(dz=-0.000058)
+    FrankaRobot.send_action(
+        robot, action, position_residual_xyz=[0, 0, -0.000116]
+    )
+    np.testing.assert_allclose(sent[-1][:3], [0, 0, -0.000116])
+    FrankaRobot.send_action(robot, action)
+    np.testing.assert_allclose(sent[-1][:3], [0, 0, -0.000174])
+
+    robot._cmd_pose = None
+    robot.config.workspace_min_xyz = (-0.001, -0.001, -0.0001)
+    with TestCase().assertRaisesRegex(RuntimeError, "outside workspace"):
+        FrankaRobot.send_action(
+            robot, action, position_residual_xyz=[0, 0, -0.0002]
+        )
+    assert len(sent) == 2
 
 
 def test_temporal_ensemble_uses_paper_log_weights_for_same_timestep():
@@ -202,7 +487,7 @@ def test_temporal_ensemble_pipeline_keeps_using_overlapping_chunks():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=4, chunk_size=4, slow_calls={2: 0.08})
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
         run_inference_episode(
             robot,
             policy,
@@ -217,12 +502,82 @@ def test_temporal_ensemble_pipeline_keeps_using_overlapping_chunks():
     assert np.all(np.diff(robot.sent_at) < 0.09)
 
 
+def test_full_trace_records_every_step_chunks_and_tcp_targets(tmp_path):
+    robot = _FakeRobot()
+    policy = _FakePolicy(n_action_steps=4, chunk_size=4)
+    args = _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=0.01)
+    args.log_dir = tmp_path
+    args.checkpoint = Path("test-checkpoint")
+
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        run_inference_episode(
+            robot, policy, lambda frame: frame, lambda action: action,
+            args, _FakeTorch, episode_index=6,
+        )
+
+    paths = list(tmp_path.glob("*.jsonl"))
+    assert len(paths) == 1
+    events = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    assert events[0]["event"] == "episode_start"
+    assert events[0]["episode_index"] == 6
+    assert events[-1]["event"] == "episode_end"
+    chunks = [event for event in events if event["event"] == "model_chunk"]
+    steps = [event for event in events if event["event"] == "control_step"]
+    assert chunks and all(len(event["actions"]) == 4 for event in chunks)
+    assert len(steps) == len(robot.sent_at) == events[-1]["stats"]["ticks"]
+    assert [event["step"] for event in steps] == list(range(len(steps)))
+    assert all(event["ensemble_votes"] >= 1 for event in steps)
+    assert all(len(event["measured_tcp_before"]) == 6 for event in steps)
+    assert all(len(event["measured_joint_before"]) == 7 for event in steps)
+    assert all(len(event["external_wrench_base_before"]) == 6 for event in steps)
+    assert all(len(event["target_tcp_sent"]) == 6 for event in steps)
+    assert all(len(event["action_unbounded"]) == 7 for event in steps)
+    assert all(len(event["action_sent"]) == 6 for event in steps)
+    assert events[0]["residual_control"] is False
+    assert all(event["residual_xyz"] is None for event in steps)
+    assert all(event["z_stall_latched"] is None for event in steps)
+    assert robot.resync_calls >= len(steps)
+
+
+def test_inference_stall_guard_clears_target_and_logs_latch(tmp_path):
+    class StuckRobot(_FakeRobot):
+        def send_action(self, action, *, position_residual_xyz=None):
+            self._cmd_pose = self.pose.copy()
+            self._cmd_pose[:3] += position_residual_xyz
+            self.sent_at.append(time.monotonic())
+
+    class DownPolicy(_FakePolicy):
+        def select_action(self, batch):
+            self.calls += 1
+            return _FakeTensor([0, 0, -0.000058, 0, 0, 0, 0.04])
+
+    robot = StuckRobot()
+    args = _threaded_args(duration=0.42, fps=30, residual_control=True)
+    args.log_dir = tmp_path
+    policy = DownPolicy(n_action_steps=4)
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        run_inference_episode(
+            robot, policy, lambda frame: frame, lambda action: action,
+            args, _FakeTorch,
+        )
+
+    path, = tmp_path.glob("*.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    steps = [event for event in events if event["event"] == "control_step"]
+    assert events[0]["residual_control"] is True
+    assert events[-1]["stats"]["z_stall_events"] == 1
+    assert sum(event["z_stall_triggered"] for event in steps) == 1
+    assert min(event["target_tcp_sent"][2] for event in steps) >= -RESIDUAL_LIMIT_M
+    latched = [event for event in steps if event["z_stall_latched"]]
+    assert latched and all(event["target_tcp_sent"][2] == 0 for event in latched)
+
+
 def test_three_worker_pipeline_hides_chunk_inference_latency():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=4, slow_calls={1: 0.08, 5: 0.08})
     pre_calls = []
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
         run_inference_episode(
             robot,
             policy,
@@ -244,7 +599,7 @@ def test_action_queue_underrun_stops_instead_of_repeating_delta():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=1, slow_calls={2: 0.15})
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
         with TestCase().assertRaisesRegex(RuntimeError, "queue underrun"):
             run_inference_episode(
                 robot,
@@ -257,6 +612,39 @@ def test_action_queue_underrun_stops_instead_of_repeating_delta():
 
     assert len(robot.sent_at) == 1
     assert robot.stop_calls == 1
+
+
+def test_30_hz_servo_timing_with_prepared_action_chunk():
+    robot = _FakeRobot()
+    policy = _FakePolicy(n_action_steps=8)
+
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        run_inference_episode(
+            robot, policy, lambda frame: frame, lambda action: action,
+            _threaded_args(duration=0.14, fps=30), _FakeTorch,
+        )
+
+    assert len(robot.sent_at) >= 4
+    assert robot.stop_calls == 1
+    intervals = np.diff(robot.sent_at)
+    assert np.all(np.abs(intervals - 1 / 30) < 0.025), intervals
+
+
+def test_30_hz_servo_timing_with_temporal_ensemble():
+    robot = _FakeRobot()
+    policy = _FakePolicy(n_action_steps=4, chunk_size=16, slow_calls={2: 0.07})
+
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        run_inference_episode(
+            robot, policy, lambda frame: frame, lambda action: action,
+            _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=0.01),
+            _FakeTorch,
+        )
+
+    assert len(robot.sent_at) >= 4
+    assert robot.stop_calls == 1
+    intervals = np.diff(robot.sent_at)
+    assert np.all(np.abs(intervals - 1 / 30) < 0.025), intervals
 
 
 if __name__ == "__main__":

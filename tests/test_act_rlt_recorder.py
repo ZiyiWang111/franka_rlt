@@ -20,8 +20,72 @@ def test_continuous_collection_defaults_are_slow_and_include_settle_delays():
     validate_args(args)
     assert args.move_speed == pytest.approx(0.02)
     assert args.insertion_speed == pytest.approx(0.01)
-    assert args.pre_episode_sleep == pytest.approx(0.5)
-    assert args.post_episode_sleep == pytest.approx(0.5)
+    assert args.pre_episode_sleep == pytest.approx(1.0)
+    assert args.post_episode_sleep == pytest.approx(1.0)
+    assert args.fps == 15
+
+
+@pytest.mark.parametrize("fps", [15, 30])
+def test_collection_fps_accepts_the_supported_rates(fps):
+    args = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--fps", str(fps),
+    ])
+    validate_args(args)
+    assert args.fps == fps
+
+
+def test_collection_fps_rejects_unsupported_rate():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--fps", "50",
+        ])
+
+
+def test_single_camera_collection_modes_select_only_one_camera():
+    wrist = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--wrist_only",
+    ])
+    validate_args(wrist)
+    assert wrist.wrist_only is True
+    assert wrist.front_only is False
+
+    front = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--front_only",
+    ])
+    validate_args(front)
+    assert front.front_only is True
+    assert front.wrist_only is False
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
+            "--wrist_only", "--front_only",
+        ])
+
+
+def test_z_insertion_mode_is_an_explicit_opt_in():
+    args = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--z-insertion-mode",
+    ])
+    validate_args(args)
+    assert args.z_insertion_mode is True
+    assert args.task is None
+    assert args.insert_minus_z is None
+
+    custom_depth = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
+        "--z-insertion-mode", "--insert-minus-z", "0.015",
+    ])
+    validate_args(custom_depth)
+    assert custom_depth.insert_minus_z == pytest.approx(0.015)
+
+
+def test_rotation_is_an_explicit_opt_in():
+    args = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--rotation",
+    ])
+    validate_args(args)
+    assert args.rotation is True
 
 
 def test_command_action_tracks_exact_waypoint_and_realigns_pending_frame():

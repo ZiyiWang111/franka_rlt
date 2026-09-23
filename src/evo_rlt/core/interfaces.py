@@ -15,6 +15,7 @@ TRANSITION_SOURCE_HUMAN_OVERRIDE = 3
 STATE_VEC = "state_vec"
 EXEC_CHUNK_FLAT = "exec_chunk_flat"
 REF_CHUNK_FLAT = "ref_chunk_flat"
+BC_TARGET_FLAT = "bc_target_flat"
 REWARD_SEQ = "reward_seq"
 NEXT_STATE_VEC = "next_state_vec"
 NEXT_REF_FLAT = "next_ref_flat"
@@ -65,3 +66,5 @@ class ChunkTransition:
     is_critical: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
     terminated: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
     truncated: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
+    # Optional human correction target. Older replay entries use ref_chunk.
+    bc_target_chunk: torch.Tensor | None = None

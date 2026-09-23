@@ -20,7 +20,7 @@ DATASET_ROOT="${DATASET_ROOT:-}"
 FPS="${FPS:-15}"
 EPISODES="${EPISODES:-10}"
 EPISODE_TIME_S="${EPISODE_TIME_S:-60}"
-TASK="${TASK:-Move from a sampled workspace pose to the reference point and advance along -Y.}"
+TASK="${TASK:-}"
 MOVE_SPEED="${MOVE_SPEED:-0.02}"
 INSERTION_SPEED="${INSERTION_SPEED:-0.01}"
 PRE_EPISODE_SLEEP="${PRE_EPISODE_SLEEP:-1.0}"
@@ -29,10 +29,15 @@ X_HALF_RANGE="${X_HALF_RANGE:-0.01}"
 Y_RANGE="${Y_RANGE:-0.02}"
 Z_HALF_RANGE="${Z_HALF_RANGE:-0.01}"
 INSERT_MINUS_Y="${INSERT_MINUS_Y:-0.01}"
+INSERT_MINUS_Z="${INSERT_MINUS_Z:-}"
+Z_INSERTION_MODE="${Z_INSERTION_MODE:-false}"
+ROTATION="${ROTATION:-false}"
 ABORT_KEY="${ABORT_KEY:-x}"
 SEED="${SEED:-}"
 RESUME="${RESUME:-false}"
 CAMERA_CHECK_FRAMES="${CAMERA_CHECK_FRAMES:-5}"
+CAMERA_MODE="both"
+CAMERA_MODE_SET=false
 
 CONTROL_PID=""
 CONTROL_PID_FILE=""
@@ -44,7 +49,7 @@ Usage: act_rlt/data_collection/collect_sample_space.sh [options]
 Dataset:
   --dataset NAME          Dataset repo/name (default: act_rlt_sample_space)
   --root PATH             Dataset root (default: PROJECT/datasets/NAME)
-  --fps HZ                Recording rate (default: 15)
+  --fps HZ                Recording rate: 15 or 30 Hz (default: 15)
   --episodes N            Number of newly saved episodes (default: 10)
   --episode-time SEC      Per-attempt timeout (default: 60)
   --task TEXT             LeRobot task description
@@ -59,6 +64,9 @@ Trajectory (metres, robot-base frame):
   --y-range M             Sample y0 through y0+range (default: 0.02)
   --z-half-range M        Sample z0 +/- range (default: 0.01)
   --insert-minus-y M      Recorded -Y advance (default: 0.01)
+  --insert-minus-z M      Recorded -Z advance in --z-insertion-mode (default: 0.01)
+  --z-insertion-mode      Record p0 -> p0-1cm(Z); sample X/Y +/-1cm and Z +0..2cm
+  --rotation              Randomize every sample's base-Z orientation by +/-5 degrees
   --abort-key KEY         Stop and discard active episode (default: x)
   --seed N                Optional reproducible sample sequence
 
@@ -66,6 +74,8 @@ Hardware/runtime:
   --robot-ip IP
   --wrist-camera SERIAL
   --front-camera SERIAL
+  --wrist_only          Record only wrist, at 1280x720 (front is not opened)
+  --front_only          Record only front, at 640x480 (wrist is not opened)
   --collect-python PATH
   --control-python PATH
   --control-log PATH
@@ -76,6 +86,9 @@ Workflow:
   2. The recorder samples and moves to a start pose outside the episode.
   3. After 1.0 s it records sample -> p0 -> p0-1cm(Y) and saves automatically.
   4. After another 1.0 s it retreats to p0, moves to the next sample, and repeats.
+
+With --z-insertion-mode, step 3 is p0 -> p0-1cm(Z), step 4 returns +Z 1cm
+to p0, and samples use X/Y +/-1cm and Z from p0 through p0+2cm.
 
 No per-episode ENTER is required. During either 0.5 s transition window,
 1 moves to p0, 2 moves to the current sample, and Q quits; numeric keys pause
@@ -105,12 +118,21 @@ while (($#)); do
         --y-range) Y_RANGE="${2:?--y-range requires a value}"; shift 2 ;;
         --z-half-range) Z_HALF_RANGE="${2:?--z-half-range requires a value}"; shift 2 ;;
         --insert-minus-y) INSERT_MINUS_Y="${2:?--insert-minus-y requires a value}"; shift 2 ;;
+        --insert-minus-z) INSERT_MINUS_Z="${2:?--insert-minus-z requires a value}"; shift 2 ;;
+        --z-insertion-mode) Z_INSERTION_MODE=true; shift ;;
+        --rotation) ROTATION=true; shift ;;
         --abort-key) ABORT_KEY="${2:?--abort-key requires a value}"; shift 2 ;;
         --seed) SEED="${2:?--seed requires a value}"; shift 2 ;;
         --resume) RESUME=true; shift ;;
         --robot-ip) ROBOT_IP="${2:?--robot-ip requires a value}"; shift 2 ;;
         --wrist-camera) WRIST_CAMERA_SERIAL="${2:?--wrist-camera requires a value}"; shift 2 ;;
         --front-camera) FRONT_CAMERA_SERIAL="${2:?--front-camera requires a value}"; shift 2 ;;
+        --wrist_only|--wrist-only)
+            [[ "$CAMERA_MODE_SET" == false ]] || die "--wrist_only and --front_only are mutually exclusive"
+            CAMERA_MODE="wrist"; CAMERA_MODE_SET=true; shift ;;
+        --front_only|--front-only)
+            [[ "$CAMERA_MODE_SET" == false ]] || die "--wrist_only and --front_only are mutually exclusive"
+            CAMERA_MODE="front"; CAMERA_MODE_SET=true; shift ;;
         --collect-python) COLLECT_PYTHON="${2:?--collect-python requires a value}"; shift 2 ;;
         --control-python) CONTROL_PYTHON="${2:?--control-python requires a value}"; shift 2 ;;
         --control-log) CONTROL_LOG="${2:?--control-log requires a value}"; shift 2 ;;
@@ -124,7 +146,10 @@ is_positive_number() {
 }
 
 [[ -n "$DATASET_NAME" ]] || die "dataset name cannot be empty"
-[[ "$FPS" =~ ^[1-9][0-9]*$ ]] || die "--fps must be a positive integer"
+case "$FPS" in
+    15|30) ;;
+    *) die "--fps must be one of: 15, 30" ;;
+esac
 [[ "$EPISODES" =~ ^[1-9][0-9]*$ ]] || die "--episodes must be a positive integer"
 for pair in \
     "episode-time:${EPISODE_TIME_S}" \
@@ -140,9 +165,14 @@ for pair in \
     value="${pair#*:}"
     is_positive_number "$value" || die "--${name} must be positive"
 done
+if [[ -n "$INSERT_MINUS_Z" ]]; then
+    is_positive_number "$INSERT_MINUS_Z" || die "--insert-minus-z must be positive"
+fi
 [[ ${#ABORT_KEY} -eq 1 ]] || die "--abort-key must be exactly one character"
 [[ -z "$SEED" || "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 [[ "$RESUME" == true || "$RESUME" == false ]] || die "RESUME must be true or false"
+[[ "$Z_INSERTION_MODE" == true || "$Z_INSERTION_MODE" == false ]] || die "Z_INSERTION_MODE must be true or false"
+[[ "$ROTATION" == true || "$ROTATION" == false ]] || die "ROTATION must be true or false"
 [[ -x "$COLLECT_PYTHON" ]] || die "collection Python is not executable: $COLLECT_PYTHON"
 [[ -x "$CONTROL_PYTHON" ]] || die "control-server Python is not executable: $CONTROL_PYTHON"
 [[ -f "$CONTROL_SERVER_SCRIPT" ]] || die "control-server launcher not found: $CONTROL_SERVER_SCRIPT"
@@ -192,10 +222,25 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPAT
 echo "ACT-RLT sample-space collection:"
 echo "  dataset=${DATASET_NAME}, root=${DATASET_ROOT}"
 echo "  fps=${FPS}, new_episodes=${EPISODES}, timeout=${EPISODE_TIME_S}s"
-echo "  sample x=+/-${X_HALF_RANGE}m, y=[0,+${Y_RANGE}]m, z=+/-${Z_HALF_RANGE}m from p0"
+case "$CAMERA_MODE" in
+    wrist) echo "  cameras=wrist only (1280x720@30Hz)" ;;
+    front) echo "  cameras=front only (640x480@30Hz)" ;;
+    both) echo "  cameras=wrist + front (each 640x480@30Hz)" ;;
+esac
+if [[ "$Z_INSERTION_MODE" == true ]]; then
+    echo "  z-insertion mode: sample x=+/-${X_HALF_RANGE}m, y=+/-${X_HALF_RANGE}m, z=[0,+${Y_RANGE}]m from p0"
+    Z_DEPTH="${INSERT_MINUS_Z:-$INSERT_MINUS_Y}"
+    echo "  final=-Z ${Z_DEPTH}m; non-recorded retreat=+Z ${Z_DEPTH}m"
+else
+    echo "  sample x=+/-${X_HALF_RANGE}m, y=[0,+${Y_RANGE}]m, z=+/-${Z_HALF_RANGE}m from p0"
+    echo "  final=-Y ${INSERT_MINUS_Y}m, abort_key=${ABORT_KEY}"
+fi
 echo "  move_speed=${MOVE_SPEED}m/s, insertion_speed=${INSERTION_SPEED}m/s"
 echo "  pre_episode_sleep=${PRE_EPISODE_SLEEP}s, post_episode_sleep=${POST_EPISODE_SLEEP}s"
-echo "  final=-Y ${INSERT_MINUS_Y}m, abort_key=${ABORT_KEY}"
+echo "  abort_key=${ABORT_KEY}"
+if [[ "$ROTATION" == true ]]; then
+    echo "  sampled orientation: base-Z yaw +/-5 deg"
+fi
 
 CONTROL_PID_FILE="$(mktemp /tmp/act-rlt-control-server.XXXXXX.pid)"
 echo "Starting a fresh Evo-RLT control server ..."
@@ -205,15 +250,23 @@ CONTROL_PID="$(<"$CONTROL_PID_FILE")"
 [[ "$CONTROL_PID" =~ ^[1-9][0-9]*$ ]] || die "invalid control-server PID: $CONTROL_PID"
 kill -0 "$CONTROL_PID" 2>/dev/null || die "control server exited; see $CONTROL_LOG"
 
-echo "Checking wrist and front RealSense cameras ..."
-"$COLLECT_PYTHON" "$CAMERA_CHECK_SCRIPT" \
-    --wrist-serial "$WRIST_CAMERA_SERIAL" \
-    --front-serial "$FRONT_CAMERA_SERIAL" \
-    --wrist-width 640 \
-    --wrist-height 480 \
-    --front-width 640 \
-    --front-height 480 \
-    --frames "$CAMERA_CHECK_FRAMES"
+echo "Checking selected RealSense camera(s) ..."
+CAMERA_CHECK_ARGS=(--frames "$CAMERA_CHECK_FRAMES")
+case "$CAMERA_MODE" in
+    wrist)
+        CAMERA_CHECK_ARGS+=(--wrist-serial "$WRIST_CAMERA_SERIAL" --wrist-width 1280 --wrist-height 720)
+        ;;
+    front)
+        CAMERA_CHECK_ARGS+=(--front-serial "$FRONT_CAMERA_SERIAL" --front-width 640 --front-height 480)
+        ;;
+    both)
+        CAMERA_CHECK_ARGS+=(
+            --wrist-serial "$WRIST_CAMERA_SERIAL" --wrist-width 640 --wrist-height 480
+            --front-serial "$FRONT_CAMERA_SERIAL" --front-width 640 --front-height 480
+        )
+        ;;
+esac
+"$COLLECT_PYTHON" "$CAMERA_CHECK_SCRIPT" "${CAMERA_CHECK_ARGS[@]}"
 
 RECORDER_ARGS=(
     --dataset "$DATASET_NAME"
@@ -221,7 +274,6 @@ RECORDER_ARGS=(
     --fps "$FPS"
     --episodes "$EPISODES"
     --episode-time "$EPISODE_TIME_S"
-    --task "$TASK"
     --robot-ip "$ROBOT_IP"
     --wrist-camera "$WRIST_CAMERA_SERIAL"
     --front-camera "$FRONT_CAMERA_SERIAL"
@@ -235,6 +287,23 @@ RECORDER_ARGS=(
     --insert-minus-y "$INSERT_MINUS_Y"
     --abort-key "$ABORT_KEY"
 )
+if [[ "$CAMERA_MODE" == wrist ]]; then
+    RECORDER_ARGS+=(--wrist_only)
+elif [[ "$CAMERA_MODE" == front ]]; then
+    RECORDER_ARGS+=(--front_only)
+fi
+if [[ -n "$TASK" ]]; then
+    RECORDER_ARGS+=(--task "$TASK")
+fi
+if [[ "$Z_INSERTION_MODE" == true ]]; then
+    RECORDER_ARGS+=(--z-insertion-mode)
+fi
+if [[ "$ROTATION" == true ]]; then
+    RECORDER_ARGS+=(--rotation)
+fi
+if [[ -n "$INSERT_MINUS_Z" ]]; then
+    RECORDER_ARGS+=(--insert-minus-z "$INSERT_MINUS_Z")
+fi
 if [[ -n "$SEED" ]]; then
     RECORDER_ARGS+=(--seed "$SEED")
 fi

@@ -7,6 +7,7 @@ import torch
 
 from evo_rlt.core.interfaces import (
     ACTUAL_STEPS,
+    BC_TARGET_FLAT,
     DONE,
     EPISODE_ID,
     EXEC_CHUNK_FLAT,
@@ -48,7 +49,7 @@ class ReplayBuffer:
     def add(self, transition: ChunkTransition) -> None:
         self.buffer.append(transition)
 
-    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
+    def sample(self, batch_size: int, *, include_bc_target: bool = False) -> dict[str, torch.Tensor]:
         """Sample a batch and collate into a dict of stacked tensors."""
         n = min(batch_size, len(self.buffer))
         indices = random.sample(range(len(self.buffer)), n)
@@ -56,7 +57,7 @@ class ReplayBuffer:
         stacked_exec = torch.stack([t.exec_chunk for t in batch])
         stacked_ref = torch.stack([t.ref_chunk for t in batch])
         stacked_next_ref = torch.stack([t.next_ref_chunk for t in batch])
-        return {
+        result = {
             STATE_VEC: torch.stack([t.state_vec for t in batch]),
             EXEC_CHUNK_FLAT: stacked_exec.flatten(start_dim=-2),
             REF_CHUNK_FLAT: stacked_ref.flatten(start_dim=-2),
@@ -72,3 +73,10 @@ class ReplayBuffer:
             TERMINATED: torch.stack([t.terminated for t in batch]),
             TRUNCATED: torch.stack([t.truncated for t in batch]),
         }
+        if include_bc_target:
+            targets = torch.stack([
+                t.bc_target_chunk if getattr(t, "bc_target_chunk", None) is not None else t.ref_chunk
+                for t in batch
+            ])
+            result[BC_TARGET_FLAT] = targets.flatten(start_dim=-2)
+        return result

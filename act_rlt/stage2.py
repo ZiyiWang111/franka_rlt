@@ -22,6 +22,7 @@ from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
 from act_rlt.modeling_act_rlt_token import ACTRLTokenPolicy
 from act_rlt.stage2_networks import Stage2ChunkActor, Stage2TwinCritic
 from evo_rlt.core.interfaces import (
+    TRANSITION_SOURCE_HUMAN_OVERRIDE,
     TRANSITION_SOURCE_RL_AUTONOMOUS,
     TRANSITION_SOURCE_WARMUP_VLA,
     ChunkTransition,
@@ -61,7 +62,7 @@ class ACTStage2Config:
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
     fusion_dim: int = 128
-    actor_fixed_std: float = 0.1
+    actor_fixed_std: float = 0.2
     actor_ref_dropout_p: float = 0.5
     actor_lr: float = 3e-4
 
@@ -191,6 +192,7 @@ class ACTStage2Policy(nn.Module):
         loaded = PreTrainedConfig.from_pretrained(stage1_path, local_files_only=True)
         if not isinstance(loaded, ACTRLTokenConfig):
             raise TypeError(f"expected act_rlt_token checkpoint, got {loaded.type!r}")
+        # The ACT run may have been copied or renamed after RL Token training.
         loaded.act_pretrained_path = str(act_path)
         loaded.device = self.config.device
         return ACTRLTokenPolicy.from_pretrained(
@@ -311,6 +313,13 @@ class Stage2Learner:
     def _batch_to_device(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         return {key: value.to(self.config.device) for key, value in batch.items()}
 
+    def _sample_batch(self, replay: ReplayBuffer) -> dict[str, Tensor]:
+        if isinstance(replay, ReplayBuffer):
+            return self._batch_to_device(
+                replay.sample(self.config.batch_size, include_bc_target=True)
+            )
+        return self._batch_to_device(replay.sample(self.config.batch_size))
+
     def configure_action_projection(self, postprocessor) -> None:
         """Differentiate through the same physical norm bounds as the robot.
 
@@ -342,9 +351,12 @@ class Stage2Learner:
         if len(replay) < self.config.batch_size:
             raise ValueError("not enough replay for Actor/Critic initialization")
         for step in range(self.config.bc_init_steps):
-            batch = self._batch_to_device(replay.sample(self.config.batch_size))
+            batch = self._sample_batch(replay)
             mu, _ = self.policy.actor(batch["state_vec"], batch["ref_chunk_flat"])
-            loss = (mu - batch["ref_chunk_flat"]).square().sum(-1).mean()
+            bc_target = batch.get("bc_target_flat", batch["ref_chunk_flat"])
+            loss = self.config.chunk_dim * _bc_loss(
+                mu, bc_target, batch.get("actual_steps"), chunk_length=self.config.chunk_length
+            )
             self.actor_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config.grad_clip_norm,
@@ -360,7 +372,7 @@ class Stage2Learner:
         self.initialized = True
 
     def update_once(self, replay: ReplayBuffer, *, update_actor: bool = True) -> LearnerStepMetrics:
-        batch = self._batch_to_device(replay.sample(self.config.batch_size))
+        batch = self._sample_batch(replay)
         self.critic.train()
         self.policy.actor.train()
 
@@ -416,7 +428,8 @@ class Stage2Learner:
             try:
                 mu, _ = self.policy.actor(x, batch["ref_chunk_flat"], training=True)
                 actor_q = self.critic.min_q(x, self.action_projection(mu))
-                bc = (mu - batch["ref_chunk_flat"]).square().sum(-1).mean()
+                bc_target = batch.get("bc_target_flat", batch["ref_chunk_flat"])
+                bc = _bc_loss(mu, bc_target, batch.get("actual_steps"), chunk_length=self.config.chunk_length)
                 a_loss = -actor_q.mean() + self.config.beta * bc
                 diagnostics.update(q_actor_mean=actor_q.detach().mean().item(),
                                    q_actor_max=actor_q.detach().max().item(),
@@ -503,6 +516,7 @@ class ChunkExecution:
     ref_chunk: Tensor | None = None
     next_state_vec: Tensor | None = None
     next_ref_chunk: Tensor | None = None
+    bc_target_chunk: Tensor | None = None
 
 
 class Stage2Environment(Protocol):
@@ -519,6 +533,8 @@ class OnlineStage2Metrics:
     chunks: int = 0
     episodes: int = 0
     successes: int = 0
+    human_chunks: int = 0
+    human_env_steps: int = 0
     critic_updates: int = 0
     actor_updates: int = 0
     last_learner: LearnerStepMetrics | None = None
@@ -529,6 +545,19 @@ def _unbatch_cpu(tensor: Tensor) -> Tensor:
     if tensor.ndim > 0 and tensor.shape[0] == 1:
         tensor = tensor.squeeze(0)
     return tensor
+
+
+def _bc_loss(mean: Tensor, target: Tensor, actual_steps: Tensor | None, *, chunk_length: int) -> Tensor:
+    """Mean squared error over executed steps, including short terminal chunks."""
+    dimensions = mean.shape[-1] // chunk_length
+    error = (mean - target).reshape(-1, chunk_length, dimensions).square()
+    if actual_steps is None:
+        return error.mean()
+    mask = (
+        torch.arange(chunk_length, device=mean.device)[None, :]
+        < actual_steps.reshape(-1, 1)
+    ).unsqueeze(-1)
+    return (error * mask).sum() / (mask.sum().clamp_min(1) * dimensions)
 
 
 def run_online_stage2(
@@ -644,12 +673,17 @@ def run_online_stage2(
             intervention=torch.tensor(float(execution.intervention)),
             actual_steps=torch.tensor(execution.actual_steps, dtype=torch.int64),
             source=torch.tensor(
+                TRANSITION_SOURCE_HUMAN_OVERRIDE if execution.intervention else
                 TRANSITION_SOURCE_WARMUP_VLA if warmup else TRANSITION_SOURCE_RL_AUTONOMOUS
             ),
             episode_id=torch.tensor(episode_id),
             is_critical=torch.tensor(1.0),
             terminated=torch.tensor(float(execution.terminated)),
             truncated=torch.tensor(float(execution.truncated)),
+            bc_target_chunk=(
+                _unbatch_cpu(execution.bc_target_chunk)
+                if execution.bc_target_chunk is not None else None
+            ),
         )
         replay.add(transition)
         metrics.env_steps += execution.actual_steps
@@ -658,6 +692,9 @@ def run_online_stage2(
         else:
             metrics.online_env_steps += execution.actual_steps
         metrics.chunks += 1
+        if execution.intervention:
+            metrics.human_chunks += 1
+            metrics.human_env_steps += execution.actual_steps
 
         # Confirmed timing: no updates for a chunk that started in warmup.
         # Confirmed UTD: G updates per collected chunk, never G*C.

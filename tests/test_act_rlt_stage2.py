@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import time
+from collections import deque
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ from act_rlt.act_encoder import (
     predict_act_chunk_with_encoder_hidden_and_pos,
 )
 from act_rlt.stage2_networks import ChunkInputFusion, Stage2ChunkActor, Stage2TwinCritic
+from act_rlt.human_input import HumanInputMonitor
 from act_rlt.stage2 import (
     ACTStage2Config,
     ChunkExecution,
@@ -26,11 +29,15 @@ from act_rlt.stage2 import (
 from act_rlt.train_stage2 import (
     FrankaInsertionStage2Env,
     RESET_RETREAT_Y_M,
+    RESET_RETREAT_Z_M,
     RESET_XY_MARGIN_M,
+    STARTUP_WORKSPACE_HALF_RANGE_M,
     build_parser,
+    capture_centered_workspace,
     _format_terminal_metrics,
     load_checkpoint,
     retreat_pose_along_positive_y,
+    sample_z_insertion_workspace_pose,
     sample_workspace_pose,
     save_checkpoint,
     validate_args,
@@ -62,6 +69,31 @@ def _config(**overrides) -> ACTStage2Config:
     }
     values.update(overrides)
     return ACTStage2Config(**values)
+
+
+def test_stage2_uses_only_checkpoint_camera_at_reset_and_chunk_boundary():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+
+    observation = {f"joint_{index}": 0.0 for index in range(7)}
+    observation["wrist"] = np.zeros((720, 1280, 3), dtype=np.uint8)
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.camera_shapes = {"wrist": (720, 1280, 3)}
+    env.robot = SimpleNamespace(get_observation=lambda: observation)
+    env.pre = lambda frame: frame
+
+    reset_frame = env._processed_observation()
+    assert set(reset_frame) == {"observation.state", "observation.images.wrist"}
+    assert reset_frame["observation.images.wrist"].shape == (3, 720, 1280)
+
+    runtime = object.__new__(FixedChunkRuntime)
+    runtime.env = env
+    runtime.observation_ready = threading.Condition()
+    runtime.observation = observation
+    runtime.observation_started = 1.0
+    runtime.stop = threading.Event()
+    boundary_frame = runtime._boundary_batch(0.0)
+    assert set(boundary_frame) == set(reset_frame)
+    torch.testing.assert_close(boundary_frame["observation.images.wrist"], reset_frame["observation.images.wrist"])
 
 
 class _FakeEncoder(nn.Module):
@@ -392,6 +424,36 @@ def test_warmup_has_no_updates_and_utd_is_per_chunk() -> None:
     assert torch.equal(env.executed[1], torch.full((1, 4, 6), 0.1))
 
 
+def test_human_chunk_uses_executed_bc_target_with_act_reference_preserved():
+    config = _config(warmup_steps=4, total_env_steps=4)
+    policy = _FakeStage2Policy(config)
+    learner = Stage2Learner(policy, config)
+    replay = ReplayBuffer(config.replay_capacity)
+    env = _FakeEnvironment(config)
+    ordinary_execute = env.execute_chunk
+
+    def human_first_chunk(action_chunk, full_reference):
+        result = ordinary_execute(action_chunk, full_reference)
+        if len(env.executed) == 1:
+            result.exec_chunk = torch.full((4, 6), .2)
+            result.bc_target_chunk = result.exec_chunk.clone()
+            result.intervention = True
+        return result
+
+    env.execute_chunk = human_first_chunk
+    metrics = run_online_stage2(policy, learner, env, replay, config)
+    assert metrics.human_chunks == 1
+    assert metrics.human_env_steps == 4
+    human, policy_transition = replay.buffer
+    assert int(human.source) == 3
+    assert float(human.intervention) == 1
+    torch.testing.assert_close(human.ref_chunk, torch.full((4, 6), .1))
+    torch.testing.assert_close(human.bc_target_chunk, torch.full((4, 6), .2))
+    assert policy_transition.bc_target_chunk is None
+    sampled = replay.sample(2, include_bc_target=True)
+    assert sorted(sampled["bc_target_flat"].mean(dim=1).tolist()) == pytest.approx([.1, .2])
+
+
 def test_zero_step_workspace_refusal_resets_without_fake_replay_transition() -> None:
     config = _config(warmup_steps=4, total_env_steps=4)
     policy = _FakeStage2Policy(config)
@@ -546,6 +608,159 @@ def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner()
     assert all(not thread.is_alive() for thread in workers)
 
 
+def test_human_takeover_waits_for_complete_policy_chunk_and_returns_at_boundary():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+
+    config = _config()
+    env = _threaded_env(config, period=.01)
+    env.enable_human_intervention = True
+    env.teleop_speed_m_s = .01
+    env._control_mode = "policy"
+    commands = []
+    original_send = env.robot.send_action
+
+    def send(command):
+        commands.append(command.copy())
+        original_send(command)
+        if len(commands) == 5:
+            env._monitor.pending = True
+
+    env.robot.send_action = send
+
+    class Monitor:
+        def __init__(self):
+            self.switches = 0
+            # A request already waiting before the first policy action must
+            # still let that entire four-step chunk complete.
+            self.pending = True
+
+        def poll(self):
+            return None
+
+        def direction(self):
+            return np.array([1., 0., 0.])
+
+        def consume_toggle(self, *, human):
+            if self.pending:
+                self.pending = False
+                self.switches += 1
+                return True
+            return False
+
+    env._monitor = Monitor()
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        runtime = FixedChunkRuntime(
+            env, _FakeStage2Policy(config),
+            {"observation.state": torch.zeros(1, 7)}, warmup=True, step_budget=12,
+        )
+        try:
+            results = [runtime.next_result() for _ in range(3)]
+        finally:
+            runtime.close()
+
+    assert [result.actual_steps for result in results] == [4, 4, 4]
+    assert [result.intervention for result in results] == [False, True, False]
+    assert [result.info.get("handoff_to") for result in results] == ["human", "policy", None]
+    assert env.robot.stops == 3
+    assert len(commands) == 12
+    assert all(command["dx"] == pytest.approx(.0001) for command in commands[4:8])
+    assert results[1].bc_target_chunk is not None
+    torch.testing.assert_close(results[1].bc_target_chunk, results[1].exec_chunk)
+    torch.testing.assert_close(results[0].next_state_vec, results[1].state_vec)
+    torch.testing.assert_close(results[1].next_state_vec, results[2].state_vec)
+
+
+def test_pynput_repeat_does_not_toggle_or_release_human_motion():
+    monitor = object.__new__(HumanInputMonitor)
+    monitor.backend = "pynput"
+    monitor._lock = threading.Lock()
+    monitor._stopping = threading.Event()
+    monitor._pressed = set()
+    monitor._pending_release = {}
+    monitor._toggle_down = False
+    monitor._toggle_pending = False
+    monitor._toggle_release_deadline = None
+    monitor._outcomes = deque()
+    monitor._failure = None
+    monitor._listener = None
+    with patch("act_rlt.human_input.time.monotonic") as clock:
+        clock.return_value = 0.0
+        monitor._event("KEY_SPACE", True)
+        assert monitor.consume_toggle(human=False)
+        clock.return_value = .01
+        monitor._event("KEY_SPACE", False)
+        monitor._event("KEY_SPACE", True)
+        assert not monitor.consume_toggle(human=True)
+        clock.return_value = .02
+        monitor._event("KEY_SPACE", False)
+        clock.return_value = .20
+        monitor._event("KEY_SPACE", True)
+        assert monitor.consume_toggle(human=True)
+
+
+def test_stage2_human_keys_reserve_s_f_for_outcomes_and_x_for_negative_x():
+    monitor = object.__new__(HumanInputMonitor)
+    monitor.backend = "evdev"
+    monitor._lock = threading.Lock()
+    monitor._stopping = threading.Event()
+    monitor._pressed = set()
+    monitor._pending_release = {}
+    monitor._toggle_down = False
+    monitor._toggle_pending = False
+    monitor._toggle_release_deadline = None
+    monitor._outcomes = deque()
+    monitor._failure = None
+    monitor._listener = None
+    monitor._event("KEY_X", True)
+    assert monitor.direction().tolist() == [-1.0, 0.0, 0.0]
+    monitor._event("KEY_S", True)
+    monitor._event("KEY_F", True)
+    assert monitor.direction().tolist() == [-1.0, 0.0, 0.0]
+    assert monitor.poll() == "s"
+    assert monitor.poll() == "f"
+
+
+def test_human_key_release_stops_servo_without_leaving_human_mode():
+    from act_rlt.stage2_runtime import FixedChunkRuntime
+
+    config = _config()
+    env = _threaded_env(config, period=.01)
+    env.enable_human_intervention = True
+    env.teleop_speed_m_s = .01
+    env._control_mode = "human"
+
+    class Monitor:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            return None
+
+        def direction(self):
+            self.calls += 1
+            return np.array([1., 0., 0.]) if self.calls <= 2 else np.zeros(3)
+
+        def consume_toggle(self, *, human):
+            return False
+
+    env._monitor = Monitor()
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        runtime = FixedChunkRuntime(
+            env, _FakeStage2Policy(config),
+            {"observation.state": torch.zeros(1, 7)}, warmup=True, step_budget=4,
+        )
+        try:
+            result = runtime.next_result()
+        finally:
+            runtime.close()
+    assert result.actual_steps == 4
+    assert result.intervention
+    assert result.info["human_idle_steps"] == 2
+    assert len(env.robot.sent_at) == 2
+    assert env.robot.stops == 2  # key release, then phase boundary
+    assert env._control_mode == "human"
+
+
 def test_default_online_loop_uses_persistent_collection_and_respects_phase_budget():
     config = _config(warmup_steps=4, total_env_steps=4)
     env = _threaded_env(config)
@@ -625,17 +840,85 @@ def test_threaded_outcome_stops_before_prompt_or_retreat(outcome):
             )
         finally:
             env.close()
-    assert result.actual_steps == 1
+    assert result.actual_steps == (4 if outcome in {"s", "f"} else 1)
     assert result.done
     assert result.reward_seq.sum().item() == int(outcome in {"s", "timeout"})
+    if outcome == "s":
+        assert result.reward_seq.tolist() == [0.0, 0.0, 0.0, 1.0]
     assert result.stop_requested == (outcome == "q")
     assert calls == ([] if outcome == "q" else ["prompt", "retreat"] if outcome == "timeout" else ["retreat"])
     # Warmup executes the ACT reference exactly, so all three endpoint
     # comparisons must be zero after one completed episode.
-    assert result.info["episode_tcp_target_comparison_steps"] == 1
+    assert result.info["episode_tcp_target_comparison_steps"] == result.actual_steps
     assert result.info["episode_exploration_vs_actor_mean_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
     assert result.info["episode_actor_mean_vs_reference_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
     assert result.info["episode_sampled_vs_reference_tcp_target_translation_norm_mm"] == pytest.approx(0.0)
+
+
+def test_single_thread_outcome_waits_for_full_chunk():
+    config = _config()
+    env = _threaded_env(config, period=0.0)
+    env._monitor.poll = lambda: "s"
+    env._processed_observation = lambda: {"observation.state": torch.zeros(1, 7)}
+    env._retreat_after_outcome = lambda: None
+    result = env.execute_chunk(
+        torch.zeros(1, config.chunk_length, config.action_dim),
+        torch.zeros(1, 16, config.action_dim + 1),
+    )
+    assert result.actual_steps == config.chunk_length
+    assert len(env.robot.sent_at) == config.chunk_length
+    assert result.done and result.terminated
+    assert result.reward_seq.tolist() == [0.0, 0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("outcome", ["s", "f"])
+def test_human_mode_outcome_ends_episode_before_time_limit(outcome):
+    config = _config()
+    env = _threaded_env(config)
+    env.enable_human_intervention = True
+    env.teleop_speed_m_s = .01
+    env._control_mode = "human"
+    env.episode_time_s = 100.0
+    env._monitor.poll = lambda: outcome
+    env._monitor.direction = lambda: np.zeros(3)
+    env._monitor.consume_toggle = lambda *, human: False
+    env._retreat_after_outcome = lambda: None
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        try:
+            result = env.execute_policy_chunk(
+                _FakeStage2Policy(config), {"observation.state": torch.zeros(1, 7)},
+                warmup=True, remaining_steps=8,
+            )
+        finally:
+            env.close()
+    assert result.actual_steps == 4
+    assert result.done and result.terminated and not result.truncated
+    assert result.reward_seq.sum().item() == int(outcome == "s")
+    assert not result.info.get("timed_out")
+
+
+def test_outcome_during_final_control_period_ends_before_timeout():
+    config = _config()
+    env = _threaded_env(config, period=.01)
+    env.enable_human_intervention = True
+    env._control_mode = "policy"
+    env.episode_time_s = 100.0
+    polls = iter([None, None, None, None, "s"])
+    env._monitor.poll = lambda: next(polls)
+    env._monitor.consume_toggle = lambda *, human: False
+    env._retreat_after_outcome = lambda: None
+    with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
+        try:
+            result = env.execute_policy_chunk(
+                _FakeStage2Policy(config), {"observation.state": torch.zeros(1, 7)},
+                warmup=True, remaining_steps=8,
+            )
+        finally:
+            env.close()
+    assert result.actual_steps == 4
+    assert result.done and result.terminated
+    assert result.reward_seq.tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert not result.info.get("timed_out")
 
 
 def test_late_boundary_prediction_is_logged_without_repeating_or_bursting_actions():
@@ -736,6 +1019,61 @@ def test_automatic_reset_retreat_and_workspace_sample() -> None:
     assert np.allclose(sampled[3:], measured[3:])
 
 
+def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch) -> None:
+    p0 = np.array([0.65, -0.10, 0.15, 0.1, 0.2, 0.3])
+    lower = np.array([0.62, -0.13, 0.13])
+    upper = np.array([0.68, -0.07, 0.18])
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.z_insertion_mode = True
+    env._reference_pose = None
+    env._reset_orientation = None
+    env._first_reset_move = True
+    env.workspace_min = lower
+    env.workspace_max = upper
+    env.robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=lambda: p0))
+    moves = []
+    env._move_reset_pose = lambda target, *, label: moves.append((target, label))
+    answers = iter(["", "", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    env._move_to_accepted_workspace_sample()
+    assert np.array_equal(env._reference_pose, p0)
+    target, _ = moves[0]
+    assert abs(target[0] - p0[0]) <= 0.01
+    assert abs(target[1] - p0[1]) <= 0.01
+    assert p0[2] <= target[2] <= p0[2] + 0.02
+    assert np.array_equal(target[3:], p0[3:])
+
+    env._retreat_after_outcome()
+    retreat, label = moves[-1]
+    assert label == "+Z 1 cm retreat"
+    assert np.isclose(retreat[2], p0[2] + RESET_RETREAT_Z_M)
+    assert np.array_equal(retreat[[0, 1, 3, 4, 5]], p0[[0, 1, 3, 4, 5]])
+    with pytest.raises(ValueError, match="outside the safe workspace"):
+        sample_z_insertion_workspace_pose(p0, lower, np.array([0.66, -0.07, 0.16]))
+
+
+def test_workspace_center_is_sampled_when_enter_is_pressed(monkeypatch) -> None:
+    pose = np.array([0.65, -0.10, 0.15, 0.1, 0.2, 0.3])
+    pressed = False
+
+    def confirm(_prompt):
+        nonlocal pressed
+        pressed = True
+        return ""
+
+    def get_pose():
+        assert pressed
+        return pose
+
+    monkeypatch.setattr("builtins.input", confirm)
+    robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=get_pose))
+    captured, lower, upper = capture_centered_workspace(robot)
+    assert np.array_equal(captured, pose)
+    np.testing.assert_allclose(lower, pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M)
+    np.testing.assert_allclose(upper, pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M)
+
+
 def test_automatic_reset_can_use_explicit_narrow_sample_box() -> None:
     workspace_min = np.array([0.570, -0.223, 0.128])
     workspace_max = np.array([0.710, -0.060, 0.180])
@@ -767,6 +1105,43 @@ def test_stage2_parser_accepts_narrow_sample_box() -> None:
     validate_args(parser, args)
     assert args.sample_min == [0.630, -0.120, 0.130]
     assert args.sample_max == [0.670, -0.080, 0.175]
+
+
+def test_stage2_z_insertion_mode_captures_workspace_at_startup() -> None:
+    parser = build_parser()
+    args = parser.parse_args([
+        "--stage1-checkpoint", "/tmp/stage1", "--act-checkpoint", "/tmp/act",
+        "--allow-motion", "--z-insertion-mode",
+    ])
+    validate_args(parser, args)
+    assert args.z_insertion_mode
+    assert args.fps == 30.0
+    assert args.workspace_min is None and args.workspace_max is None
+
+
+@pytest.mark.parametrize(
+    ("display", "extra_args", "expected"),
+    [
+        (":1", [], "pynput"),
+        (None, [], "evdev"),
+        (":1", ["--teleop-keyboard", "/dev/input/event3"], "evdev"),
+        (":1", ["--teleop-input-backend", "evdev"], "evdev"),
+    ],
+)
+def test_stage2_keyboard_backend_auto_selection(monkeypatch, display, extra_args, expected) -> None:
+    if display is None:
+        monkeypatch.delenv("DISPLAY", raising=False)
+    else:
+        monkeypatch.setenv("DISPLAY", display)
+    parser = build_parser()
+    args = parser.parse_args([
+        "--stage1-checkpoint", "/tmp/stage1",
+        "--act-checkpoint", "/tmp/act",
+        "--dry-run",
+        *extra_args,
+    ])
+    validate_args(parser, args)
+    assert args.teleop_input_backend == expected
 
 
 def test_workspace_sample_rejects_xy_box_without_two_centimetre_margins() -> None:

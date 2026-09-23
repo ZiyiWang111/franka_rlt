@@ -11,8 +11,8 @@ import pyrealsense2 as rs
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wrist-serial", required=True)
-    parser.add_argument("--front-serial", required=True)
+    parser.add_argument("--wrist-serial")
+    parser.add_argument("--front-serial")
     parser.add_argument("--wrist-width", type=int, default=640)
     parser.add_argument("--wrist-height", type=int, default=480)
     parser.add_argument("--front-width", type=int, default=1920)
@@ -24,7 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.wrist_serial == args.front_serial:
+    if not args.wrist_serial and not args.front_serial:
+        print("ERROR: provide at least one camera serial", file=sys.stderr)
+        return 2
+    if args.wrist_serial and args.front_serial and args.wrist_serial == args.front_serial:
         print("ERROR: wrist and front camera serials must be different", file=sys.stderr)
         return 2
     dimensions = (
@@ -43,10 +46,8 @@ def main() -> int:
     }
     missing = [
         f"{name}={serial}"
-        for name, serial in (
-            ("wrist", args.wrist_serial),
-            ("front", args.front_serial),
-        )
+        for name, serial in (("wrist", args.wrist_serial), ("front", args.front_serial))
+        if serial
         if serial not in detected
     ]
     if missing:
@@ -57,9 +58,13 @@ def main() -> int:
         print("Detected serials: " + (", ".join(sorted(detected)) or "none"), file=sys.stderr)
         return 1
 
-    streams = (
-        ("wrist", args.wrist_serial, args.wrist_width, args.wrist_height),
-        ("front", args.front_serial, args.front_width, args.front_height),
+    streams = tuple(
+        (name, serial, width, height)
+        for name, serial, width, height in (
+            ("wrist", args.wrist_serial, args.wrist_width, args.wrist_height),
+            ("front", args.front_serial, args.front_width, args.front_height),
+        )
+        if serial
     )
     running: list[tuple[str, rs.pipeline]] = []
     try:

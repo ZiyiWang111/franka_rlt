@@ -3,7 +3,7 @@
 
 The operator teaches one immutable TCP reference pose.  Each saved episode
 starts at a uniformly sampled pose, moves to the reference pose, and then moves
-along the robot-base -Y axis.  Repositioning is deliberately performed outside
+along the robot-base -Y axis (or -Z with ``--z-insertion-mode``). Repositioning is deliberately performed outside
 the episode, so the dataset contains only the task trajectory.
 """
 
@@ -47,11 +47,14 @@ from evo_rlt.adapters.lerobot.record.loop import (
 )
 from act_rlt.data_collection.sampling import (
     DEFAULT_INSERT_MINUS_Y_M,
+    DEFAULT_Z_ROTATION_DEG,
     DEFAULT_X_HALF_RANGE_M,
     DEFAULT_Y_RANGE_M,
     DEFAULT_Z_HALF_RANGE_M,
     insertion_pose,
+    insertion_pose_minus_z,
     sample_pose,
+    sample_z_insertion_pose,
 )
 
 
@@ -65,22 +68,38 @@ COMMAND_ACTION_NAMES = [
     "target_rz",
     "speed_m_s",
 ]
+SUPPORTED_FPS = (15, 30)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, help="LeRobot dataset repo/name")
     parser.add_argument("--root", type=Path, required=True, help="Local dataset directory")
-    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--fps",
+        type=int,
+        choices=SUPPORTED_FPS,
+        default=15,
+        help="Recording frequency in Hz (default: 15).",
+    )
     parser.add_argument("--episodes", type=int, default=10, help="Number of newly saved episodes")
     parser.add_argument("--episode-time", type=float, default=60.0, help="Per-attempt timeout")
     parser.add_argument(
         "--task",
-        default="Move from a sampled workspace pose to the reference point and advance along -Y.",
+        default=None,
     )
     parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--wrist-camera", default="349622072679")
     parser.add_argument("--front-camera", default="233522075778")
+    cameras = parser.add_mutually_exclusive_group()
+    cameras.add_argument(
+        "--wrist_only", "--wrist-only", dest="wrist_only", action="store_true",
+        help="Record only wrist at 1280x720; do not open the front camera.",
+    )
+    cameras.add_argument(
+        "--front_only", "--front-only", dest="front_only", action="store_true",
+        help="Record only front at 640x480; do not open the wrist camera.",
+    )
     parser.add_argument("--move-speed", type=float, default=0.02, help="TCP speed in m/s")
     parser.add_argument(
         "--insertion-speed",
@@ -103,7 +122,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--x-half-range", type=float, default=DEFAULT_X_HALF_RANGE_M)
     parser.add_argument("--y-range", type=float, default=DEFAULT_Y_RANGE_M)
     parser.add_argument("--z-half-range", type=float, default=DEFAULT_Z_HALF_RANGE_M)
+    parser.add_argument(
+        "--rotation",
+        action="store_true",
+        help="Randomly rotate each sampled start pose around base Z by up to +/-5 degrees.",
+    )
     parser.add_argument("--insert-minus-y", type=float, default=DEFAULT_INSERT_MINUS_Y_M)
+    parser.add_argument(
+        "--insert-minus-z",
+        type=float,
+        default=None,
+        help="Recorded -Z advance in --z-insertion-mode (default: --insert-minus-y value).",
+    )
+    parser.add_argument(
+        "--z-insertion-mode",
+        action="store_true",
+        help="Use -Z insertion and X/Y symmetric, Z-upward sample space.",
+    )
     parser.add_argument("--abort-key", default="x", help="Single-key active-episode abort")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic sampler seed")
     parser.add_argument("--resume", action="store_true")
@@ -125,6 +160,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "z-half-range": args.z_half_range,
         "insert-minus-y": args.insert_minus_y,
     }
+    if args.insert_minus_z is not None:
+        positive["insert-minus-z"] = args.insert_minus_z
     invalid = [
         name
         for name, value in positive.items()
@@ -132,7 +169,7 @@ def validate_args(args: argparse.Namespace) -> None:
     ]
     if invalid:
         raise ValueError(f"these arguments must be positive: {', '.join(invalid)}")
-    if args.wrist_camera == args.front_camera:
+    if not (args.wrist_only or args.front_only) and args.wrist_camera == args.front_camera:
         raise ValueError("wrist and front camera serials must be different")
     if len(args.abort_key) != 1:
         raise ValueError("abort-key must be exactly one character")
@@ -566,9 +603,13 @@ def build_dataset_and_robot(args: argparse.Namespace):
     config = FrankaRobotConfig(
         robot_ip=args.robot_ip,
         camera_serial=args.wrist_camera,
+        camera_width=1280 if args.wrist_only else 640,
+        camera_height=720 if args.wrist_only else 480,
+        enable_wrist_camera=not args.front_only,
         front_camera_serial=args.front_camera,
         front_camera_width=640,
         front_camera_height=480,
+        enable_front_camera=not args.wrist_only,
         include_gripper_action=True,
     )
     robot = FrankaRobot(config)
@@ -640,6 +681,12 @@ def build_dataset_and_robot(args: argparse.Namespace):
 def main() -> int:
     args = build_parser().parse_args()
     validate_args(args)
+    if args.task is None:
+        args.task = (
+            "Move from a sampled workspace pose to the reference point and advance along -Z."
+            if args.z_insertion_mode else
+            "Move from a sampled workspace pose to the reference point and advance along -Y."
+        )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     rng = np.random.default_rng(args.seed)
     dataset, robot, observation_processor, action_names = build_dataset_and_robot(args)
@@ -649,15 +696,32 @@ def main() -> int:
         robot.get_observation()  # Warm the gripper cache before recording.
 
         reference = teach_reference(robot)
-        final_pose = insertion_pose(reference, args.insert_minus_y)
-        print(f"REFERENCE p0: {format_pose(reference)}")
-        print(f"FINAL (-Y {args.insert_minus_y * 1000:.1f} mm): {format_pose(final_pose)}")
-        print(
-            "Sample bounds (robot base frame): "
-            f"x=x0+/-{args.x_half_range:.4f} m, "
-            f"y=[y0, y0+{args.y_range:.4f} m], "
-            f"z=z0+/-{args.z_half_range:.4f} m. Orientation is fixed."
+        insertion_distance = (
+            args.insert_minus_z if args.z_insertion_mode and args.insert_minus_z is not None
+            else args.insert_minus_y
         )
+        final_pose = (
+            insertion_pose_minus_z(reference, insertion_distance)
+            if args.z_insertion_mode else insertion_pose(reference, args.insert_minus_y)
+        )
+        insertion_axis = "-Z" if args.z_insertion_mode else "-Y"
+        print(f"REFERENCE p0: {format_pose(reference)}")
+        print(f"FINAL ({insertion_axis} {insertion_distance * 1000:.1f} mm): {format_pose(final_pose)}")
+        if args.z_insertion_mode:
+            print(
+                "Sample bounds (robot base frame): "
+                f"x=x0+/-{args.x_half_range:.4f} m, y=y0+/-{args.x_half_range:.4f} m, "
+                f"z=[z0, z0+{args.y_range:.4f} m]. "
+                f"Orientation is {'base-Z yaw +/-5 deg' if args.rotation else 'fixed'}."
+            )
+        else:
+            print(
+                "Sample bounds (robot base frame): "
+                f"x=x0+/-{args.x_half_range:.4f} m, "
+                f"y=[y0, y0+{args.y_range:.4f} m], "
+                f"z=z0+/-{args.z_half_range:.4f} m. "
+                f"Orientation is {'base-Z yaw +/-5 deg' if args.rotation else 'fixed'}."
+            )
 
         recorder = EpisodeRecorder(
             robot=robot,
@@ -673,12 +737,15 @@ def main() -> int:
         encoding_manager_used = True
         with VideoEncodingManager(dataset):
             while saved < args.episodes:
-                current_sample = sample_pose(
-                    reference,
-                    rng,
-                    x_half_range=args.x_half_range,
-                    y_range=args.y_range,
-                    z_half_range=args.z_half_range,
+                current_sample = (
+                    sample_z_insertion_pose(
+                        reference, rng, x_half_range=args.x_half_range, z_range=args.y_range,
+                        z_rotation_degrees=DEFAULT_Z_ROTATION_DEG if args.rotation else 0.0,
+                    ) if args.z_insertion_mode else sample_pose(
+                        reference, rng, x_half_range=args.x_half_range,
+                        y_range=args.y_range, z_half_range=args.z_half_range,
+                        z_rotation_degrees=DEFAULT_Z_ROTATION_DEG if args.rotation else 0.0,
+                    )
                 )
                 print(f"CURRENT SAMPLE: {format_pose(current_sample)}")
 
@@ -741,7 +808,7 @@ def main() -> int:
                             recorder,
                             final_pose,
                             speed=args.insertion_speed,
-                            label="reference -> final -Y",
+                            label=f"reference -> final {insertion_axis}",
                         )
                         recorder.clear_command()
                         frame_count = recorder.finish()
@@ -785,13 +852,14 @@ def main() -> int:
                 ):
                     stop_requested = True
 
-                # The final recorded pose is p0 - [0, 1 cm, 0]. Returning to p0
-                # is therefore the requested +Y retreat, and is not recorded.
+                # The final recorded pose is one centimetre along the negative
+                # insertion axis. Returning to p0 is the matching +axis retreat
+                # and is not recorded.
                 if not nonrecorded_arm_move(
                     robot,
                     reference,
                     speed=args.move_speed,
-                    label="REFERENCE p0 (retreat)",
+                    label=f"REFERENCE p0 (retreat +{'Z' if args.z_insertion_mode else 'Y'})",
                 ):
                     print("Retreat failed; automatic collection is paused.")
                     if not stop_requested and not wait_for_resume(

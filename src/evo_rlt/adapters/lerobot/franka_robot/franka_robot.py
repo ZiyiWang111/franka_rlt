@@ -67,27 +67,39 @@ class FrankaRobot(Robot):
         # LeRobot record backend expects a `cameras` attribute (e.g. for image
         # writer thread count). The wrist RealSense is managed internally.
         self.cameras = {}
-        self.camera = rs.pipeline()
-        self.camera_cfg = rs.config()
-        self.camera_cfg.enable_device(config.camera_serial)
-        self.camera_cfg.enable_stream(
-            rs.stream.color, 640, 480, rs.format.rgb8, 30
-        )
+        self.camera = None
+        self.camera_cfg = None
+        if config.enable_wrist_camera:
+            self.camera = rs.pipeline()
+            self.camera_cfg = rs.config()
+            self.camera_cfg.enable_device(config.camera_serial)
+            self.camera_cfg.enable_stream(
+                rs.stream.color, config.camera_width, config.camera_height, rs.format.rgb8, 30
+            )
         # The front stream resolution is configurable. Existing users keep the
         # 1920x1080 default; ACT-RLT requests native 640x480 capture.
-        self.front_camera = rs.pipeline()
-        self.front_camera_cfg = rs.config()
-        self.front_camera_cfg.enable_device(config.front_camera_serial)
-        self.front_camera_cfg.enable_stream(
-            rs.stream.color,
-            config.front_camera_width,
-            config.front_camera_height,
-            rs.format.rgb8,
-            30,
-        )
+        self.front_camera = None
+        self.front_camera_cfg = None
+        if config.enable_front_camera:
+            self.front_camera = rs.pipeline()
+            self.front_camera_cfg = rs.config()
+            self.front_camera_cfg.enable_device(config.front_camera_serial)
+            self.front_camera_cfg.enable_stream(
+                rs.stream.color,
+                config.front_camera_width,
+                config.front_camera_height,
+                rs.format.rgb8,
+                30,
+            )
         # Collection-health bookkeeping (see CAM_FRAME_TIMEOUT_MS / .camera_frame_ages)
-        self._cam_streams = {"wrist": self.camera, "front": self.front_camera}
-        self._cam_last_frame_t = {"wrist": None, "front": None}
+        self._cam_streams = {
+            name: pipeline
+            for name, pipeline in (("wrist", self.camera), ("front", self.front_camera))
+            if pipeline is not None
+        }
+        if not self._cam_streams:
+            raise ValueError("at least one camera must be enabled")
+        self._cam_last_frame_t = {name: None for name in self._cam_streams}
         self._keepalive_thread = None
         self._keepalive_stop = threading.Event()
 
@@ -102,8 +114,14 @@ class FrankaRobot(Robot):
             **{f"joint_vel_{i}": float for i in range(7)},
             "gripper_width": float,
             "gripper_grasped": float,
-            "wrist": (480, 640, 3),
-            "front": (480, 640, 3),
+            **(
+                {"wrist": (self.config.camera_height, self.config.camera_width, 3)}
+                if self.config.enable_wrist_camera
+                else {}
+            ),
+            **(
+                {"front": (480, 640, 3)} if self.config.enable_front_camera else {}
+            ),
         }
     
 
@@ -131,17 +149,17 @@ class FrankaRobot(Robot):
     def connect(self, calibrate=True):
         self.robot.connect()
         try:
-            self.camera.start(self.camera_cfg)
-            self.front_camera.start(self.front_camera_cfg)
+            for name, pipeline in self._cam_streams.items():
+                pipeline.start(self.camera_cfg if name == "wrist" else self.front_camera_cfg)
             # Warm both pipelines; a camera that cannot deliver its first frames is
             # a startup failure (raise), not a silent mid-take surprise.
             for _ in range(CAM_WARMUP_FRAMES):
-                self._read_camera_frame("wrist", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
-                self._read_camera_frame("front", timeout_ms=CAM_WARMUP_TIMEOUT_MS)
+                for name in self._cam_streams:
+                    self._read_camera_frame(name, timeout_ms=CAM_WARMUP_TIMEOUT_MS)
         except BaseException:
             # The control connection was already acquired. Release it even
             # though `_connected` is not set until all camera warm-up succeeds.
-            for pipeline in (self.camera, self.front_camera):
+            for pipeline in self._cam_streams.values():
                 try:
                     pipeline.stop()
                 except Exception:
@@ -165,7 +183,7 @@ class FrankaRobot(Robot):
                     self.robot.stop_gripper()
         except Exception:
             logging.exception("failed to stop asynchronous gripper motion during disconnect")
-        for pipeline in (self.camera, self.front_camera):
+        for pipeline in self._cam_streams.values():
             try:
                 pipeline.stop()
             except Exception:
@@ -236,21 +254,7 @@ class FrankaRobot(Robot):
             gripper_width = 0.0
             gripper_grasped = 0.0
 
-        frames = self._read_camera_frame("wrist")
-        wrist = np.asanyarray(frames.get_color_frame().get_data())
-
-        front_frames = self._read_camera_frame("front")
-        front_full = np.asanyarray(front_frames.get_color_frame().get_data())
-        if front_full.shape[:2] == (480, 640):
-            # ACT-RLT uses this path: the sensor already produced the dataset
-            # shape, so preserve the pixels without resize or crop.
-            front = front_full
-        else:
-            # Backwards-compatible path for the existing 1920x1080 stream:
-            # preserve the full view while resizing it to the 4:3 tensor.
-            front = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
-
-        return {
+        observation = {
             **{f"joint_{i}": float(q[i]) for i in range(7)},
             "ee_x": float(pose[0]),
             "ee_y": float(pose[1]),
@@ -261,9 +265,18 @@ class FrankaRobot(Robot):
             **{f"joint_vel_{i}": float(dq[i]) for i in range(7)},
             "gripper_width": gripper_width,
             "gripper_grasped": gripper_grasped,
-            "wrist": wrist,
-            "front": front,
         }
+        if self.config.enable_wrist_camera:
+            frames = self._read_camera_frame("wrist")
+            observation["wrist"] = np.asanyarray(frames.get_color_frame().get_data())
+        if self.config.enable_front_camera:
+            front_frames = self._read_camera_frame("front")
+            front_full = np.asanyarray(front_frames.get_color_frame().get_data())
+            if front_full.shape[:2] == (480, 640):
+                observation["front"] = front_full
+            else:
+                observation["front"] = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
+        return observation
 
     # -- collection health (camera + control-server liveness) ---------------
     def _read_camera_frame(self, camera: str, timeout_ms: int = CAM_FRAME_TIMEOUT_MS):
@@ -446,17 +459,22 @@ class FrankaRobot(Robot):
         """Re-anchor the integrated TCP target to the next measured pose."""
         self._cmd_pose = None
 
-    def send_action(self, action):
+    def send_action(self, action, *, position_residual_xyz=None):
         measured = np.asarray(self.robot.get_tool_pose(), dtype=float)
 
+        if position_residual_xyz is not None:
+            # ACT inference supplies a bounded, unexecuted translation residual.
+            # Rotation remains a per-step delta from the measured pose.
+            translation = np.asarray(position_residual_xyz, dtype=float)
+            if translation.shape != (3,) or not np.isfinite(translation).all():
+                raise ValueError("position_residual_xyz must be a finite 3D vector")
+            self._cmd_pose = measured.copy()
+        else:
+            translation = np.asarray([action["dx"], action["dy"], action["dz"]], dtype=float)
         if self._cmd_pose is None:
             self._cmd_pose = measured.copy()
 
-        self._cmd_pose[:3] += [
-            action["dx"],
-            action["dy"],
-            action["dz"],
-        ]
+        self._cmd_pose[:3] += translation
 
         delta_rot = Rotation.from_rotvec([
             action["drx"],

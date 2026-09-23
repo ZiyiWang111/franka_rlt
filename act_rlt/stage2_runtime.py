@@ -23,6 +23,8 @@ class Prediction:
     mean_commands: list[dict]
     executed: torch.Tensor
     clipped: list[bool]
+    human: bool = False
+    gripper_values: list[float] | None = None
 
 
 class FixedChunkRuntime:
@@ -33,11 +35,14 @@ class FixedChunkRuntime:
     Worker queues never repeat an action or silently discard a transition.
     """
 
-    def __init__(self, env, policy, initial_batch, *, warmup: bool, step_budget: int):
+    def __init__(self, env, policy, initial_batch, *, warmup: bool, step_budget: int,
+                 deterministic: bool = False):
         self.env = env
         self.policy = policy
         self.warmup = warmup
         self.step_budget = step_budget
+        self.deterministic = deterministic
+        self.human = getattr(env, "_control_mode", "policy") == "human"
         self.actor = None if warmup else copy.deepcopy(policy.actor).eval().requires_grad_(False)
         self.actor_lock = threading.Lock()
         self.actor_state = None
@@ -100,10 +105,16 @@ class FixedChunkRuntime:
             if not ready:
                 raise RuntimeError("Stage-2 camera did not supply a fresh boundary observation")
             observation = self.observation
-        return self.env.pre(observation_frame(observation))
+        camera_shapes = getattr(self.env, "camera_shapes", None)
+        frame = (
+            observation_frame(observation)
+            if camera_shapes is None
+            else observation_frame(observation, camera_shapes)
+        )
+        return self.env.pre(frame)
 
-    def _prediction(self, state, reference, full):
-        if self.warmup:
+    def _prediction(self, state, reference, full, *, human=False):
+        if self.warmup or human:
             actions = reference
             mean_actions = reference
         else:
@@ -111,10 +122,18 @@ class FixedChunkRuntime:
                 snapshot, self.actor_state = self.actor_state, None
             if snapshot is not None:
                 self.actor.load_state_dict(snapshot)
-            sampled, mean = self.actor.sample(
-                state, reference.flatten(start_dim=-2), training=False
+            if self.deterministic:
+                mean, _ = self.actor(
+                    state, reference.flatten(start_dim=-2), training=False
+                )
+                selected = mean
+            else:
+                selected, mean = self.actor.sample(
+                    state, reference.flatten(start_dim=-2), training=False
+                )
+            actions = selected.reshape(
+                1, self.env.config.chunk_length, self.env.config.action_dim
             )
-            actions = sampled.reshape(1, self.env.config.chunk_length, self.env.config.action_dim)
             mean_actions = mean.reshape_as(actions)
 
         def physical_actions(action_chunk):
@@ -131,6 +150,7 @@ class FixedChunkRuntime:
         reference_physical = physical_actions(reference)
         mean_physical = physical_actions(mean_actions)
         commands, reference_commands, mean_commands, executed, clipped = [], [], [], [], []
+        gripper_values = []
         for row, reference_row, mean_row in zip(
             physical, reference_physical, mean_physical, strict=True
         ):
@@ -149,19 +169,20 @@ class FixedChunkRuntime:
             reference_commands.append(reference_command)
             mean_commands.append(mean_command)
             executed.append(self.env._normalize_executed_action(actual))
+            gripper_values.append(float(reference_row[self.env.config.action_dim]))
         return Prediction(
             state, reference, commands, reference_commands, mean_commands,
-            torch.stack(executed), clipped,
+            torch.stack(executed), clipped, human, gripper_values,
         )
 
     def _inference(self):
         try:
             with torch.inference_mode():
                 state, reference, full = self.policy.encode_and_reference(self.initial_batch)
-                self.predictions.put_nowait(self._prediction(state, reference, full))
+                self.predictions.put_nowait(self._prediction(state, reference, full, human=self.human))
                 while not self.stop.is_set():
                     try:
-                        previous, execution, after, last = self.requests.get(timeout=0.05)
+                        previous, execution, after, last, next_human = self.requests.get(timeout=0.05)
                     except queue.Empty:
                         continue
                     batch = self._boundary_batch(after)
@@ -176,7 +197,9 @@ class FixedChunkRuntime:
                     execution.next_ref_chunk = reference
                     if not last:
                         # Prepare the next command before CPU replay/logging work.
-                        self.predictions.put_nowait(self._prediction(state, reference, full))
+                        self.predictions.put_nowait(
+                            self._prediction(state, reference, full, human=next_human)
+                        )
                     try:
                         self.results.put_nowait(execution)
                     except queue.Full:
@@ -196,6 +219,7 @@ class FixedChunkRuntime:
         previous_send = None
         collected = 0
         servo_stopped = False
+        human_moving = False
         try:
             while not self.stop.is_set():
                 waiting_since = time.monotonic()
@@ -204,6 +228,11 @@ class FixedChunkRuntime:
                         prediction = self.predictions.get(timeout=0.02)
                         break
                     except queue.Empty:
+                        if self.human and human_moving and not self.env._monitor.direction().any():
+                            if not self.env.robot.robot.stop_servo():
+                                raise RuntimeError("control server did not acknowledge human stop_servo")
+                            human_moving = False
+                            servo_stopped = True
                         limit = 2.0 if deadline is None else MAX_INFERENCE_S
                         if time.monotonic() - waiting_since > limit:
                             raise RuntimeError(
@@ -211,6 +240,8 @@ class FixedChunkRuntime:
                             )
                 else:
                     break
+                if prediction.human != self.human:
+                    raise RuntimeError("Stage-2 prediction belongs to an obsolete control mode")
                 if deadline is None:
                     deadline = time.monotonic()
                 rewards = torch.zeros(self.env.config.chunk_length)
@@ -221,13 +252,15 @@ class FixedChunkRuntime:
                     "execution_mode": "persistent_three_thread_fixed_chunk",
                     "deadline_misses": 0, "max_lateness_ms": 0.0,
                     "max_command_interval_ms": 0.0, "warmup": self.warmup,
+                    "control_source": "human" if self.human else "policy",
                 }
                 actual = 0
                 sampled_sum = torch.zeros(self.env.config.action_dim)
                 reference_sum = torch.zeros(self.env.config.action_dim)
                 mean_sum = torch.zeros(self.env.config.action_dim)
                 done = terminated = truncated = stop_requested = False
-                for index, command in enumerate(prediction.commands):
+                pending_outcome = None
+                for index, policy_command in enumerate(prediction.commands):
                     if self.stop.wait(max(0.0, deadline - time.monotonic())):
                         return
                     now = time.monotonic()
@@ -238,9 +271,28 @@ class FixedChunkRuntime:
                     # Do not send a burst of relative actions to catch up after
                     # an underrun. Hold the last target while waiting; never replay it.
                     deadline = max(deadline, now) + self.env.period_s
-                    self.env.robot.resync_command_pose()
+                    command = policy_command
+                    if self.human:
+                        monitor = self.env._monitor
+                        if monitor is None or not hasattr(monitor, "direction"):
+                            raise RuntimeError("human control requires the Stage-2 teleop keyboard")
+                        delta = monitor.direction() * self.env.teleop_speed_m_s * self.env.period_s
+                        command = dict(zip(
+                            ("dx", "dy", "dz", "drx", "dry", "drz"),
+                            (float(delta[0]), float(delta[1]), float(delta[2]), 0.0, 0.0, 0.0),
+                            strict=True,
+                        ))
+                        moving = bool((delta != 0).any())
+                        if not moving and human_moving:
+                            if not self.env.robot.robot.stop_servo():
+                                raise RuntimeError("control server did not acknowledge human stop_servo")
+                            servo_stopped = True
+                        human_moving = moving
                     try:
-                        self.env.robot.send_action(command)
+                        if not self.human or human_moving:
+                            self.env.robot.resync_command_pose()
+                            self.env.robot.send_action(command)
+                            servo_stopped = False
                     except RuntimeError as error:
                         if "refusing TCP target outside workspace" not in str(error):
                             raise
@@ -248,30 +300,36 @@ class FixedChunkRuntime:
                         info["workspace_error"] = str(error)
                         truncated = done = True
                         break
-                    sent = time.monotonic()
-                    if previous_send is not None:
-                        info["max_command_interval_ms"] = max(
-                            info["max_command_interval_ms"], (sent - previous_send) * 1000
-                        )
-                    previous_send = sent
-                    executed[index] = prediction.executed[index]
+                    if not self.human or human_moving:
+                        sent = time.monotonic()
+                        if previous_send is not None:
+                            info["max_command_interval_ms"] = max(
+                                info["max_command_interval_ms"], (sent - previous_send) * 1000
+                            )
+                        previous_send = sent
+                    else:
+                        info["human_idle_steps"] = info.get("human_idle_steps", 0) + 1
+                    if self.human:
+                        full_action = torch.tensor([
+                            *command.values(), prediction.gripper_values[index]
+                        ], dtype=executed.dtype)
+                        executed[index] = self.env._normalize_executed_action(full_action)
+                    else:
+                        executed[index] = prediction.executed[index]
                     sampled_sum += torch.tensor(list(command.values()))
                     reference_sum += torch.tensor(
                         list(prediction.reference_commands[index].values())
                     )
                     mean_sum += torch.tensor(list(prediction.mean_commands[index].values()))
-                    info["safety_clip_steps"] += int(prediction.clipped[index])
+                    info["safety_clip_steps"] += int(prediction.clipped[index]) if not self.human else 0
                     actual += 1
                     collected += 1
                     key = self.env._monitor.poll() if self.env._monitor is not None else None
-                    if key == "s":
-                        rewards[index] = 1.0
-                        info["success"] = terminated = done = True
-                    elif key == "f":
-                        terminated = done = True
-                    elif key == "q":
+                    if key in {"s", "f"} and pending_outcome is None:
+                        pending_outcome = key
+                    if key == "q":
                         truncated = done = stop_requested = True
-                    elif time.monotonic() - self.env._episode_start >= self.env.episode_time_s:
+                    elif pending_outcome is None and time.monotonic() - self.env._episode_start >= self.env.episode_time_s:
                         info["timed_out"] = done = True
                     if done:
                         break
@@ -281,23 +339,63 @@ class FixedChunkRuntime:
                 info["_sampled_tcp_command_sum"] = sampled_sum.tolist()
                 info["_reference_tcp_command_sum"] = reference_sum.tolist()
                 info["_mean_tcp_command_sum"] = mean_sum.tolist()
+                # In intervention mode the fourth action keeps its full control
+                # period. A Space press during that period still takes effect at
+                # this boundary, without shortening the four-step transition.
+                boundary_waited = False
+                if (getattr(self.env, "enable_human_intervention", False) or pending_outcome is not None) and not done:
+                    if self.stop.wait(max(0.0, deadline - time.monotonic())):
+                        return
+                    boundary_waited = True
+                    key = self.env._monitor.poll() if self.env._monitor is not None else None
+                    if key in {"s", "f"} and pending_outcome is None:
+                        pending_outcome = key
+                    if key == "q":
+                        truncated = done = stop_requested = True
+                    elif pending_outcome is None and time.monotonic() - self.env._episode_start >= self.env.episode_time_s:
+                        info["timed_out"] = done = True
+                if pending_outcome is not None and not done:
+                    rewards[actual - 1] = float(pending_outcome == "s")
+                    info["success"] = pending_outcome == "s"
+                    terminated = done = True
                 last = done or collected >= self.step_budget
                 info["collector_paused"] = last
-                if last:
+                monitor = self.env._monitor
+                handoff = (
+                    not done and monitor is not None and hasattr(monitor, "consume_toggle")
+                    and monitor.consume_toggle(human=self.human)
+                )
+                if last or handoff:
                     # Budget boundaries allow the final command its control
-                    # period; episode outcomes stop immediately. Capture the
-                    # final replay observation only after stopping the stream.
-                    if not done and self.stop.wait(max(0.0, deadline - time.monotonic())):
+                    # period; handoffs and s/f episode outcomes do too.
+                    if not done and not boundary_waited and self.stop.wait(max(0.0, deadline - time.monotonic())):
                         return
                     if not self.env.robot.robot.stop_servo():
                         raise RuntimeError("control server did not acknowledge Stage-2 stop_servo")
                     servo_stopped = True
+                next_human = self.human
+                if handoff:
+                    requested_at = getattr(monitor, "last_consumed_toggle_at", None)
+                    if requested_at is not None:
+                        info["handoff_request_to_stop_ms"] = (
+                            time.monotonic() - requested_at
+                        ) * 1000
+                    next_human = not self.human
+                    self.human = next_human
+                    self.env._control_mode = "human" if next_human else "policy"
+                    info["handoff_to"] = self.env._control_mode
+                    info["handoff_after_steps"] = actual
+                    deadline = None
+                    human_moving = False
+                    print(f"Stage-2 control: {self.env._control_mode.upper()}", flush=True)
                 result = ChunkExecution(
                     next_batch={}, exec_chunk=executed, reward_seq=rewards,
                     actual_steps=actual, done=done, terminated=terminated,
                     truncated=truncated, stop_requested=stop_requested, info=info,
+                    intervention=prediction.human,
+                    bc_target_chunk=executed.clone() if prediction.human else None,
                 )
-                self.requests.put_nowait((prediction, result, time.monotonic(), last))
+                self.requests.put_nowait((prediction, result, time.monotonic(), last, next_human))
                 if last:
                     break
         except BaseException as error:

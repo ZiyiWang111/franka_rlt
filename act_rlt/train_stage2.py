@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Run ACT-RLT Stage-2 online training on the local FR3.
 
-The first implementation is deliberately critical-phase only. Episode starts
-are sampled and reached automatically; the operator labels success/failure
-with the keyboard. Human action intervention is not enabled.
+Critical-phase episodes begin at automatically sampled reset poses. Optional
+keyboard takeover switches control only after a complete action chunk.
 """
 
 from __future__ import annotations
@@ -24,7 +23,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from act_rlt.infer import bounded_action, observation_frame
+from act_rlt.infer import (
+    bounded_action,
+    checkpoint_camera_shapes,
+    observation_frame,
+    robot_camera_kwargs,
+)
 from act_rlt.stage2 import (
     ACTStage2Config,
     ACTStage2Policy,
@@ -41,8 +45,12 @@ from lerobot.types import TransitionKey
 
 
 RESET_RETREAT_Y_M = 0.01
+RESET_RETREAT_Z_M = 0.01
 RESET_MOVE_SPEED_M_S = 0.02
 RESET_XY_MARGIN_M = 0.02
+STARTUP_WORKSPACE_HALF_RANGE_M = 0.03
+Z_SAMPLE_XY_HALF_RANGE_M = 0.01
+Z_SAMPLE_UP_RANGE_M = 0.02
 
 
 def retreat_pose_along_positive_y(
@@ -61,6 +69,75 @@ def retreat_pose_along_positive_y(
             f"target={pose[:3]}, min={workspace_min}, max={workspace_max}"
         )
     return pose
+
+
+def retreat_pose_along_positive_z(
+    measured_pose: np.ndarray,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+) -> np.ndarray:
+    """Return a 1 cm base-frame +Z retreat within the configured workspace."""
+    pose = np.asarray(measured_pose, dtype=float).copy()
+    if pose.shape != (6,) or not np.isfinite(pose).all():
+        raise ValueError(f"invalid measured TCP pose: {pose}")
+    pose[2] += RESET_RETREAT_Z_M
+    if np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max):
+        raise RuntimeError(
+            "+Z reset retreat would leave workspace: "
+            f"target={pose[:3]}, min={workspace_min}, max={workspace_max}"
+        )
+    return pose
+
+
+def sample_z_insertion_workspace_pose(
+    reference: np.ndarray,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+) -> np.ndarray:
+    """Sample x/y ±1 cm and z 0–2 cm above p0; retain p0 orientation."""
+    reference = np.asarray(reference, dtype=float)
+    lower = np.asarray(workspace_min, dtype=float)
+    upper = np.asarray(workspace_max, dtype=float)
+    if reference.shape != (6,) or not np.isfinite(reference).all():
+        raise ValueError(f"invalid Z insertion reference pose: {reference}")
+    if (
+        lower.shape != (3,) or upper.shape != (3,)
+        or not np.isfinite(lower).all() or not np.isfinite(upper).all()
+        or np.any(lower >= upper)
+    ):
+        raise ValueError("invalid Z insertion workspace bounds")
+    sample_min = reference[:3] + [-Z_SAMPLE_XY_HALF_RANGE_M, -Z_SAMPLE_XY_HALF_RANGE_M, 0]
+    sample_max = reference[:3] + [Z_SAMPLE_XY_HALF_RANGE_M, Z_SAMPLE_XY_HALF_RANGE_M, Z_SAMPLE_UP_RANGE_M]
+    if np.any(sample_min < lower) or np.any(sample_max > upper):
+        raise ValueError("Z insertion sample volume extends outside the safe workspace")
+    if reference[2] - RESET_RETREAT_Z_M < lower[2]:
+        raise ValueError("Z insertion endpoint extends below the safe workspace")
+    return np.concatenate([np.random.uniform(sample_min, sample_max), reference[3:]])
+
+
+def capture_centered_workspace(robot) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Capture the current TCP pose on Enter, then bound XYZ to ±3 cm."""
+    while True:
+        choice = input(
+            "Place TCP at Z insertion p0; press Enter to capture its pose "
+            "and set XYZ workspace to +/-3 cm (q to stop): "
+        ).strip().lower()
+        if not choice:
+            break
+        if choice in {"q", "quit"}:
+            raise KeyboardInterrupt
+        print("Press Enter to capture or q to stop.", flush=True)
+    pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
+    if pose.shape != (6,) or not np.isfinite(pose).all():
+        raise RuntimeError(f"invalid TCP pose at workspace capture: {pose}")
+    lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
+    upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
+    print(
+        f"Captured p0: {pose.tolist()}; workspace XYZ: "
+        f"min={lower.tolist()}, max={upper.tolist()}",
+        flush=True,
+    )
+    return pose, lower, upper
 
 
 def sample_workspace_pose(
@@ -154,6 +231,13 @@ class FrankaInsertionStage2Env:
         max_step_rad: float,
         sample_min: tuple[float, float, float] | None = None,
         sample_max: tuple[float, float, float] | None = None,
+        camera_shapes: dict[str, tuple[int, int, int]] | None = None,
+        z_insertion_mode: bool = False,
+        reference_pose: np.ndarray | None = None,
+        enable_human_intervention: bool = False,
+        teleop_input_backend: str = "evdev",
+        teleop_keyboard: str | None = None,
+        teleop_speed_m_s: float = 0.01,
     ) -> None:
         self.robot = robot
         self.pre = preprocessor
@@ -165,10 +249,16 @@ class FrankaInsertionStage2Env:
         except StopIteration as error:
             raise ValueError("ACT preprocessor has no NormalizerProcessorStep") from error
         self.config = config
+        self.camera_shapes = camera_shapes
         self.period_s = 1.0 / fps
         self.episode_time_s = episode_time_s
         self.max_step_m = max_step_m
         self.max_step_rad = max_step_rad
+        self.enable_human_intervention = enable_human_intervention
+        self.teleop_input_backend = teleop_input_backend
+        self.teleop_keyboard = teleop_keyboard
+        self.teleop_speed_m_s = teleop_speed_m_s
+        self._control_mode = "policy"
         self.workspace_min = np.asarray(robot.config.workspace_min_xyz, dtype=float)
         self.workspace_max = np.asarray(robot.config.workspace_max_xyz, dtype=float)
         self.sample_min = (
@@ -176,6 +266,10 @@ class FrankaInsertionStage2Env:
         )
         self.sample_max = (
             None if sample_max is None else np.asarray(sample_max, dtype=float)
+        )
+        self.z_insertion_mode = z_insertion_mode
+        self._reference_pose = (
+            None if reference_pose is None else np.asarray(reference_pose, dtype=float).copy()
         )
         if (
             self.workspace_min.shape != (3,)
@@ -197,9 +291,10 @@ class FrankaInsertionStage2Env:
         self._episode_reference_tcp_command_sum = np.zeros(6, dtype=float)
         self._episode_mean_tcp_command_sum = np.zeros(6, dtype=float)
         self._episode_tcp_target_comparison_steps = 0
+        self._episode_human_steps = 0
 
     def _processed_observation(self) -> dict[str, torch.Tensor]:
-        return self.pre(observation_frame(self.robot.get_observation()))
+        return self.pre(observation_frame(self.robot.get_observation(), self.camera_shapes))
 
     def _close_monitor(self) -> None:
         if self._monitor is not None:
@@ -223,16 +318,35 @@ class FrankaInsertionStage2Env:
 
     def _retreat_after_outcome(self) -> None:
         measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
-        retreat = retreat_pose_along_positive_y(
-            measured,
-            self.workspace_min,
-            self.workspace_max,
-        )
-        self._move_reset_pose(retreat, label="+Y 1 cm retreat")
+        if self.z_insertion_mode:
+            retreat = retreat_pose_along_positive_z(
+                measured, self.workspace_min, self.workspace_max
+            )
+            label = "+Z 1 cm retreat"
+        else:
+            retreat = retreat_pose_along_positive_y(
+                measured, self.workspace_min, self.workspace_max
+            )
+            label = "+Y 1 cm retreat"
+        self._move_reset_pose(retreat, label=label)
 
     def _move_to_accepted_workspace_sample(self) -> None:
-        if self._reset_orientation is None:
+        if self.z_insertion_mode and self._reference_pose is None:
             measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
+            if measured.shape != (6,) or not np.isfinite(measured).all():
+                raise RuntimeError(f"invalid initial TCP reference pose: {measured}")
+            choice = input(
+                "Use current TCP pose as fixed Z insertion p0 "
+                f"{self._format_pose(measured)}? Press Enter/y to accept, q to stop: "
+            ).strip().lower()
+            if choice not in {"", "y", "yes"}:
+                raise KeyboardInterrupt
+            self._reference_pose = measured.copy()
+        if self._reset_orientation is None:
+            measured = (
+                self._reference_pose if self.z_insertion_mode
+                else np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
+            )
             if measured.shape != (6,) or not np.isfinite(measured).all():
                 raise RuntimeError(f"invalid initial TCP pose: {measured}")
             self._reset_orientation = measured[3:].copy()
@@ -242,13 +356,18 @@ class FrankaInsertionStage2Env:
                 flush=True,
             )
         while True:
-            target = sample_workspace_pose(
-                self.workspace_min,
-                self.workspace_max,
-                self._reset_orientation,
-                sample_min=self.sample_min,
-                sample_max=self.sample_max,
-            )
+            if self.z_insertion_mode:
+                target = sample_z_insertion_workspace_pose(
+                    self._reference_pose, self.workspace_min, self.workspace_max
+                )
+            else:
+                target = sample_workspace_pose(
+                    self.workspace_min,
+                    self.workspace_max,
+                    self._reset_orientation,
+                    sample_min=self.sample_min,
+                    sample_max=self.sample_max,
+                )
             if self._first_reset_move:
                 choice = input(
                     "First sampled reset target is "
@@ -277,7 +396,7 @@ class FrankaInsertionStage2Env:
     def _prompt_outcome_after_timeout() -> str:
         while True:
             choice = input(
-                "Episode inference time elapsed. Confirm outcome: "
+                "Episode maximum time elapsed. Confirm outcome: "
                 "s=success, f=failure, q=stop training: "
             ).strip().lower()
             if choice in {"s", "f", "q"}:
@@ -289,6 +408,7 @@ class FrankaInsertionStage2Env:
             self._runtime.close()
             self._runtime = None
         self._close_monitor()
+        self._control_mode = "policy"
         phase = "ACT WARMUP" if warmup else "RLT ACTOR"
         print(f"\nPreparing Episode {episode_id} [{phase}] with automatic reset.", flush=True)
         self._move_to_accepted_workspace_sample()
@@ -298,10 +418,21 @@ class FrankaInsertionStage2Env:
         self._episode_reference_tcp_command_sum.fill(0.0)
         self._episode_mean_tcp_command_sum.fill(0.0)
         self._episode_tcp_target_comparison_steps = 0
+        self._episode_human_steps = 0
         batch = self._processed_observation()
+        if self.enable_human_intervention:
+            from act_rlt.human_input import HumanInputMonitor
+
+            self._monitor = HumanInputMonitor(self.teleop_input_backend, self.teleop_keyboard)
+            print(
+                "Episode active: Space=take over/return at 4-step boundary; "
+                "W/X/A/D/P/L=human XYZ; S/F=finish after this 4-step chunk; Esc=stop training",
+                flush=True,
+            )
+        else:
+            self._monitor = OutcomeMonitor()
+            print("Episode active: s/f=finish after this 4-step chunk; q=stop training", flush=True)
         self._episode_start = time.monotonic()
-        self._monitor = OutcomeMonitor()
-        print("Episode active: s=success, f=failure, q=stop training", flush=True)
         return batch
 
     def _record_episode_action_comparison(self, result: ChunkExecution) -> None:
@@ -323,6 +454,8 @@ class FrankaInsertionStage2Env:
                 setattr(self, name, np.zeros(6, dtype=float))
         if not hasattr(self, "_episode_tcp_target_comparison_steps"):
             self._episode_tcp_target_comparison_steps = 0
+        if not hasattr(self, "_episode_human_steps"):
+            self._episode_human_steps = 0
         sums = (
             ("_sampled_tcp_command_sum", self._episode_sampled_tcp_command_sum),
             ("_reference_tcp_command_sum", self._episode_reference_tcp_command_sum),
@@ -332,8 +465,12 @@ class FrankaInsertionStage2Env:
             value = np.asarray(result.info.pop(name, np.zeros(6)), dtype=float)
             if value.shape != (6,) or not np.isfinite(value).all():
                 raise RuntimeError(f"invalid Stage-2 TCP command summary {name}: {value}")
-            destination += value
-        self._episode_tcp_target_comparison_steps += result.actual_steps
+            if not result.intervention:
+                destination += value
+        if result.intervention:
+            self._episode_human_steps += result.actual_steps
+        else:
+            self._episode_tcp_target_comparison_steps += result.actual_steps
         if not result.done:
             return
 
@@ -359,19 +496,21 @@ class FrankaInsertionStage2Env:
             self._episode_sampled_tcp_command_sum - self._episode_reference_tcp_command_sum,
         )
         result.info["episode_tcp_target_comparison_steps"] = self._episode_tcp_target_comparison_steps
+        result.info["episode_human_steps"] = self._episode_human_steps
 
     def execute_policy_chunk(
         self, policy: ACTStage2Policy, initial_batch: dict[str, torch.Tensor],
-        *, warmup: bool, remaining_steps: int,
+        *, warmup: bool, remaining_steps: int, deterministic: bool = False,
     ) -> ChunkExecution:
         """Consume one result from the persistent fixed-chunk collector."""
         from act_rlt.stage2_runtime import FixedChunkRuntime
 
         if self._runtime is None:
             self._runtime = FixedChunkRuntime(
-                self, policy, initial_batch, warmup=warmup, step_budget=remaining_steps
+                self, policy, initial_batch, warmup=warmup, step_budget=remaining_steps,
+                deterministic=deterministic,
             )
-        elif self._runtime.warmup != warmup:
+        elif self._runtime.warmup != warmup or self._runtime.deterministic != deterministic:
             raise RuntimeError("collector must pause at the warmup boundary")
         self._runtime.publish_actor(policy.actor)
         result = self._runtime.next_result()
@@ -425,6 +564,7 @@ class FrankaInsertionStage2Env:
         actual_steps = 0
         done = terminated = truncated = stop_requested = False
         success = False
+        pending_outcome = None
         workspace_violation = False
         workspace_error: str | None = None
         last_batch = None
@@ -475,15 +615,11 @@ class FrankaInsertionStage2Env:
             last_batch = self._processed_observation()
 
             key = self._monitor.poll() if self._monitor is not None else None
-            if key == "s":
-                rewards[index] = 1.0
-                success = True
-                terminated = done = True
-            elif key == "f":
-                terminated = done = True
-            elif key == "q":
+            if key in {"s", "f"} and pending_outcome is None:
+                pending_outcome = key
+            if key == "q":
                 truncated = done = stop_requested = True
-            elif time.monotonic() - self._episode_start >= self.episode_time_s:
+            elif pending_outcome is None and time.monotonic() - self._episode_start >= self.episode_time_s:
                 # Stop inference at the wall-clock limit, but keep outcomes
                 # human-labelled in both warmup and online RL.
                 self._close_monitor()
@@ -503,6 +639,13 @@ class FrankaInsertionStage2Env:
                 if not stop_requested:
                     self._needs_automatic_reset = True
                 break
+        if pending_outcome is not None and not done:
+            rewards[actual_steps - 1] = float(pending_outcome == "s")
+            success = pending_outcome == "s"
+            terminated = done = True
+            self._close_monitor()
+            self._retreat_after_outcome()
+            self._needs_automatic_reset = True
         if last_batch is None:
             raise RuntimeError("action chunk executed zero steps without a next observation")
         return ChunkExecution(
@@ -547,6 +690,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--critic-init-steps", type=int, default=1000)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-motion", action="store_true")
+    parser.add_argument("--enable-human-intervention", action="store_true")
+    parser.add_argument(
+        "--teleop-input-backend",
+        choices=("auto", "evdev", "pynput"),
+        default="auto",
+        help="auto uses pynput in an X11 session, or evdev on a headless host",
+    )
+    parser.add_argument("--teleop-keyboard", help="evdev input device, e.g. /dev/input/event4")
+    parser.add_argument("--teleop-speed-m-s", type=float, default=0.01)
 
     parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--wrist-camera", default="349622072679")
@@ -567,7 +719,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y", "Z"),
         help="optional reset-pose sampling upper bound inside the safe workspace",
     )
-    parser.add_argument("--fps", type=float, default=15.0)
+    parser.add_argument(
+        "--z-insertion-mode", action="store_true",
+        help="sample around fixed p0 (X/Y +/-1 cm, Z +0..2 cm) and retreat +Z 1 cm",
+    )
+    parser.add_argument("--fps", type=float, default=None,
+                        help="control rate in Hz (default: 30 for Z insertion, 15 otherwise)")
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--max-step-m", type=float, default=0.002)
     parser.add_argument("--max-step-rad", type=float, default=0.02)
@@ -591,31 +748,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--utd-ratio", type=int, default=5)
     parser.add_argument("--beta", type=float, default=0.5,
                         help="BC regularization coefficient in -Q + beta * BC (default: 0.5)")
-    parser.add_argument("--exploration-sigma", type=float, default=0.1,
-                        help="fixed normalized action standard deviation during collection (default: 0.1)")
+    parser.add_argument("--exploration-sigma", type=float, default=0.2,
+                        help="fixed normalized action standard deviation during collection (default: 0.2)")
     parser.add_argument("--save-every-env-steps", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.fps is None:
+        args.fps = 30.0 if args.z_insertion_mode else 15.0
+    if args.teleop_input_backend == "auto":
+        args.teleop_input_backend = (
+            "evdev" if args.teleop_keyboard or not os.environ.get("DISPLAY") else "pynput"
+        )
+    if args.teleop_keyboard and args.teleop_input_backend != "evdev":
+        parser.error("--teleop-keyboard applies only to --teleop-input-backend evdev")
+    if args.enable_human_intervention:
+        from act_rlt.human_input import validate_teleop_speed
+
+        try:
+            validate_teleop_speed(args.teleop_speed_m_s, args.fps, args.max_step_m)
+        except ValueError as error:
+            parser.error(str(error))
     if args.resume and args.replay_from:
         parser.error("--resume and --replay-from are mutually exclusive")
     if args.prepare_only and not (args.replay_from or args.resume):
         parser.error("--prepare-only requires --replay-from or --resume")
     if not args.dry_run and not args.prepare_only and not args.allow_motion:
         parser.error("real Stage-2 collection requires --allow-motion")
-    if args.allow_motion and (args.workspace_min is None or args.workspace_max is None):
+    if args.allow_motion and not args.z_insertion_mode and (
+        args.workspace_min is None or args.workspace_max is None
+    ):
         parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
     if (args.workspace_min is None) != (args.workspace_max is None):
         parser.error("supply both workspace bounds")
+    if args.z_insertion_mode and args.workspace_min is not None:
+        parser.error("--z-insertion-mode captures the +/-3 cm workspace at startup; omit workspace bounds")
     if (args.sample_min is None) != (args.sample_max is None):
         parser.error("supply both --sample-min and --sample-max")
+    if args.z_insertion_mode and args.sample_min is not None:
+        parser.error("--sample-min/--sample-max cannot be combined with --z-insertion-mode")
     if args.workspace_min is not None:
         bounds = np.asarray([args.workspace_min, args.workspace_max], dtype=float)
         if not np.isfinite(bounds).all() or np.any(bounds[0] >= bounds[1]):
             parser.error("workspace bounds must be finite with min < max")
-        if np.any(bounds[1, :2] - bounds[0, :2] <= 2 * RESET_XY_MARGIN_M):
+        if not args.z_insertion_mode and np.any(bounds[1, :2] - bounds[0, :2] <= 2 * RESET_XY_MARGIN_M):
             parser.error("workspace X/Y spans must each exceed 4 cm for 2 cm margins")
         if args.sample_min is not None:
             sample_bounds = np.asarray([args.sample_min, args.sample_max], dtype=float)
@@ -697,7 +875,9 @@ def load_checkpoint(
     saved_config.setdefault(
         "temporal_ensemble_coeff", current_config["temporal_ensemble_coeff"]
     )
-    schedule_keys = {"warmup_steps", "total_env_steps", "device"}
+    # Beta changes only the Actor objective on future updates; it does not
+    # invalidate the learned network, optimizer state, or replay contents.
+    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta"}
     incompatible = {
         key: (saved_config.get(key), current_config.get(key))
         for key in set(saved_config) | set(current_config)
@@ -758,6 +938,11 @@ def import_replay(path: Path, config: ACTStage2Config, replay: ReplayBuffer) -> 
             value = getattr(transition, key)
             if tuple(value.shape) != shape or not torch.isfinite(value).all():
                 raise ValueError(f"invalid replay {key}")
+        bc_target = getattr(transition, "bc_target_chunk", None)
+        if bc_target is not None and (
+            tuple(bc_target.shape) != expected["ref_chunk"] or not torch.isfinite(bc_target).all()
+        ):
+            raise ValueError("invalid replay bc_target_chunk")
         k = int(transition.actual_steps)
         rewards = transition.reward_seq
         if (not 1 <= k <= config.chunk_length or float(transition.done) not in (0, 1)
@@ -783,9 +968,12 @@ def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkE
         "chunks": metrics.chunks,
         "episodes": metrics.episodes,
         "successes": metrics.successes,
+        "human_chunks": metrics.human_chunks,
+        "human_env_steps": metrics.human_env_steps,
         "critic_updates": metrics.critic_updates,
         "actor_updates": metrics.actor_updates,
         "actual_steps": execution.actual_steps,
+        "intervention": execution.intervention,
         "done": execution.done,
         "terminated": execution.terminated,
         "truncated": execution.truncated,
@@ -822,6 +1010,8 @@ def _format_terminal_metrics(record: dict[str, Any]) -> str:
     ]
     if record.get("workspace_violation"):
         parts.append("WORKSPACE")
+    if record.get("intervention"):
+        parts.append("HUMAN")
     if record.get("safety_clip_steps"):
         parts.append(f"clip={record['safety_clip_steps']}")
     if record.get("done"):
@@ -891,6 +1081,7 @@ def main() -> int:
     from lerobot.policies.factory import make_pre_post_processors
 
     policy = ACTStage2Policy(config).to(config.device)
+    camera_shapes = checkpoint_camera_shapes(policy.stage1._act.config)
     pre, post = make_pre_post_processors(
         policy.stage1._act.config,
         pretrained_path=str(act_path),
@@ -920,33 +1111,24 @@ def main() -> int:
         print(f"Prepared v3 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
         return 0
 
+    if args.enable_human_intervention:
+        from act_rlt.human_input import validate_human_input
+
+        validate_human_input(args.teleop_input_backend, args.teleop_keyboard)
+
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
 
     robot = FrankaRobot(
         FrankaRobotConfig(
             robot_ip=args.robot_ip,
-            camera_serial=args.wrist_camera,
-            front_camera_serial=args.front_camera,
-            front_camera_width=640,
-            front_camera_height=480,
+            **robot_camera_kwargs(camera_shapes, args),
             include_gripper_action=True,
             enable_fci_keepalive=False,
-            workspace_min_xyz=tuple(args.workspace_min),
-            workspace_max_xyz=tuple(args.workspace_max),
+            workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
+            workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
         )
     )
-    env = FrankaInsertionStage2Env(
-        robot=robot,
-        preprocessor=pre,
-        postprocessor=post,
-        config=config,
-        fps=args.fps,
-        episode_time_s=args.episode_time,
-        max_step_m=args.max_step_m,
-        max_step_rad=args.max_step_rad,
-        sample_min=None if args.sample_min is None else tuple(args.sample_min),
-        sample_max=None if args.sample_max is None else tuple(args.sample_max),
-    )
+    env = None
     output.mkdir(parents=True, exist_ok=True)
     (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
     last_save_step = metrics.env_steps
@@ -960,6 +1142,30 @@ def main() -> int:
 
     try:
         robot.connect()
+        reference_pose = None
+        if args.z_insertion_mode:
+            reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot)
+            robot.config.workspace_min_xyz = tuple(workspace_min)
+            robot.config.workspace_max_xyz = tuple(workspace_max)
+        env = FrankaInsertionStage2Env(
+            robot=robot,
+            preprocessor=pre,
+            postprocessor=post,
+            config=config,
+            fps=args.fps,
+            episode_time_s=args.episode_time,
+            max_step_m=args.max_step_m,
+            max_step_rad=args.max_step_rad,
+            camera_shapes=camera_shapes,
+            z_insertion_mode=args.z_insertion_mode,
+            reference_pose=reference_pose,
+            sample_min=None if args.sample_min is None else tuple(args.sample_min),
+            sample_max=None if args.sample_max is None else tuple(args.sample_max),
+            enable_human_intervention=args.enable_human_intervention,
+            teleop_input_backend=args.teleop_input_backend,
+            teleop_keyboard=args.teleop_keyboard,
+            teleop_speed_m_s=args.teleop_speed_m_s,
+        )
         metrics = run_online_stage2(
             policy,
             learner,
@@ -973,7 +1179,8 @@ def main() -> int:
         print("Interrupted by operator; saving recoverable state.", flush=True)
     finally:
         try:
-            env.close()
+            if env is not None:
+                env.close()
         finally:
             try:
                 if robot.is_connected:
