@@ -18,6 +18,7 @@ from act_rlt.data_collection.sampling import (
     SAMPLE_ROTATION_VECTOR,
     SAMPLE_Z_M,
 )
+from act_rlt.infer_gc import EpisodeGarbageCollection
 
 
 ACTION_KEYS = ("dx", "dy", "dz", "drx", "dry", "drz")
@@ -491,6 +492,16 @@ def _predict_full_action_chunk(policy, pre, post, observation, camera_shapes=Non
 
 def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=None,
                           *, episode_index=None):
+    """Defer automatic cyclic GC until all episode workers have stopped."""
+    with EpisodeGarbageCollection() as episode_gc:
+        return _run_inference_episode(
+            robot, policy, pre, post, args, torch, camera_shapes,
+            episode_index=episode_index, episode_gc=episode_gc,
+        )
+
+
+def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=None,
+                           *, episode_index=None, episode_gc):
     """Run camera, ACT, and servo as three independently scheduled workers."""
     trace_file = None
     trace_queue = None
@@ -581,6 +592,8 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         z_stall_max_progress_m=Z_STALL_MAX_PROGRESS_M if residual_control else None,
         dry_run=bool(args.dry_run),
         profile_timing=profile_timing,
+        gc_policy="between_episodes", gc_enabled_before_episode=episode_gc.was_enabled,
+        gc_before_episode=episode_gc.before,
         queue_capacity=action_queue.maxsize, low_watermark=low_watermark,
         # JSON null denotes an unbounded axis; keep traces valid strict JSON.
         workspace_min_xyz=[float(v) if np.isfinite(v) else None for v in robot.config.workspace_min_xyz]
@@ -882,13 +895,14 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         refill_event.set()
     else:
         temporal_request_event.set()
-    if gc_tracer is not None:
-        gc_tracer.start()
-    for thread in threads:
-        thread.start()
-
     stop_error = None
+    started_threads = []
     try:
+        if gc_tracer is not None:
+            gc_tracer.start()
+        for thread in threads:
+            thread.start()
+            started_threads.append(thread)
         while not servo_finished.wait(timeout=0.1):
             while True:
                 try:
@@ -915,11 +929,15 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
             except BaseException as exc:
                 stop_error = exc
 
-        for thread in threads:
+        for thread in started_threads:
             thread.join()
-        if gc_tracer is not None:
-            gc_tracer.close()
         drain_trace()
+        try:
+            policy.reset()
+            episode_gc.collect_after_episode()
+        finally:
+            if gc_tracer is not None:
+                gc_tracer.close()
         while True:
             try:
                 print(log_queue.get_nowait(), flush=True)
@@ -944,6 +962,7 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         )
         trace(
             "episode_end", stats=stats.copy(),
+            gc_after_episode=episode_gc.after,
             error=str(failures[0]) if failures else str(stop_error) if stop_error else None,
             measured_tcp_after_stop=robot.robot.get_tool_pose()
             if trace_queue is not None else None,
@@ -951,7 +970,6 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         drain_trace()
         if trace_file is not None:
             trace_file.close()
-        policy.reset()
 
     if failures:
         raise failures[0]

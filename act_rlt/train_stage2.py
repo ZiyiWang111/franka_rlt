@@ -43,6 +43,7 @@ from act_rlt.stage2 import (
     resolve_pretrained_model,
     run_online_stage2,
 )
+from act_rlt.stage2_logging import Stage2MetricsWriter
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from lerobot.processor import NormalizerProcessorStep
 from lerobot.processor.converters import create_transition
@@ -53,8 +54,9 @@ RESET_RETREAT_Y_M = 0.01
 RESET_RETREAT_Z_M = 0.01
 RESET_MOVE_SPEED_M_S = 0.02
 RESET_XY_MARGIN_M = 0.02
-STARTUP_WORKSPACE_HALF_RANGE_M = 0.03
+STARTUP_WORKSPACE_HALF_RANGE_M = 0.05
 Z_SAMPLE_XY_HALF_RANGE_M = 0.01
+FIXED_RESET_XY_OFFSETS_M = ((0.0, 0.0), (-0.02, -0.02), (0.02, -0.02))
 
 
 def retreat_pose_along_positive_y(
@@ -100,7 +102,7 @@ def sample_z_insertion_workspace_pose(
     *,
     randomize_xy: bool = False,
 ) -> np.ndarray:
-    """Use p0 XY, optionally randomized ±1 cm, with fixed Z and orientation."""
+    """Use p1 XY, optionally randomized ±1 cm, with fixed Z and orientation."""
     reference = np.asarray(reference, dtype=float)
     lower = np.asarray(workspace_min, dtype=float)
     upper = np.asarray(workspace_max, dtype=float)
@@ -124,12 +126,47 @@ def sample_z_insertion_workspace_pose(
     return np.concatenate([position, SAMPLE_ROTATION_VECTOR])
 
 
+def fixed_z_insertion_reset_points(
+    reference: np.ndarray,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+) -> np.ndarray:
+    """Build p1/p2/p3 reset targets with base-frame XY offsets in metres."""
+    base = sample_z_insertion_workspace_pose(reference, workspace_min, workspace_max)
+    points = np.tile(base, (3, 1))
+    points[:, :2] += np.asarray(FIXED_RESET_XY_OFFSETS_M)
+    if np.any(points[:, :3] < workspace_min) or np.any(points[:, :3] > workspace_max):
+        raise ValueError("p1/p2/p3 reset points extend outside the safe workspace")
+    return points
+
+
+def read_reset_point_choice(prompt: str) -> str:
+    """Read a single terminal key so digits move immediately and Enter starts."""
+    if not sys.stdin.isatty():
+        return input(prompt).strip().lower()
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    print(prompt, end="", flush=True)
+    try:
+        tty.setcbreak(fd)
+        key = os.read(fd, 1)
+        if not key:
+            raise EOFError("terminal closed during reset point selection")
+        choice = key.decode(errors="ignore").lower()
+        if choice == "\x03":
+            raise KeyboardInterrupt
+        return "" if choice in {"\r", "\n"} else choice
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        print(flush=True)
+
+
 def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Capture the current TCP pose on Enter, then bound XYZ to ±3 cm."""
+    """Capture the current TCP pose on Enter, then bound XYZ to ±5 cm."""
     while True:
         choice = input(
-            "Place TCP at Z insertion p0; press Enter to capture its pose "
-            "and set XYZ workspace to +/-3 cm (q to stop): "
+            "Place TCP at Z insertion p1; press Enter to capture its pose "
+            "and set XYZ workspace to +/-5 cm (q to stop): "
         ).strip().lower()
         if not choice:
             break
@@ -142,13 +179,13 @@ def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np
     lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
     upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
     print(
-        f"Captured p0: {pose.tolist()}; workspace XYZ: "
+        f"Captured p1 reference: {pose.tolist()}; workspace XYZ: "
         f"min={lower.tolist()}, max={upper.tolist()}",
         flush=True,
     )
     xy_description = (
-        f"XY randomized +/-{Z_SAMPLE_XY_HALF_RANGE_M:.3f} m around p0"
-        if randomize_xy else "XY fixed at p0"
+        f"XY randomized +/-{Z_SAMPLE_XY_HALF_RANGE_M:.3f} m around p1"
+        if randomize_xy else "select fixed p1/p2/p3 with keys 1/2/3"
     )
     print(
         f"Sample resets: {xy_description}, "
@@ -156,6 +193,10 @@ def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np
         f"intrinsic XYZ Euler={SAMPLE_EULER_XYZ_DEG} deg.",
         flush=True,
     )
+    if not randomize_xy:
+        points = fixed_z_insertion_reset_points(pose, lower, upper)
+        for index, point in enumerate(points, start=1):
+            print(f"Recorded reset p{index} (m, rotvec rad): {point.tolist()}", flush=True)
     return pose, lower, upper
 
 
@@ -258,6 +299,7 @@ class FrankaInsertionStage2Env:
         teleop_input_backend: str = "evdev",
         teleop_keyboard: str | None = None,
         teleop_speed_m_s: float = 0.01,
+        observation_selection: str = "boundary",
     ) -> None:
         self.robot = robot
         self.pre = preprocessor
@@ -278,6 +320,9 @@ class FrankaInsertionStage2Env:
         self.teleop_input_backend = teleop_input_backend
         self.teleop_keyboard = teleop_keyboard
         self.teleop_speed_m_s = teleop_speed_m_s
+        if observation_selection not in {"latest", "boundary"}:
+            raise ValueError("observation_selection must be latest or boundary")
+        self.observation_selection = observation_selection
         self._control_mode = "policy"
         self.workspace_min = np.asarray(robot.config.workspace_min_xyz, dtype=float)
         self.workspace_max = np.asarray(robot.config.workspace_max_xyz, dtype=float)
@@ -292,6 +337,8 @@ class FrankaInsertionStage2Env:
         self._reference_pose = (
             None if reference_pose is None else np.asarray(reference_pose, dtype=float).copy()
         )
+        self._fixed_reset_points: np.ndarray | None = None
+        self._selected_reset_point = 0
         if (
             self.workspace_min.shape != (3,)
             or self.workspace_max.shape != (3,)
@@ -357,7 +404,7 @@ class FrankaInsertionStage2Env:
             if measured.shape != (6,) or not np.isfinite(measured).all():
                 raise RuntimeError(f"invalid initial TCP reference pose: {measured}")
             choice = input(
-                "Use current TCP pose as fixed Z insertion p0 "
+                "Use current TCP pose as fixed Z insertion p1 "
                 f"{self._format_pose(measured)}? Press Enter/y to accept, q to stop: "
             ).strip().lower()
             if choice not in {"", "y", "yes"}:
@@ -382,12 +429,21 @@ class FrankaInsertionStage2Env:
                 f"{self._format_pose(self._reset_orientation)}",
                 flush=True,
             )
+        fixed_points_mode = self.z_insertion_mode and not self.randomize_reset_xy
+        if fixed_points_mode and self._fixed_reset_points is None:
+            self._fixed_reset_points = fixed_z_insertion_reset_points(
+                self._reference_pose, self.workspace_min, self.workspace_max
+            )
         while True:
-            if self.z_insertion_mode:
+            if fixed_points_mode:
+                target = self._fixed_reset_points[self._selected_reset_point].copy()
+                label = f"reset p{self._selected_reset_point + 1}"
+            elif self.z_insertion_mode:
                 target = sample_z_insertion_workspace_pose(
                     self._reference_pose, self.workspace_min, self.workspace_max,
                     randomize_xy=self.randomize_reset_xy,
                 )
+                label = "sampled workspace reset pose"
             else:
                 target = sample_workspace_pose(
                     self.workspace_min,
@@ -396,6 +452,7 @@ class FrankaInsertionStage2Env:
                     sample_min=self.sample_min,
                     sample_max=self.sample_max,
                 )
+                label = "sampled workspace reset pose"
             if self._first_reset_move:
                 choice = input(
                     "First sampled reset target is "
@@ -407,7 +464,22 @@ class FrankaInsertionStage2Env:
                     print("First automatic reset not authorized; stopping.", flush=True)
                     raise KeyboardInterrupt
                 self._first_reset_move = False
-            self._move_reset_pose(target, label="sampled workspace reset pose")
+            self._move_reset_pose(target, label=label)
+            if fixed_points_mode:
+                while True:
+                    choice = read_reset_point_choice(
+                        f"At p{self._selected_reset_point + 1}: "
+                        "1/2/3=move to p1/p2/p3, Enter=start episode, q=stop: "
+                    )
+                    if choice == "":
+                        return
+                    if choice in {"1", "2", "3"}:
+                        self._selected_reset_point = int(choice) - 1
+                        break
+                    if choice in {"q", "quit"}:
+                        raise KeyboardInterrupt
+                    print("Please use 1, 2, 3, Enter, or q.", flush=True)
+                continue
             choice = input(
                 "Sample point OK? [Enter/y]=start episode, r=move to a new sample, "
                 "q=stop training: "
@@ -750,17 +822,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--z-insertion-mode", action="store_true",
-        help="reset at p0 XY with fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
+        help="reset at selectable p1/p2/p3 with fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
     )
     parser.add_argument(
         "--randomize-reset-xy", action="store_true",
-        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p0 (default: fixed p0 XY)",
+        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p1 (default: select p1/p2/p3)",
     )
     parser.add_argument("--fps", type=float, default=None,
                         help="control rate in Hz (default: 30 for Z insertion, 15 otherwise)")
     parser.add_argument(
         "--camera-boundary-mode", choices=("timestamp", "legacy"), default="timestamp",
-        help="timestamp: use verified exposure timing, falling back to legacy waits when unavailable",
+        help="timestamp: align image/state when available; legacy: use ordinary observations",
+    )
+    parser.add_argument(
+        "--observation-selection", choices=("latest", "boundary"), default="latest",
+        help="latest: use newer cached observations like ACT infer; boundary: require post-command observations",
     )
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--max-step-m", type=float, default=0.002)
@@ -823,7 +899,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     if (args.workspace_min is None) != (args.workspace_max is None):
         parser.error("supply both workspace bounds")
     if args.z_insertion_mode and args.workspace_min is not None:
-        parser.error("--z-insertion-mode captures the +/-3 cm workspace at startup; omit workspace bounds")
+        parser.error("--z-insertion-mode captures the +/-5 cm workspace at startup; omit workspace bounds")
     if (args.sample_min is None) != (args.sample_max is None):
         parser.error("supply both --sample-min and --sample-max")
     if args.z_insertion_mode and args.sample_min is not None:
@@ -997,7 +1073,8 @@ def import_replay(path: Path, config: ACTStage2Config, replay: ReplayBuffer) -> 
     return OnlineStage2Metrics(warmup_env_steps=config.warmup_steps, env_steps=config.warmup_steps)
 
 
-def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkExecution) -> None:
+def append_metrics(writer: Stage2MetricsWriter, metrics: OnlineStage2Metrics,
+                   execution: ChunkExecution) -> None:
     learner = metrics.last_learner
     record: dict[str, Any] = {
         "time": time.time(),
@@ -1026,9 +1103,7 @@ def append_metrics(output: Path, metrics: OnlineStage2Metrics, execution: ChunkE
             critic_grad_norm=learner.critic_grad_norm,
             actor_grad_norm=learner.actor_grad_norm,
         )
-    with (output / "metrics.jsonl").open("a") as stream:
-        stream.write(json.dumps(record, sort_keys=True) + "\n")
-    print(_format_terminal_metrics(record), flush=True)
+    writer.append(record)
 
 
 def _format_terminal_metrics(record: dict[str, Any]) -> str:
@@ -1173,15 +1248,20 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
     last_save_step = metrics.env_steps
+    metrics_writer = None
 
     def on_chunk(current: OnlineStage2Metrics, execution: ChunkExecution) -> None:
         nonlocal last_save_step
-        append_metrics(output, current, execution)
+        assert metrics_writer is not None
+        append_metrics(metrics_writer, current, execution)
         if execution.done or current.env_steps - last_save_step >= args.save_every_env_steps:
             save_checkpoint(output, config, learner, replay, current)
             last_save_step = current.env_steps
 
     try:
+        metrics_writer = Stage2MetricsWriter(
+            output / "metrics.jsonl", format_terminal=_format_terminal_metrics,
+        )
         robot.connect()
         reference_pose = None
         if args.z_insertion_mode:
@@ -1209,6 +1289,7 @@ def main() -> int:
             teleop_input_backend=args.teleop_input_backend,
             teleop_keyboard=args.teleop_keyboard,
             teleop_speed_m_s=args.teleop_speed_m_s,
+            observation_selection=args.observation_selection,
         )
         metrics = run_online_stage2(
             policy,
@@ -1233,7 +1314,11 @@ def main() -> int:
                     finally:
                         robot.disconnect()
             finally:
-                save_checkpoint(output, config, learner, replay, metrics)
+                try:
+                    save_checkpoint(output, config, learner, replay, metrics)
+                finally:
+                    if metrics_writer is not None:
+                        metrics_writer.close()
     return 0
 
 

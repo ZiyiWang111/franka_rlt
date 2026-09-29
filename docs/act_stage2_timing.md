@@ -1,7 +1,10 @@
 # Stage 2 耗时日志
 
-正常启动 `act_rlt/train_stage2.py` 即自动启用，逐 chunk 写入运行输出目录的
-`metrics.jsonl`，无需新增命令行参数。建议保留 `config.json` 和启动命令，
+正常启动 `act_rlt/train_stage2.py` 即自动启用，每个 chunk 的完整记录先进入内存队列，
+由后台线程每秒批量写入运行输出目录的 `metrics.jsonl`，终端每秒最多显示一次最新状态。
+文件保持打开；训练回调不执行 JSON 序列化、写盘或终端打印。正常退出和异常清理时
+会等待剩余记录写完；强制杀进程或断电可能丢失尚未写入的记录。后台写入失败或
+队列积压满时会报错退出，不静默丢弃日志。无需新增命令行参数。建议保留 `config.json` 和启动命令，
 并采集 warmup、正式训练各一段，以比较训练竞争的影响。
 
 所有 `*_ms` 单位均为毫秒。`*_wall_ms` 是主机墙钟时间；GPU 运算异步提交，
@@ -31,7 +34,7 @@
 ## 当前 chunk 结束后，准备下一段
 
 - `next_request_queue_wall_ms`：边界请求到推理线程开始处理。
-- `next_camera_wait_wall_ms`：等待符合边界新鲜度要求的观测。
+- `next_camera_wait_wall_ms`：等待符合当前选择模式的新观测；默认 latest 模式有更新缓存时不等待相机。
 - `next_camera_capture_wall_ms`：被选中观测的 get_observation 调用时间；是上述等待的相关诊断项，不能直接累加。
 - `next_observation_start_after_request_ms`：被选中观测开始采集时间相对边界请求的偏移。这里是主机调用时间，不是相机硬件曝光时间。
 - `next_preprocess_wall_ms`：观测组帧和预处理的主机耗时。
@@ -49,12 +52,47 @@
 - `result_queue_wait_wall_ms`、`result_queue_depth`：结果等待 learner 消费的时间和消费后的队列长度，可识别 learner 落后。
 - `warmup`、`control_source`、`collector_paused`、`done`：分析时分组，排除人工接管和阶段结束边界。
 
-## 相机边界优化（默认开启）
+## 观测选择（训练默认 latest）
+
+`train_stage2.py` 默认使用 `--observation-selection latest`，原启动命令无需修改。
+相机线程持续采集并为每份完成的观测增加序号。推理在四步 chunk 执行结束后，
+选择比上次使用的序号更大的最新缓存；只有没有更新缓存才等待。未使用的中间
+相机帧可被跳过，但不重复使用上一份观测，也不丢弃任何已执行的动作或 transition。
+
+同一次编码仍同时作为 replay 的 `next_state/next_ref` 和下一段的
+`state/reference`。缓存的曝光/状态时间可能早于末步指令，因而不再保证它是
+完整 chunk 执行后的物理状态。这是观测时序的取舍，不等同于 RL 采集语义完全
+不变；Actor/Critic 损失、四步执行、奖励及 actual_steps 的计算未修改。
+没有加入提前生成下一 chunk、动作混合或强制下压。
+
+可加 `--observation-selection boundary` 恢复旧的严格边界选择。该参数不改变
+checkpoint 网络结构或学习配置；每条 metrics 记录包含 `observation_selection`。
+`infer_stage2` 的冻结策略推理仍保持原来的 boundary 模式。
+
+新增字段（除顶层 `observation_selection` 外，均有 `current_` / `next_` 前缀）：
+
+| 字段 | 含义 |
+|---|---|
+| `observation_selection` | `latest` 缓存新序号；`boundary` 严格末步后观测 |
+| `observation_seq` | 本 runtime 内被选中观测的递增序号 |
+| `observation_seq_gap` | 相对上次使用的序号差，超过 1 表示跳过中间相机帧 |
+| `camera_cache_hit` | 进入选择过程时已有满足要求的缓存，无需等待新观测 |
+| `observation_cache_age_ms` | 选择时距观测调用完成的时间，不是曝光帧龄 |
+| `observation_age_ms` | 选择时距 fresh_after 的时间；fresh_after 是曝光/状态的保守时间或 legacy 调用开始时间 |
+
+latest 模式中 `observation_fresh_after_request_ms` 和
+`observation_start_after_request_ms` 可以为负，表示使用边界之前采集的缓存，
+不应把负值误判为异常。比较速度时同时看缓存命中、帧龄、相机等待和下一行的
+`chunk_boundary_command_interval_ms`；仍需实机验证，缓存命中不保证 GPU 推理无停顿。
+
+## 相机曝光/状态时间配对（默认开启）
 
 `train_stage2.py` 默认使用 `--camera-boundary-mode timestamp`，原训练命令无需
-增加参数。A/B 对比可指定 `--camera-boundary-mode legacy`。无需重启控制服务器。
+增加参数。A/B 对比可指定 `--camera-boundary-mode legacy`。这个参数控制时间配对，
+不控制是否必须等待边界之后的新帧；后者由 observation-selection 决定。
+无需重启控制服务器。
 
-采集线程持续读取相机，保留最近 8 份观测。边界选择缓冲区中第一份满足新鲜度
+采集线程持续读取相机，保留最近 8 份观测。在 boundary 模式，选择第一份满足新鲜度
 条件的观测；即使采集调用开始于边界之前，只要可验证的曝光开始时间和配套
 机器人状态时间都在边界之后，也可采用。该观测编码仍同时作为 replay 的
 `next_state` 和下一段 actor 输入，未添加预测动作、重放动作或修改训练更新规则。
@@ -89,7 +127,7 @@
 | `camera_frame_spread_ms` | 多相机曝光中点跨度；单相机为 0 |
 | `camera_timestamp_margin_ms` | 帧时间判断的保护裕量 |
 
-优化生效时，`observation_start_after_request_ms` 可以是负数，这表示采集调用
+在 boundary 模式且曝光时间优化生效时，`observation_start_after_request_ms` 可以是负数，这表示采集调用
 早已开始；`observation_fresh_after_request_ms` 应非负，表示实际采用的图像和
 状态满足边界条件。比较速度时按 `camera_boundary_mode` 分组，排除首段、
 终止段和人工切换；不要把回退样本当作优化已生效。

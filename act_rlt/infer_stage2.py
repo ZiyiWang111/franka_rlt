@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--z-insertion-mode", action="store_true")
     parser.add_argument(
         "--randomize-reset-xy", action="store_true",
-        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p0 (default: fixed p0 XY)",
+        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p1 (default: select p1/p2/p3)",
     )
     parser.add_argument("--workspace-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))

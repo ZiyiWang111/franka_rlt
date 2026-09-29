@@ -2,12 +2,15 @@ import gc
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
+
+from act_rlt.infer_gc import EpisodeGarbageCollection
 
 from act_rlt.infer import (
     RESIDUAL_LIMIT_M,
@@ -717,6 +720,99 @@ def test_profile_gc_callback_is_removed_when_inference_fails(tmp_path):
                 args, _FakeTorch,
             )
     assert gc.callbacks == callbacks_before
+
+
+def test_gc_runs_only_before_workers_and_after_servo_shutdown(tmp_path):
+    robot = _FakeRobot()
+    args = _threaded_args(duration=0.14, fps=30)
+    args.profile_timing = True
+    args.log_dir = tmp_path
+    gc_was_enabled = gc.isenabled()
+    boundary_states = []
+    worker_states = []
+
+    def collect(generation):
+        assert generation == 2
+        boundary_states.append((
+            gc.isenabled(), robot.stop_calls,
+            [t.name for t in threading.enumerate() if t.name.startswith("act-")],
+        ))
+        return 0
+
+    def pre(frame):
+        worker_states.append(gc.isenabled())
+        return frame
+
+    with patch("act_rlt.infer_gc.gc.collect", side_effect=collect):
+        with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+            run_inference_episode(robot, _FakePolicy(4), pre, lambda a: a, args, _FakeTorch)
+
+    assert worker_states and not any(worker_states)
+    assert boundary_states == [(False, 0, []), (False, 1, [])]
+    assert gc.isenabled() == gc_was_enabled
+    path, = tmp_path.glob("*.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert events[0]["gc_policy"] == "between_episodes"
+    assert events[0]["gc_before_episode"]["rss_after_bytes"] > 0
+    assert events[-1]["gc_after_episode"]["rss_after_bytes"] > 0
+
+
+def test_gc_state_is_restored_after_worker_failure_even_if_previously_disabled():
+    originally_enabled = gc.isenabled()
+    try:
+        for enabled in (True, False):
+            (gc.enable if enabled else gc.disable)()
+            with patch("act_rlt.infer_gc.gc.collect", return_value=0) as collect:
+                with patch("act_rlt.infer.observation_frame", side_effect=ValueError("bad image")):
+                    with TestCase().assertRaisesRegex(ValueError, "bad image"):
+                        run_inference_episode(
+                            _FakeRobot(), _FakePolicy(4), lambda f: f, lambda a: a,
+                            _threaded_args(), _FakeTorch,
+                        )
+            assert collect.call_count == 2
+            assert gc.isenabled() == enabled
+    finally:
+        (gc.enable if originally_enabled else gc.disable)()
+
+
+def test_partial_thread_start_failure_stops_workers_and_restores_gc(tmp_path):
+    robot = _FakeRobot()
+    args = _threaded_args()
+    args.profile_timing = True
+    args.log_dir = tmp_path
+    callbacks_before = list(gc.callbacks)
+    gc_was_enabled = gc.isenabled()
+    original_start = threading.Thread.start
+
+    def start(thread):
+        if thread.name == "act-inference":
+            raise RuntimeError("thread startup failed")
+        original_start(thread)
+
+    with patch("act_rlt.infer_gc.gc.collect", return_value=0):
+        with patch("act_rlt.infer.threading.Thread.start", new=start):
+            with TestCase().assertRaisesRegex(RuntimeError, "thread startup failed"):
+                run_inference_episode(
+                    robot, _FakePolicy(4), lambda f: f, lambda a: a, args, _FakeTorch,
+                )
+    assert robot.stop_calls == 1
+    assert not any(t.name.startswith("act-") for t in threading.enumerate())
+    assert gc.isenabled() == gc_was_enabled
+    assert gc.callbacks == callbacks_before
+
+
+def test_gc_is_restored_when_boundary_collection_itself_fails():
+    was_enabled = gc.isenabled()
+    with patch("act_rlt.infer_gc.gc.collect", side_effect=RuntimeError("collection failed")):
+        with TestCase().assertRaisesRegex(RuntimeError, "collection failed"):
+            with EpisodeGarbageCollection():
+                raise AssertionError("must not enter episode")
+    assert gc.isenabled() == was_enabled
+    with patch("act_rlt.infer_gc.gc.collect", side_effect=[0, RuntimeError("collection failed")]):
+        with TestCase().assertRaisesRegex(RuntimeError, "collection failed"):
+            with EpisodeGarbageCollection():
+                assert not gc.isenabled()
+    assert gc.isenabled() == was_enabled
 
 
 def test_30_hz_servo_timing_with_prepared_action_chunk():

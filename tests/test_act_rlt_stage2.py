@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
@@ -23,6 +24,7 @@ from act_rlt.human_input import HumanInputMonitor
 from act_rlt.stage2 import (
     ACTStage2Config,
     ChunkExecution,
+    LearnerStepMetrics,
     OnlineStage2Metrics,
     Stage2Learner,
     run_online_stage2,
@@ -32,10 +34,12 @@ from act_rlt.train_stage2 import (
     RESET_RETREAT_Y_M,
     RESET_RETREAT_Z_M,
     RESET_XY_MARGIN_M,
-    STARTUP_WORKSPACE_HALF_RANGE_M,
     build_parser,
     capture_centered_workspace,
+    fixed_z_insertion_reset_points,
+    read_reset_point_choice,
     _format_terminal_metrics,
+    append_metrics,
     load_checkpoint,
     retreat_pose_along_positive_y,
     sample_z_insertion_workspace_pose,
@@ -210,6 +214,49 @@ def test_terminal_metrics_are_compact_while_json_fields_remain_available() -> No
         "loss(critic=0.250) Q(q1=0.200 q2=0.300 ref=0.100) "
         "Δtcp_mm(explore=1.20 sampled-ref=2.30)"
     )
+
+
+def test_metrics_callback_queues_complete_chunk_and_learner_snapshot(tmp_path) -> None:
+    from act_rlt.stage2_logging import Stage2MetricsWriter
+
+    path = tmp_path / "metrics.jsonl"
+    metrics = OnlineStage2Metrics(
+        env_steps=12, warmup_env_steps=4, online_env_steps=8, chunks=3,
+        episodes=2, successes=1, human_chunks=1, human_env_steps=4,
+        critic_updates=10, actor_updates=5,
+    )
+    metrics.last_learner = LearnerStepMetrics(
+        critic_loss=0.25, actor_loss=0.1,
+        critic_grad_norm=0.2, actor_grad_norm=0.3,
+        critic_updates=10, actor_updates=5,
+        diagnostics={"q1_mean": 0.2, "nested": {"values": [1, 2]}},
+    )
+    execution = ChunkExecution(
+        next_batch={}, exec_chunk=torch.zeros(4, 6), reward_seq=torch.zeros(4),
+        actual_steps=4, done=True, terminated=True, truncated=False,
+        intervention=True, info={"warmup": False, "success": True, "current_act_wall_ms": 12.5},
+    )
+    writer = Stage2MetricsWriter(path, format_terminal=_format_terminal_metrics, interval_s=60)
+    try:
+        append_metrics(writer, metrics, execution)
+        # These objects are reused by the learner after its callback returns.
+        metrics.env_steps = 99
+        execution.info["current_act_wall_ms"] = 99
+        metrics.last_learner.diagnostics["nested"]["values"][0] = 99
+    finally:
+        writer.close()
+    record = json.loads(path.read_text())
+    assert record.pop("time") > 0
+    assert record == {
+        "env_steps": 12, "warmup_env_steps": 4, "online_env_steps": 8, "chunks": 3,
+        "episodes": 2, "successes": 1, "human_chunks": 1, "human_env_steps": 4,
+        "critic_updates": 10, "actor_updates": 5, "actual_steps": 4,
+        "intervention": True, "done": True, "terminated": True, "truncated": False,
+        "warmup": False, "success": True, "current_act_wall_ms": 12.5,
+        "q1_mean": 0.2, "nested": {"values": [1, 2]},
+        "critic_loss": 0.25, "actor_loss": 0.1,
+        "critic_grad_norm": 0.2, "actor_grad_norm": 0.3,
+    }
 
 
 def test_v2_targets_clip_high_q_and_mask_terminal_bootstrap():
@@ -568,10 +615,12 @@ def _threaded_env(config, *, camera_delay=.003, period=.02, refusal_at=None):
 
 
 @pytest.mark.parametrize("timestamped", [False, True])
-def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner(timestamped):
+@pytest.mark.parametrize("selection", ["latest", "boundary"])
+def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner(timestamped, selection):
     from act_rlt.stage2_runtime import FixedChunkRuntime
     config = _config()
     env = _threaded_env(config)
+    env.observation_selection = selection
     policy = _FakeStage2Policy(config).eval()
     calls = []
 
@@ -609,6 +658,12 @@ def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner(t
         assert result.info["next_boundary_total_wall_ms"] >= result.info["next_camera_wait_wall_ms"]
         assert result.info["current_encode_wall_ms"] >= 0
         assert result.info["send_action_wall_ms_sum"] >= 0
+        assert result.info["observation_selection"] == selection
+        assert result.info["next_observation_selection"] == selection
+    assert first.info["next_observation_seq"] < second.info["next_observation_seq"] < third.info["next_observation_seq"]
+    if selection == "latest":
+        assert first.info["next_camera_cache_hit"] is True
+        assert first.info["next_observation_fresh_after_request_ms"] < 0
     assert second.info["chunk_boundary_command_interval_ms"] > 0
     assert third.info["result_queue_wait_wall_ms"] > 0
     assert len(calls) == 4  # initial state + one next state per chunk, no duplicates
@@ -1059,7 +1114,7 @@ def test_z_reset_xy_randomization_cli_is_opt_in(entrypoint) -> None:
 
 
 @pytest.mark.parametrize("randomize_xy", [False, True])
-def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch, randomize_xy) -> None:
+def test_z_insertion_reset_uses_confirmed_p1_and_retreats_up(monkeypatch, randomize_xy) -> None:
     p0 = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
     lower = np.array([0.62, -0.13, 0.357])
     upper = np.array([0.68, -0.07, 0.417])
@@ -1069,6 +1124,8 @@ def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch, random
     env._reference_pose = None
     env._reset_orientation = None
     env._first_reset_move = True
+    env._fixed_reset_points = None
+    env._selected_reset_point = 0
     env.workspace_min = lower
     env.workspace_max = upper
     env.robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=lambda: p0))
@@ -1112,8 +1169,8 @@ def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch, random
         sample_z_insertion_workspace_pose(p0, lower, np.array([0.66, -0.07, 0.401]))
 
 
-def test_workspace_center_is_sampled_when_enter_is_pressed(monkeypatch) -> None:
-    pose = np.array([0.65, -0.10, 0.15, 0.1, 0.2, 0.3])
+def test_workspace_center_is_sampled_when_enter_is_pressed(monkeypatch, capsys) -> None:
+    pose = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
     pressed = False
 
     def confirm(_prompt):
@@ -1129,8 +1186,128 @@ def test_workspace_center_is_sampled_when_enter_is_pressed(monkeypatch) -> None:
     robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=get_pose))
     captured, lower, upper = capture_centered_workspace(robot)
     assert np.array_equal(captured, pose)
-    np.testing.assert_allclose(lower, pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M)
-    np.testing.assert_allclose(upper, pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M)
+    np.testing.assert_allclose(lower, pose[:3] - 0.05)
+    np.testing.assert_allclose(upper, pose[:3] + 0.05)
+    output = capsys.readouterr().out
+    for name in ("p1", "p2", "p3"):
+        assert f"Recorded reset {name}" in output
+
+
+def test_fixed_reset_points_use_two_cm_base_xy_offsets_and_fixed_pose():
+    reference = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
+    original = reference.copy()
+    lower, upper = reference[:3] - 0.05, reference[:3] + 0.05
+    points = fixed_z_insertion_reset_points(reference, lower, upper)
+    np.testing.assert_allclose(points[:, :3], [
+        [0.65, -0.10, 0.402], [0.63, -0.12, 0.402], [0.67, -0.12, 0.402],
+    ])
+    expected = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True).as_matrix()
+    for point in points:
+        np.testing.assert_allclose(Rotation.from_rotvec(point[3:]).as_matrix(), expected)
+    np.testing.assert_array_equal(reference, original)
+    with pytest.raises(ValueError, match="p1/p2/p3 reset points"):
+        fixed_z_insertion_reset_points(reference, [0.64, -0.11, 0.357], upper)
+
+
+def test_fixed_reset_menu_switches_points_before_enter_and_keeps_selection(monkeypatch):
+    reference = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.z_insertion_mode = True
+    env.randomize_reset_xy = False
+    env._reference_pose = reference.copy()
+    env._reset_orientation = None
+    env._fixed_reset_points = None
+    env._selected_reset_point = 0
+    env._first_reset_move = True
+    env.workspace_min = reference[:3] - 0.05
+    env.workspace_max = reference[:3] + 0.05
+    moves = []
+    env._move_reset_pose = lambda target, *, label: moves.append((target.copy(), label))
+    confirmations = []
+    monkeypatch.setattr("builtins.input", lambda prompt: confirmations.append(prompt) or "")
+    prompts = []
+    keys = iter(["r", "2", "3", "1", "2", ""])
+
+    def choose(prompt):
+        prompts.append(prompt)
+        return next(keys)
+
+    monkeypatch.setattr("act_rlt.train_stage2.read_reset_point_choice", choose)
+    env._move_to_accepted_workspace_sample()
+    assert len(confirmations) == 1  # One-time move authorization.
+    assert [label for _, label in moves] == ["reset p1", "reset p2", "reset p3", "reset p1", "reset p2"]
+    assert all(
+        not option.strip().startswith("r=")
+        for prompt in prompts for option in prompt.split(",")
+    )
+    assert env._selected_reset_point == 1
+    points = env._fixed_reset_points.copy()
+    np.testing.assert_allclose(moves[-1][0], points[1])
+
+    monkeypatch.setattr("act_rlt.train_stage2.read_reset_point_choice", lambda prompt: "")
+    env._move_to_accepted_workspace_sample()
+    assert len(confirmations) == 1
+    assert moves[-1][1] == "reset p2"
+    np.testing.assert_array_equal(env._fixed_reset_points, points)
+
+    monkeypatch.setattr("act_rlt.train_stage2.read_reset_point_choice", lambda prompt: "q")
+    with pytest.raises(KeyboardInterrupt):
+        env._move_to_accepted_workspace_sample()
+
+
+def test_randomized_reset_keeps_resampling_menu_without_fixed_point_switching(monkeypatch):
+    reference = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.z_insertion_mode = True
+    env.randomize_reset_xy = True
+    env._reference_pose = reference
+    env._reset_orientation = None
+    env._first_reset_move = True
+    env.workspace_min = reference[:3] - 0.05
+    env.workspace_max = reference[:3] + 0.05
+    moves = []
+    env._move_reset_pose = lambda target, *, label: moves.append(target.copy())
+    prompts = []
+    answers = iter(["", "r", ""])
+
+    def confirm(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", confirm)
+    with patch("act_rlt.train_stage2.read_reset_point_choice", side_effect=AssertionError("fixed menu")):
+        env._move_to_accepted_workspace_sample()
+    assert len(moves) == 2
+    assert any("r=move to a new sample" in prompt for prompt in prompts)
+    assert not np.array_equal(moves[0][:2], moves[1][:2])
+    for target in moves:
+        assert np.all(np.abs(target[:2] - reference[:2]) <= 0.01)
+        assert target[2] == 0.402
+
+
+@pytest.mark.parametrize("key,expected", [(b"2", "2"), (b"\n", "")])
+def test_reset_point_key_does_not_require_enter_and_restores_terminal(monkeypatch, key, expected):
+    import os
+    import termios
+
+    master, slave = os.openpty()
+    try:
+        previous = termios.tcgetattr(slave)
+        monkeypatch.setattr("act_rlt.train_stage2.sys.stdin", SimpleNamespace(
+            isatty=lambda: True, fileno=lambda: slave,
+        ))
+
+        def read(fd, count):
+            assert fd == slave and count == 1
+            assert not termios.tcgetattr(slave)[3] & termios.ICANON
+            return key
+
+        with patch("act_rlt.train_stage2.os.read", side_effect=read):
+            assert read_reset_point_choice("Select point: ") == expected
+        assert termios.tcgetattr(slave) == previous
+    finally:
+        os.close(master)
+        os.close(slave)
 
 
 def test_automatic_reset_can_use_explicit_narrow_sample_box() -> None:

@@ -192,11 +192,21 @@ Workers also stop at episode boundaries and the online budget. Reset and human
 outcome prompts run only after the servo worker stops. A checkpoint contains
 consumed replay transitions; in-flight collection is not resumed after restart.
 
-The observation captured after the final command is encoded once and shared by
-the previous transition's next state and the following chunk's current state.
-Unlike ACT's optional early queue refill, this preserves a boundary observation
-instead of planning from a mid-chunk observation. Consequently camera + inference
-must fit the remaining control period to avoid a boundary gap. Late predictions
+Stage-2 training defaults to `--observation-selection latest`: the camera keeps
+capturing during execution, and at each chunk boundary inference consumes the
+newest cached observation with a sequence newer than the last one used. It only
+waits for the camera if no newer observation exists. One encoding still supplies
+both the previous transition's next state and the following chunk's current
+state/reference. A cached observation can precede the final command, so this is
+not a guarantee of a physically post-chunk replay state. Logs report selection,
+sequence, cache hit, and observation ages. Use `--observation-selection boundary`
+to restore strict post-command selection. `--camera-boundary-mode` independently
+controls exposure/state timestamp pairing. The frozen `infer_stage2` runtime
+keeps its existing strict boundary selection.
+
+This change does not enable early chunk prediction, temporal blending, or forced
+downward actions. Inference still begins after the four-step chunk, but camera
+waiting can be overlapped with its execution. Late predictions
 hold the last target, never repeat a relative action or trigger a catch-up burst;
 an action queue wait over 0.5 seconds stops collection (2 seconds at startup).
 GPU contention from learning can still increase latency.
@@ -216,6 +226,12 @@ clip fractions, TD targets/errors, reward, terminal fraction, BC loss and
 Actor-reference RMSE. Statistics average all UTD updates for each chunk (extrema
 retain min/max); Actor statistics use only updates that actually train the Actor.
 Gradient norms are measured before clipping. Non-finite gradients abort updates.
+
+Each chunk's complete metrics are queued in memory. A dedicated writer keeps the
+JSONL file open and writes/flushes a batch every second; regular terminal metrics
+are printed at most once per second using the latest record. Shutdown drains
+remaining records, including exception cleanup. Writer failures and a full queue
+are surfaced instead of silently dropping metrics.
 
 Use a new output directory for a fresh run, without `--resume` or `--replay-from`.
 Old v1/v2 learner checkpoints cannot be resumed as v3: the Actor/Critic network
@@ -251,11 +267,18 @@ samples the next reset pose, then asks whether to accept it or sample again.
 For the wrist-only `act_rlt_z_350` insertion policy, pass
 `--act-checkpoint outputs/act_rlt_z_350` with its matching RL Token checkpoint
 and add `--z-insertion-mode`. Stage 2 opens only the checkpoint's 1280x720 wrist
-camera. At startup it asks the operator to place the TCP at p0 and press Enter
-before moving. The TCP pose read at Enter becomes p0;
-its XYZ coordinates define the safety workspace at ±3 cm on each axis. It
-uses fixed X/Y at `p0` by default; add `--randomize-reset-xy` to sample X/Y
-within ±1 cm of `p0`. Both modes use fixed absolute Z = 0.402 m and the
+camera. At startup it asks the operator to place the TCP at p1 and press Enter
+before moving. The TCP pose read at Enter becomes the p1 reference;
+its XYZ coordinates define the safety workspace at ±5 cm on each axis.
+Without `--randomize-reset-xy`, that same confirmation records three reset
+points in the base frame: p1 uses the captured XY, p2 uses X−2 cm/Y−2 cm,
+and p3 uses X+2 cm/Y−2 cm. Before each episode, press `1`, `2`, or `3` to
+move immediately to the corresponding point, then press Enter to start.
+The first reset goes to p1; subsequent resets return to the last selected
+point. The fixed-point menu has no `r` option.
+Add `--randomize-reset-xy` to sample X/Y within ±1 cm of p1 instead; this mode
+retains the Enter/y confirmation and `r` resampling menu, without point switching.
+Both modes use fixed absolute Z = 0.402 m and the
 recorder's intrinsic XYZ Euler orientation `(179.7, 1.4, 90.6)` degrees.
 The fixed sample must lie inside the captured workspace. The reference pose
 is retained as measured; the arm retreats +Z 1 cm after each episode.
@@ -357,9 +380,11 @@ python -m act_rlt.infer_stage2 \
 
 The sample bounds are optional. For a Z-insertion checkpoint, pass its matching
 Stage-2 run and `--z-insertion-mode` instead of workspace/sample bounds.
-Reset X/Y stays at p0 by default; `--randomize-reset-xy` enables ±1 cm sampling.
-At startup, place the TCP at p0 and press Enter to capture the workspace. Every
-episode samples a reset pose and asks for confirmation before inference. During
+At startup, place the TCP at p1 and press Enter to capture the workspace.
+By default, reset points p1/p2/p3 use the same offsets and `1`/`2`/`3` selection
+menu as Stage-2 training; press Enter to start inference at the selected point.
+`--randomize-reset-xy` instead enables ±1 cm sampling around p1 with `r` resampling.
+During
 an episode, `s` or `f` ends after the current chunk, `q` stops the session, and
 `--episode-time` sets the maximum rollout duration (default 5 seconds). Gripper
 commands remain held. The Stage-2 checkpoint records the original ACT and
@@ -420,6 +445,12 @@ cached TCP/joint state and raw base-frame external wrench immediately before
 sending, the attempted servo target TCP, and—when enabled—the bounded
 unexecuted-motion residual and Z-stall state. The `episode_start` event records
 whether `residual_control` was enabled.
+Automatic Python cyclic GC is paused for each episode. A full collection runs
+before worker startup and after servo shutdown and worker joins, so collection
+cannot stall the servo publisher. Normal reference-counted object/tensor cleanup
+continues. The caller's original GC state is restored even on failure.
+The episode start/end events record the boundary collection duration and current
+process RSS before/after collection for checking memory across repeated episodes.
 Add `--profile-timing` to record wall/CPU time for image conversion,
 preprocessing, policy calls, postprocessing, CPU copies and action preparation.
 It also records Python GC pauses with the executing thread and active inference

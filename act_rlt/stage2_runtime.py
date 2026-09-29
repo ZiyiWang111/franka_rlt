@@ -34,10 +34,12 @@ class Prediction:
 class FixedChunkRuntime:
     """One runtime per episode/collection phase; learning runs in the caller.
 
-    No temporal blending or mid-chunk replanning. Timestamp-verified exposure
-    (or conservative legacy call-start timing) selects a boundary observation.
-    The observation captured after
-    the last command supplies BOTH replay's next state and the next prediction.
+    No temporal blending or mid-chunk replanning. In latest mode, use the newest
+    cached observation not yet consumed, waiting only when no newer one exists.
+    Boundary mode instead requires exposure/state time (or legacy call-start
+    time) after the last command. Either mode shares one encoding between
+    replay's next state and the next prediction; latest mode does not promise a
+    physically post-command observation.
     Worker queues never repeat an action or silently discard a transition.
     """
 
@@ -48,6 +50,9 @@ class FixedChunkRuntime:
         self.warmup = warmup
         self.step_budget = step_budget
         self.deterministic = deterministic
+        self.observation_selection = getattr(env, "observation_selection", "boundary")
+        if self.observation_selection not in {"latest", "boundary"}:
+            raise ValueError("observation_selection must be latest or boundary")
         self.human = getattr(env, "_control_mode", "policy") == "human"
         self.actor = None if warmup else copy.deepcopy(policy.actor).eval().requires_grad_(False)
         self.actor_lock = threading.Lock()
@@ -57,6 +62,8 @@ class FixedChunkRuntime:
         self.observation_ready = threading.Condition()
         self.observation = None
         self.observation_started = -1.0
+        self.observation_seq = 0
+        self.last_observation_seq = 0
         self.observation_history = deque(maxlen=8)
         self.requests = queue.Queue(maxsize=1)
         self.predictions = queue.Queue(maxsize=1)
@@ -107,6 +114,8 @@ class FixedChunkRuntime:
                                    "camera_boundary_fallback_reason": "timed_observation_unavailable"}
                 completed = time.monotonic()
                 with self.observation_ready:
+                    self.observation_seq += 1
+                    diagnostics = {**diagnostics, "observation_seq": self.observation_seq}
                     self.observation = observation
                     self.observation_started = started
                     self.observation_completed = completed
@@ -119,17 +128,26 @@ class FixedChunkRuntime:
 
     def _boundary_batch(self, after, timing=None):
         started = time.monotonic()
+        selection = getattr(self, "observation_selection", "boundary")
+
         def select():
             history = getattr(self, "observation_history", None)
+            if selection == "latest":
+                if self.observation_seq <= self.last_observation_seq:
+                    return None
+                return history[-1] if history else None
             if history is None:  # Compatibility with minimal test/custom collectors.
                 if self.observation_started >= after:
                     return (self.observation_started,
                             getattr(self, "observation_completed", self.observation_started),
                             self.observation_started, self.observation, {})
                 return None
-            return next((item for item in history if item[2] >= after), None)
+            return next((item for item in history if item[2] >= after
+                         and item[4].get("observation_seq", float("inf"))
+                         > getattr(self, "last_observation_seq", 0)), None)
 
         with self.observation_ready:
+            cache_hit = select() is not None
             ready = self.observation_ready.wait_for(
                 lambda: self.stop.is_set() or select() is not None,
                 timeout=2.0,
@@ -137,10 +155,23 @@ class FixedChunkRuntime:
             if self.stop.is_set():
                 return None
             if not ready:
-                raise RuntimeError("Stage-2 camera did not supply a fresh boundary observation")
+                raise RuntimeError(
+                    f"Stage-2 camera did not supply a newer observation ({selection} selection)"
+                )
             observation_started, observation_completed, fresh_after, observation, diagnostics = select()
+            selected_at = time.monotonic()
+            sequence = diagnostics.get("observation_seq", getattr(self, "observation_seq", 1))
+            sequence_gap = sequence - getattr(self, "last_observation_seq", 0)
+            self.last_observation_seq = sequence
         if timing is not None:
             timing.values.update(diagnostics)
+            timing.values["observation_selection"] = selection
+            timing.values["observation_seq"] = sequence
+            timing.values["observation_seq_gap"] = sequence_gap
+            timing.values["camera_cache_hit"] = cache_hit
+            # Delivery age and exposure/state age differ; log both, not just IO time.
+            timing.values["observation_cache_age_ms"] = (selected_at - observation_completed) * 1000
+            timing.values["observation_age_ms"] = (selected_at - fresh_after) * 1000
             timing.values["observation_fresh_after_request_ms"] = (fresh_after - after) * 1000
             timing.values["camera_wait_wall_ms"] = (time.monotonic() - started) * 1000
             timing.values["observation_start_after_request_ms"] = (observation_started - after) * 1000
@@ -318,6 +349,7 @@ class FixedChunkRuntime:
                     "success": False, "safety_clip_steps": 0,
                     "workspace_violation": False, "workspace_error": None,
                     "execution_mode": "persistent_three_thread_fixed_chunk",
+                    "observation_selection": self.observation_selection,
                     "deadline_misses": 0, "max_lateness_ms": 0.0,
                     "max_command_interval_ms": 0.0, "warmup": self.warmup,
                     "control_source": "human" if self.human else "policy",
