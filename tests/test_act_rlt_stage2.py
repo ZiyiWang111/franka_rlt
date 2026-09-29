@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from scipy.spatial.transform import Rotation
 from torch import nn
 
 from act_rlt.act_encoder import (
@@ -566,7 +567,8 @@ def _threaded_env(config, *, camera_delay=.003, period=.02, refusal_at=None):
     return env
 
 
-def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner():
+@pytest.mark.parametrize("timestamped", [False, True])
+def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner(timestamped):
     from act_rlt.stage2_runtime import FixedChunkRuntime
     config = _config()
     env = _threaded_env(config)
@@ -581,6 +583,13 @@ def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner()
             torch.full((1, 4, 6), .1), torch.full((1, 16, 7), .1),
         )
     policy.encode_and_reference = encode
+    if timestamped:
+        from evo_rlt.adapters.lerobot.franka_robot.camera_timing import TimedObservation
+        def timed_observation():
+            observation = env.robot.get_observation()
+            return TimedObservation(observation, time.monotonic(),
+                                    {"camera_boundary_mode": "exposure_timestamp"})
+        env.robot.get_timed_observation = timed_observation
     with patch("act_rlt.stage2_runtime.observation_frame", side_effect=lambda obs: obs):
         runtime = FixedChunkRuntime(env, policy, {}, warmup=True, step_budget=12)
         try:
@@ -594,6 +603,14 @@ def test_persistent_workers_cross_chunk_boundaries_without_waiting_for_learner()
             assert tuple(runtime.threads) == workers
         finally:
             runtime.close()
+    import json
+    for result in (first, second, third):
+        json.dumps(result.info)  # Timing objects/events must not leak into JSONL.
+        assert result.info["next_boundary_total_wall_ms"] >= result.info["next_camera_wait_wall_ms"]
+        assert result.info["current_encode_wall_ms"] >= 0
+        assert result.info["send_action_wall_ms_sum"] >= 0
+    assert second.info["chunk_boundary_command_interval_ms"] > 0
+    assert third.info["result_queue_wait_wall_ms"] > 0
     assert len(calls) == 4  # initial state + one next state per chunk, no duplicates
     assert len(env.robot.sent_at) == 12
     torch.testing.assert_close(first.next_state_vec, second.state_vec)
@@ -1019,12 +1036,36 @@ def test_automatic_reset_retreat_and_workspace_sample() -> None:
     assert np.allclose(sampled[3:], measured[3:])
 
 
-def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch) -> None:
-    p0 = np.array([0.65, -0.10, 0.15, 0.1, 0.2, 0.3])
-    lower = np.array([0.62, -0.13, 0.13])
-    upper = np.array([0.68, -0.07, 0.18])
+@pytest.mark.parametrize("entrypoint", ["train", "infer"])
+def test_z_reset_xy_randomization_cli_is_opt_in(entrypoint) -> None:
+    if entrypoint == "train":
+        parser = build_parser()
+        validate = validate_args
+        base = ["--stage1-checkpoint", "/tmp/stage1", "--act-checkpoint", "/tmp/act", "--dry-run"]
+    else:
+        from act_rlt.infer_stage2 import build_parser as infer_parser, validate_args as infer_validate
+
+        parser = infer_parser()
+        validate = infer_validate
+        base = ["--checkpoint", "/tmp/stage2", "--dry-run"]
+    default = parser.parse_args(base + ["--z-insertion-mode"])
+    assert default.randomize_reset_xy is False
+    validate(parser, default)
+    enabled = parser.parse_args(base + ["--z-insertion-mode", "--randomize-reset-xy"])
+    assert enabled.randomize_reset_xy is True
+    validate(parser, enabled)
+    with pytest.raises(SystemExit):
+        validate(parser, parser.parse_args(base + ["--randomize-reset-xy"]))
+
+
+@pytest.mark.parametrize("randomize_xy", [False, True])
+def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch, randomize_xy) -> None:
+    p0 = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
+    lower = np.array([0.62, -0.13, 0.357])
+    upper = np.array([0.68, -0.07, 0.417])
     env = object.__new__(FrankaInsertionStage2Env)
     env.z_insertion_mode = True
+    env.randomize_reset_xy = randomize_xy
     env._reference_pose = None
     env._reset_orientation = None
     env._first_reset_move = True
@@ -1041,8 +1082,26 @@ def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch) -> Non
     target, _ = moves[0]
     assert abs(target[0] - p0[0]) <= 0.01
     assert abs(target[1] - p0[1]) <= 0.01
-    assert p0[2] <= target[2] <= p0[2] + 0.02
-    assert np.array_equal(target[3:], p0[3:])
+    if not randomize_xy:
+        np.testing.assert_array_equal(target[:2], p0[:2])
+    assert target[2] == 0.402
+    expected_rotation = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True)
+    np.testing.assert_allclose(Rotation.from_rotvec(target[3:]).as_matrix(), expected_rotation.as_matrix())
+    for z in (0.38, 0.40):
+        reference = p0.copy()
+        reference[2] = z
+        for _ in range(20):
+            sampled = sample_z_insertion_workspace_pose(reference, lower, upper, randomize_xy=randomize_xy)
+            assert abs(sampled[0] - reference[0]) <= 0.01
+            assert abs(sampled[1] - reference[1]) <= 0.01
+            assert sampled[2] == 0.402
+            if randomize_xy:
+                assert not np.array_equal(sampled[:2], reference[:2])
+            else:
+                np.testing.assert_array_equal(sampled[:2], reference[:2])
+            np.testing.assert_allclose(
+                Rotation.from_rotvec(sampled[3:]).as_matrix(), expected_rotation.as_matrix()
+            )
 
     env._retreat_after_outcome()
     retreat, label = moves[-1]
@@ -1050,7 +1109,7 @@ def test_z_insertion_reset_uses_confirmed_p0_and_retreats_up(monkeypatch) -> Non
     assert np.isclose(retreat[2], p0[2] + RESET_RETREAT_Z_M)
     assert np.array_equal(retreat[[0, 1, 3, 4, 5]], p0[[0, 1, 3, 4, 5]])
     with pytest.raises(ValueError, match="outside the safe workspace"):
-        sample_z_insertion_workspace_pose(p0, lower, np.array([0.66, -0.07, 0.16]))
+        sample_z_insertion_workspace_pose(p0, lower, np.array([0.66, -0.07, 0.401]))
 
 
 def test_workspace_center_is_sampled_when_enter_is_pressed(monkeypatch) -> None:

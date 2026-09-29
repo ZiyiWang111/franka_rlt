@@ -1,8 +1,11 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from act_rlt.data_collection import record_sample_space as collector
+from act_rlt.data_collection.sampling import insertion_pose_minus_z, sample_z_insertion_pose
 from act_rlt.data_collection.record_sample_space import (
     COMMAND_ACTION_KEY,
     COMMAND_ACTION_NAMES,
@@ -63,29 +66,123 @@ def test_single_camera_collection_modes_select_only_one_camera():
         ])
 
 
-def test_z_insertion_mode_is_an_explicit_opt_in():
-    args = build_parser().parse_args([
-        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--z-insertion-mode",
-    ])
+def test_z_insertion_is_the_default_collection_mode():
+    args = build_parser().parse_args(["--dataset", "test/act_rlt", "--root", "/tmp/act-rlt"])
     validate_args(args)
-    assert args.z_insertion_mode is True
     assert args.task is None
-    assert args.insert_minus_z is None
+    assert args.insert_minus_z == pytest.approx(0.01)
 
     custom_depth = build_parser().parse_args([
         "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
-        "--z-insertion-mode", "--insert-minus-z", "0.015",
+        "--insert-minus-z", "0.015",
     ])
     validate_args(custom_depth)
     assert custom_depth.insert_minus_z == pytest.approx(0.015)
 
 
-def test_rotation_is_an_explicit_opt_in():
-    args = build_parser().parse_args([
-        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--rotation",
+@pytest.mark.parametrize("removed_option", ["--z-insertion-mode", "--insert-minus-y"])
+def test_legacy_collection_mode_options_are_rejected(removed_option):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", removed_option,
+        ])
+
+
+def test_collection_returns_to_taught_orientation_before_insertion(monkeypatch):
+    taught = [0.561755, -0.225792, 0.387321, 0.1, 0.2, 0.3]
+    reference = taught.copy()
+    moves = []
+    saved = []
+    robot = SimpleNamespace(
+        is_connected=True,
+        connect=lambda: None,
+        get_observation=lambda: {},
+        disconnect=lambda: None,
+    )
+    dataset = SimpleNamespace(save_episode=lambda: saved.append(True))
+    recorder = SimpleNamespace(
+        start=lambda: None,
+        capture=lambda: None,
+        clear_command=lambda: None,
+        finish=lambda: 3,
+        abort_monitor=None,
+    )
+
+    def move_outside(_robot, target, **kwargs):
+        moves.append(("outside", target.copy()))
+        return True
+
+    def move_recorded(_recorder, target, **kwargs):
+        moves.append(("recorded", target.copy()))
+
+    monkeypatch.setattr(collector.sys, "argv", [
+        "record_sample_space.py", "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
+        "--episodes", "1", "--seed", "42",
     ])
-    validate_args(args)
-    assert args.rotation is True
+    monkeypatch.setattr(collector, "build_dataset_and_robot", lambda args: (dataset, robot, None, []))
+    monkeypatch.setattr(collector, "teach_reference", lambda robot: reference)
+    monkeypatch.setattr(collector, "EpisodeRecorder", lambda **kwargs: recorder)
+    monkeypatch.setattr(collector, "VideoEncodingManager", lambda dataset: nullcontext())
+    monkeypatch.setattr(collector, "EpisodeAbortMonitor", lambda key: nullcontext())
+    monkeypatch.setattr(collector, "robot_is_executable", lambda robot: True)
+    monkeypatch.setattr(collector, "nonrecorded_arm_move", move_outside)
+    monkeypatch.setattr(collector, "run_recorded_move", move_recorded)
+    monkeypatch.setattr(collector, "read_key_during_delay", lambda seconds: None)
+    monkeypatch.setattr(collector, "normalize_lerobot_scalar_buffer", lambda dataset: None)
+
+    assert collector.main() == 0
+    assert reference == taught
+    assert moves == [
+        ("outside", sample_z_insertion_pose(taught, np.random.default_rng(42))),
+        ("recorded", taught),
+        ("recorded", insertion_pose_minus_z(taught, 0.01)),
+        ("outside", taught),
+    ]
+    assert moves[0][1][3:] != taught[3:]
+    assert saved == [True]
+
+
+def test_non_execution_mode_returns_to_reference_teaching_once(monkeypatch, capsys):
+    first_reference = [0.5, -0.2, 0.38, 0.1, 0.2, 0.3]
+    second_reference = [0.51, -0.21, 0.39, 0.4, 0.5, 0.6]
+    taught_references = iter([first_reference, second_reference])
+    executable = iter([False, True])
+    saved = []
+    robot = SimpleNamespace(
+        is_connected=True,
+        connect=lambda: None,
+        get_observation=lambda: {},
+        disconnect=lambda: None,
+    )
+    dataset = SimpleNamespace(save_episode=lambda: saved.append(True))
+    recorder = SimpleNamespace(
+        start=lambda: None,
+        capture=lambda: None,
+        clear_command=lambda: None,
+        finish=lambda: 3,
+        abort_monitor=None,
+    )
+
+    monkeypatch.setattr(collector.sys, "argv", [
+        "record_sample_space.py", "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
+        "--episodes", "1", "--seed", "42",
+    ])
+    monkeypatch.setattr(collector, "build_dataset_and_robot", lambda args: (dataset, robot, None, []))
+    monkeypatch.setattr(collector, "teach_reference", lambda robot: next(taught_references))
+    monkeypatch.setattr(collector, "EpisodeRecorder", lambda **kwargs: recorder)
+    monkeypatch.setattr(collector, "VideoEncodingManager", lambda dataset: nullcontext())
+    monkeypatch.setattr(collector, "EpisodeAbortMonitor", lambda key: nullcontext())
+    monkeypatch.setattr(collector, "robot_is_executable", lambda robot: next(executable))
+    monkeypatch.setattr(collector, "nonrecorded_arm_move", lambda *args, **kwargs: True)
+    monkeypatch.setattr(collector, "run_recorded_move", lambda *args, **kwargs: None)
+    monkeypatch.setattr(collector, "read_key_during_delay", lambda seconds: None)
+    monkeypatch.setattr(collector, "normalize_lerobot_scalar_buffer", lambda dataset: None)
+
+    assert collector.main() == 0
+    assert saved == [True]
+    output = capsys.readouterr().out
+    assert "Waiting for Franka Execution mode" not in output
+    assert output.count("REFERENCE p0:") == 2
 
 
 def test_command_action_tracks_exact_waypoint_and_realigns_pending_frame():

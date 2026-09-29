@@ -25,13 +25,7 @@ MOVE_SPEED="${MOVE_SPEED:-0.02}"
 INSERTION_SPEED="${INSERTION_SPEED:-0.01}"
 PRE_EPISODE_SLEEP="${PRE_EPISODE_SLEEP:-1.0}"
 POST_EPISODE_SLEEP="${POST_EPISODE_SLEEP:-1.0}"
-X_HALF_RANGE="${X_HALF_RANGE:-0.01}"
-Y_RANGE="${Y_RANGE:-0.02}"
-Z_HALF_RANGE="${Z_HALF_RANGE:-0.01}"
-INSERT_MINUS_Y="${INSERT_MINUS_Y:-0.01}"
-INSERT_MINUS_Z="${INSERT_MINUS_Z:-}"
-Z_INSERTION_MODE="${Z_INSERTION_MODE:-false}"
-ROTATION="${ROTATION:-false}"
+INSERT_MINUS_Z="${INSERT_MINUS_Z:-0.01}"
 ABORT_KEY="${ABORT_KEY:-x}"
 SEED="${SEED:-}"
 RESUME="${RESUME:-false}"
@@ -60,13 +54,7 @@ Trajectory (metres, robot-base frame):
   --insertion-speed MPS   Reference->final speed (default: 0.01)
   --pre-episode-sleep SEC Delay after reaching sample (default: 1.0)
   --post-episode-sleep SEC Delay after saving episode (default: 1.0)
-  --x-half-range M        Sample x0 +/- range (default: 0.01)
-  --y-range M             Sample y0 through y0+range (default: 0.02)
-  --z-half-range M        Sample z0 +/- range (default: 0.01)
-  --insert-minus-y M      Recorded -Y advance (default: 0.01)
-  --insert-minus-z M      Recorded -Z advance in --z-insertion-mode (default: 0.01)
-  --z-insertion-mode      Record p0 -> p0-1cm(Z); sample X/Y +/-1cm and Z +0..2cm
-  --rotation              Randomize every sample's base-Z orientation by +/-5 degrees
+  --insert-minus-z M      Recorded -Z advance from p0 (default: 0.01)
   --abort-key KEY         Stop and discard active episode (default: x)
   --seed N                Optional reproducible sample sequence
 
@@ -84,13 +72,16 @@ Hardware/runtime:
 Workflow:
   1. Hand-guide to reference p0 and press ENTER once.
   2. The recorder samples and moves to a start pose outside the episode.
-  3. After 1.0 s it records sample -> p0 -> p0-1cm(Y) and saves automatically.
+  3. After 1.0 s it records sample -> p0 -> p0-1cm(Z) and saves automatically.
   4. After another 1.0 s it retreats to p0, moves to the next sample, and repeats.
 
-With --z-insertion-mode, step 3 is p0 -> p0-1cm(Z), step 4 returns +Z 1cm
-to p0, and samples use X/Y +/-1cm and Z from p0 through p0+2cm.
+Samples use x0 +/-2cm, y0+[1.5,2.5]cm, absolute z=402mm, and a fixed
+TCP XYZ Euler angle of [179.7, 1.4, 90.6] degrees.
+Reference p0, insertion, and retreat preserve the hand-taught TCP orientation.
+Moving to a sample changes to the fixed orientation; returning to p0 restores
+the taught orientation.
 
-No per-episode ENTER is required. During either 0.5 s transition window,
+No per-episode ENTER is required. During either 1.0 s transition window,
 1 moves to p0, 2 moves to the current sample, and Q quits; numeric keys pause
 automation until ENTER. Ctrl+C stops collection at any time.
 Inside an episode: X (or --abort-key) stops motion and discards the take.
@@ -114,13 +105,7 @@ while (($#)); do
         --insertion-speed) INSERTION_SPEED="${2:?--insertion-speed requires a value}"; shift 2 ;;
         --pre-episode-sleep) PRE_EPISODE_SLEEP="${2:?--pre-episode-sleep requires a value}"; shift 2 ;;
         --post-episode-sleep) POST_EPISODE_SLEEP="${2:?--post-episode-sleep requires a value}"; shift 2 ;;
-        --x-half-range) X_HALF_RANGE="${2:?--x-half-range requires a value}"; shift 2 ;;
-        --y-range) Y_RANGE="${2:?--y-range requires a value}"; shift 2 ;;
-        --z-half-range) Z_HALF_RANGE="${2:?--z-half-range requires a value}"; shift 2 ;;
-        --insert-minus-y) INSERT_MINUS_Y="${2:?--insert-minus-y requires a value}"; shift 2 ;;
         --insert-minus-z) INSERT_MINUS_Z="${2:?--insert-minus-z requires a value}"; shift 2 ;;
-        --z-insertion-mode) Z_INSERTION_MODE=true; shift ;;
-        --rotation) ROTATION=true; shift ;;
         --abort-key) ABORT_KEY="${2:?--abort-key requires a value}"; shift 2 ;;
         --seed) SEED="${2:?--seed requires a value}"; shift 2 ;;
         --resume) RESUME=true; shift ;;
@@ -157,22 +142,14 @@ for pair in \
     "insertion-speed:${INSERTION_SPEED}" \
     "pre-episode-sleep:${PRE_EPISODE_SLEEP}" \
     "post-episode-sleep:${POST_EPISODE_SLEEP}" \
-    "x-half-range:${X_HALF_RANGE}" \
-    "y-range:${Y_RANGE}" \
-    "z-half-range:${Z_HALF_RANGE}" \
-    "insert-minus-y:${INSERT_MINUS_Y}"; do
+    "insert-minus-z:${INSERT_MINUS_Z}"; do
     name="${pair%%:*}"
     value="${pair#*:}"
     is_positive_number "$value" || die "--${name} must be positive"
 done
-if [[ -n "$INSERT_MINUS_Z" ]]; then
-    is_positive_number "$INSERT_MINUS_Z" || die "--insert-minus-z must be positive"
-fi
 [[ ${#ABORT_KEY} -eq 1 ]] || die "--abort-key must be exactly one character"
 [[ -z "$SEED" || "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 [[ "$RESUME" == true || "$RESUME" == false ]] || die "RESUME must be true or false"
-[[ "$Z_INSERTION_MODE" == true || "$Z_INSERTION_MODE" == false ]] || die "Z_INSERTION_MODE must be true or false"
-[[ "$ROTATION" == true || "$ROTATION" == false ]] || die "ROTATION must be true or false"
 [[ -x "$COLLECT_PYTHON" ]] || die "collection Python is not executable: $COLLECT_PYTHON"
 [[ -x "$CONTROL_PYTHON" ]] || die "control-server Python is not executable: $CONTROL_PYTHON"
 [[ -f "$CONTROL_SERVER_SCRIPT" ]] || die "control-server launcher not found: $CONTROL_SERVER_SCRIPT"
@@ -227,20 +204,12 @@ case "$CAMERA_MODE" in
     front) echo "  cameras=front only (640x480@30Hz)" ;;
     both) echo "  cameras=wrist + front (each 640x480@30Hz)" ;;
 esac
-if [[ "$Z_INSERTION_MODE" == true ]]; then
-    echo "  z-insertion mode: sample x=+/-${X_HALF_RANGE}m, y=+/-${X_HALF_RANGE}m, z=[0,+${Y_RANGE}]m from p0"
-    Z_DEPTH="${INSERT_MINUS_Z:-$INSERT_MINUS_Y}"
-    echo "  final=-Z ${Z_DEPTH}m; non-recorded retreat=+Z ${Z_DEPTH}m"
-else
-    echo "  sample x=+/-${X_HALF_RANGE}m, y=[0,+${Y_RANGE}]m, z=+/-${Z_HALF_RANGE}m from p0"
-    echo "  final=-Y ${INSERT_MINUS_Y}m, abort_key=${ABORT_KEY}"
-fi
+echo "  sample x=+/-0.020m, y=[+0.015,+0.025]m from p0, z=0.402m"
+echo "  sampled TCP orientation=XYZ Euler (179.7, 1.4, 90.6) deg"
+echo "  final=-Z ${INSERT_MINUS_Z}m; non-recorded retreat=+Z ${INSERT_MINUS_Z}m"
 echo "  move_speed=${MOVE_SPEED}m/s, insertion_speed=${INSERTION_SPEED}m/s"
 echo "  pre_episode_sleep=${PRE_EPISODE_SLEEP}s, post_episode_sleep=${POST_EPISODE_SLEEP}s"
 echo "  abort_key=${ABORT_KEY}"
-if [[ "$ROTATION" == true ]]; then
-    echo "  sampled orientation: base-Z yaw +/-5 deg"
-fi
 
 CONTROL_PID_FILE="$(mktemp /tmp/act-rlt-control-server.XXXXXX.pid)"
 echo "Starting a fresh Evo-RLT control server ..."
@@ -281,10 +250,7 @@ RECORDER_ARGS=(
     --insertion-speed "$INSERTION_SPEED"
     --pre-episode-sleep "$PRE_EPISODE_SLEEP"
     --post-episode-sleep "$POST_EPISODE_SLEEP"
-    --x-half-range "$X_HALF_RANGE"
-    --y-range "$Y_RANGE"
-    --z-half-range "$Z_HALF_RANGE"
-    --insert-minus-y "$INSERT_MINUS_Y"
+    --insert-minus-z "$INSERT_MINUS_Z"
     --abort-key "$ABORT_KEY"
 )
 if [[ "$CAMERA_MODE" == wrist ]]; then
@@ -294,15 +260,6 @@ elif [[ "$CAMERA_MODE" == front ]]; then
 fi
 if [[ -n "$TASK" ]]; then
     RECORDER_ARGS+=(--task "$TASK")
-fi
-if [[ "$Z_INSERTION_MODE" == true ]]; then
-    RECORDER_ARGS+=(--z-insertion-mode)
-fi
-if [[ "$ROTATION" == true ]]; then
-    RECORDER_ARGS+=(--rotation)
-fi
-if [[ -n "$INSERT_MINUS_Z" ]]; then
-    RECORDER_ARGS+=(--insert-minus-z "$INSERT_MINUS_Z")
 fi
 if [[ -n "$SEED" ]]; then
     RECORDER_ARGS+=(--seed "$SEED")

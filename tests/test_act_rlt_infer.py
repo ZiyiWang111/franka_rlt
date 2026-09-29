@@ -1,5 +1,7 @@
+import gc
 import json
 import numpy as np
+from scipy.spatial.transform import Rotation
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +95,18 @@ def test_fps_cli_accepts_30_and_rejects_faster_camera_rate():
         validate_args(parser, invalid)
 
 
+def test_automatic_episodes_require_dry_run():
+    parser = build_parser()
+    args = parser.parse_args([
+        "--checkpoint", "model", "--dry-run", "--dry-run-episodes", "8", "--profile-timing",
+    ])
+    validate_args(parser, args)
+    assert args.dry_run_episodes == 8 and args.profile_timing
+    for extra in (["--dry-run-episodes", "8"], ["--dry-run", "--dry-run-episodes", "0"]):
+        with TestCase().assertRaises(SystemExit):
+            validate_args(parser, parser.parse_args(["--checkpoint", "model", *extra]))
+
+
 def test_motion_cli_uses_confirmed_center_instead_of_workspace_arguments():
     parser = build_parser()
     validate_args(parser, parser.parse_args(["--checkpoint", "model"]))
@@ -100,20 +114,20 @@ def test_motion_cli_uses_confirmed_center_instead_of_workspace_arguments():
         parser.parse_args(["--checkpoint", "model", "--workspace-min", "0", "0", "0"])
 
 
-def test_centered_sample_and_workspace_offsets():
+def test_centered_xy_with_fixed_absolute_sample_and_workspace_z():
     pose = [0.4, -0.2, 0.3, 1, 2, 3]
     sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
-    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.295])
-    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.305])
-    np.testing.assert_allclose(workspace_min, [0.3, -0.3, 0.27])
-    np.testing.assert_allclose(workspace_max, [0.5, -0.1, 0.31])
-    sampled = sample_workspace_pose(
-        sample_min, sample_max, [1, 2, 3],
-        0.0, np.random.default_rng(0),
-    )
-    assert np.all(sampled[:3] >= sample_min)
-    assert np.all(sampled[:3] <= sample_max)
-    np.testing.assert_allclose(sampled[3:], [1, 2, 3])
+    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.402])
+    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.402])
+    np.testing.assert_allclose(workspace_min, [-np.inf, -np.inf, 0.367])
+    np.testing.assert_allclose(workspace_max, [np.inf, np.inf, 0.412])
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        sampled = sample_workspace_pose(sample_min, sample_max, [1, 2, 3], 0.0, rng)
+        assert np.all(sampled[:3] >= sample_min)
+        assert np.all(sampled[:3] <= sample_max)
+        assert sampled[2] == 0.402
+        np.testing.assert_allclose(sampled[3:], [1, 2, 3])
     with TestCase().assertRaisesRegex(ValueError, "invalid measured TCP pose"):
         centered_bounds([0, 0, float("nan"), 0, 0, 0])
 
@@ -154,14 +168,15 @@ def test_confirm_centered_bounds_only_enables_limits_after_enter():
 
     with patch("builtins.input", return_value=""):
         sample_min, sample_max, orientation = confirm_centered_bounds(robot)
-    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.295])
-    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.305])
-    np.testing.assert_allclose(orientation, [1, 2, 3])
-    np.testing.assert_allclose(config.workspace_min_xyz, [0.3, -0.3, 0.27])
-    np.testing.assert_allclose(config.workspace_max_xyz, [0.5, -0.1, 0.31])
+    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.402])
+    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.402])
+    expected_rotation = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True)
+    np.testing.assert_allclose(Rotation.from_rotvec(orientation).as_matrix(), expected_rotation.as_matrix())
+    np.testing.assert_allclose(config.workspace_min_xyz, [-np.inf, -np.inf, 0.367])
+    np.testing.assert_allclose(config.workspace_max_xyz, [np.inf, np.inf, 0.412])
 
 
-def test_enter_captures_latest_tcp_pose_including_orientation():
+def test_enter_captures_latest_xy_but_samples_use_fixed_collection_z_and_orientation():
     config = SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None)
     poses = iter([
         [0.4, -0.2, 0.3, 1, 2, 3],  # preview before Enter
@@ -170,11 +185,20 @@ def test_enter_captures_latest_tcp_pose_including_orientation():
     robot = SimpleNamespace(config=config, robot=SimpleNamespace(get_tool_pose=lambda: next(poses)))
     with patch("builtins.input", return_value=""):
         sample_min, sample_max, orientation = confirm_centered_bounds(robot)
-    np.testing.assert_allclose(sample_min, [0.48, -0.12, 0.395])
-    np.testing.assert_allclose(sample_max, [0.52, -0.08, 0.405])
-    np.testing.assert_allclose(orientation, [4, 5, 6])
-    np.testing.assert_allclose(config.workspace_min_xyz, [0.4, -0.2, 0.37])
-    np.testing.assert_allclose(config.workspace_max_xyz, [0.6, 0, 0.41])
+    np.testing.assert_allclose(sample_min, [0.48, -0.12, 0.402])
+    np.testing.assert_allclose(sample_max, [0.52, -0.08, 0.402])
+    expected_rotation = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True)
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        sampled = sample_workspace_pose(sample_min, sample_max, orientation, 0.0, rng)
+        assert np.all(sampled[:2] >= sample_min[:2])
+        assert np.all(sampled[:2] <= sample_max[:2])
+        assert sampled[2] == 0.402
+        np.testing.assert_allclose(
+            Rotation.from_rotvec(sampled[3:]).as_matrix(), expected_rotation.as_matrix()
+        )
+    np.testing.assert_allclose(config.workspace_min_xyz, [-np.inf, -np.inf, 0.367])
+    np.testing.assert_allclose(config.workspace_max_xyz, [np.inf, np.inf, 0.412])
 
 
 def test_reset_orientation_is_not_a_cli_argument():
@@ -467,6 +491,33 @@ def test_franka_residual_target_uses_offset_and_preserves_workspace_guard():
     assert len(sent) == 2
 
 
+def test_infer_workspace_allows_far_xy_but_rejects_z_outside_bounds():
+    from evo_rlt.adapters.lerobot.franka_robot.franka_robot import FrankaRobot
+
+    _, _, lower, upper = centered_bounds([0.4, -0.2, 0.402, 0, 0, 0])
+    sent = []
+    robot = SimpleNamespace(
+        robot=SimpleNamespace(
+            get_tool_pose=lambda: [0.8, 0.3, 0.402, 0, 0, 0],
+            servo_tool=lambda pose: sent.append(pose),
+        ),
+        config=SimpleNamespace(workspace_min_xyz=tuple(lower), workspace_max_xyz=tuple(upper)),
+        _cmd_pose=None,
+    )
+    FrankaRobot.send_action(robot, _xyz_action(dx=0.001, dy=0.001))
+    np.testing.assert_allclose(sent[-1][:3], [0.801, 0.301, 0.402])
+    robot.robot.get_tool_pose = lambda: [0.8, 0.3, 0.369, 0, 0, 0]
+    robot._cmd_pose = None
+    FrankaRobot.send_action(robot, _xyz_action())
+    np.testing.assert_allclose(sent[-1][:3], [0.8, 0.3, 0.369])
+    for z in (0.366, 0.413):
+        robot.robot.get_tool_pose = lambda z=z: [0.8, 0.3, z, 0, 0, 0]
+        robot._cmd_pose = None
+        with TestCase().assertRaisesRegex(RuntimeError, "outside workspace"):
+            FrankaRobot.send_action(robot, _xyz_action())
+    assert len(sent) == 2
+
+
 def test_temporal_ensemble_uses_paper_log_weights_for_same_timestep():
     ensembler = TemporalActionEnsembler(chunk_size=3, coefficient=np.log(2))
     oldest = np.zeros((3, 7), dtype=float)
@@ -504,8 +555,11 @@ def test_temporal_ensemble_pipeline_keeps_using_overlapping_chunks():
 
 def test_full_trace_records_every_step_chunks_and_tcp_targets(tmp_path):
     robot = _FakeRobot()
+    _, _, lower, upper = centered_bounds([0.4, -0.2, 0.402, 0, 0, 0])
+    robot.config = SimpleNamespace(workspace_min_xyz=tuple(lower), workspace_max_xyz=tuple(upper))
     policy = _FakePolicy(n_action_steps=4, chunk_size=4)
     args = _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=0.01)
+    args.profile_timing = True
     args.log_dir = tmp_path
     args.checkpoint = Path("test-checkpoint")
 
@@ -520,10 +574,15 @@ def test_full_trace_records_every_step_chunks_and_tcp_targets(tmp_path):
     events = [json.loads(line) for line in paths[0].read_text().splitlines()]
     assert events[0]["event"] == "episode_start"
     assert events[0]["episode_index"] == 6
+    assert events[0]["workspace_min_xyz"] == [None, None, 0.367]
+    np.testing.assert_allclose(events[0]["workspace_max_xyz"][2], 0.412)
+    assert events[0]["workspace_max_xyz"][:2] == [None, None]
     assert events[-1]["event"] == "episode_end"
     chunks = [event for event in events if event["event"] == "model_chunk"]
     steps = [event for event in events if event["event"] == "control_step"]
     assert chunks and all(len(event["actions"]) == 4 for event in chunks)
+    assert all("policy_first" in event["phase_timings"] for event in chunks)
+    assert all(event["policy_cuda_elapsed_ms"] is None for event in chunks)
     assert len(steps) == len(robot.sent_at) == events[-1]["stats"]["ticks"]
     assert [event["step"] for event in steps] == list(range(len(steps)))
     assert all(event["ensemble_votes"] >= 1 for event in steps)
@@ -612,6 +671,52 @@ def test_action_queue_underrun_stops_instead_of_repeating_delta():
 
     assert len(robot.sent_at) == 1
     assert robot.stop_calls == 1
+
+
+def test_profiled_dry_run_identifies_gc_and_slow_phase_without_motion(tmp_path):
+    callbacks_before = list(gc.callbacks)
+    robot = _FakeRobot()
+    args = _threaded_args(duration=0.32, dry_run=True, fps=30)
+    args.profile_timing = True
+    args.log_dir = tmp_path
+    policy = _FakePolicy(n_action_steps=1, slow_calls={2: 0.12})
+
+    def pre(frame):
+        gc.collect(0)
+        return frame
+
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        run_inference_episode(robot, policy, pre, lambda action: action, args, _FakeTorch)
+
+    assert gc.callbacks == callbacks_before
+    assert robot.sent_at == [] and robot.stop_calls == 0
+    path, = tmp_path.glob("*.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    chunks = [row for row in events if row["event"] == "model_chunk"]
+    slow = next(row for row in chunks if row["chunk_index"] == 1)
+    assert slow["phase_timings"]["policy_first"]["wall_s"] >= 0.12
+    assert slow["phase_timings"]["policy_first"]["thread_cpu_s"] < 0.08
+    assert slow["policy_cuda_elapsed_ms"] is None
+    assert any(row["event"] == "gc_pause" and row["inference_phase"] == "preprocess"
+               for row in events)
+    assert any(row["event"] == "chunk_enqueued" for row in events)
+    assert any(row["event"] == "refill_requested" for row in events)
+    assert any(row["event"] == "queue_underrun" for row in events)
+    assert events[-1]["stats"]["queue_underruns"] > 0
+
+
+def test_profile_gc_callback_is_removed_when_inference_fails(tmp_path):
+    callbacks_before = list(gc.callbacks)
+    args = _threaded_args()
+    args.profile_timing = True
+    args.log_dir = tmp_path
+    with patch("act_rlt.infer.observation_frame", side_effect=ValueError("bad image")):
+        with TestCase().assertRaisesRegex(ValueError, "bad image"):
+            run_inference_episode(
+                _FakeRobot(), _FakePolicy(4), lambda frame: frame, lambda action: action,
+                args, _FakeTorch,
+            )
+    assert gc.callbacks == callbacks_before
 
 
 def test_30_hz_servo_timing_with_prepared_action_chunk():

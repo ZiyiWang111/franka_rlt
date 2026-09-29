@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from lerobot.robots.robot import Robot
 
 from .configuration_franka import FrankaRobotConfig
+from .camera_timing import ExposureClock, TimedObservation
 
 # Steady-state: if a camera delivers no new frame for this long, treat it as
 # stalled (recorder aborts the take instead of writing stale/frozen frames).
@@ -64,6 +65,9 @@ class FrankaRobot(Robot):
         self._connected = False
         self._cmd_pose = None
         self._has_gripper = None  # cached from control-server RPC on first observation
+        self._timestamped_observations = False
+        self._exposure_clocks = {}
+        self._timing_status = None
         # LeRobot record backend expects a `cameras` attribute (e.g. for image
         # writer thread count). The wrist RealSense is managed internally.
         self.cameras = {}
@@ -150,7 +154,14 @@ class FrankaRobot(Robot):
         self.robot.connect()
         try:
             for name, pipeline in self._cam_streams.items():
-                pipeline.start(self.camera_cfg if name == "wrist" else self.front_camera_cfg)
+                profile = pipeline.start(self.camera_cfg if name == "wrist" else self.front_camera_cfg)
+                if self._timestamped_observations:
+                    for sensor in profile.get_device().query_sensors():
+                        try:
+                            if sensor.supports(rs.option.global_time_enabled):
+                                sensor.set_option(rs.option.global_time_enabled, 1.0)
+                        except (RuntimeError, AttributeError) as error:
+                            logging.warning("%s global camera time unavailable: %s", name, error)
             # Warm both pipelines; a camera that cannot deliver its first frames is
             # a startup failure (raise), not a silent mid-take surprise.
             for _ in range(CAM_WARMUP_FRAMES):
@@ -237,10 +248,10 @@ class FrankaRobot(Robot):
         except Exception:  # noqa: BLE001 - a renewal glitch must never kill the thread
             pass
 
-    def get_observation(self):
-        q = self.robot.get_joint_angles()
-        dq = self.robot.get_joint_speeds()
-        pose = self.robot.get_tool_pose()
+    def _proprio_observation(self, snapshot=None):
+        q = self.robot.get_joint_angles() if snapshot is None else snapshot["joints"]
+        dq = self.robot.get_joint_speeds() if snapshot is None else snapshot["joint_speeds"]
+        pose = self.robot.get_tool_pose() if snapshot is None else snapshot["pose"]
 
         # Query once whether a Hand is attached. Width/grasped then come from the
         # control-server PUSH snapshot, so a native async Hand command cannot
@@ -248,8 +259,12 @@ class FrankaRobot(Robot):
         if self._has_gripper is None:
             self._has_gripper = self.robot.has_gripper()
         if self._has_gripper:
-            gripper_width = float(self.robot.get_gripper_width())
-            gripper_grasped = 1.0 if self.robot.is_grasped() else 0.0
+            if snapshot is None:
+                gripper_width = float(self.robot.get_gripper_width())
+                gripper_grasped = 1.0 if self.robot.is_grasped() else 0.0
+            else:
+                gripper_width = float(snapshot["gripper_motion"]["width"])
+                gripper_grasped = float(bool(snapshot["gripper_motion"]["grasped"]))
         else:
             gripper_width = 0.0
             gripper_grasped = 0.0
@@ -266,17 +281,116 @@ class FrankaRobot(Robot):
             "gripper_width": gripper_width,
             "gripper_grasped": gripper_grasped,
         }
+        return observation
+
+    def _image_observation(self, timing=None):
+        observation = {}
         if self.config.enable_wrist_camera:
             frames = self._read_camera_frame("wrist")
+            if timing is not None:
+                timing["wrist"] = self._exposure_time("wrist", frames.get_color_frame())
             observation["wrist"] = np.asanyarray(frames.get_color_frame().get_data())
         if self.config.enable_front_camera:
             front_frames = self._read_camera_frame("front")
+            if timing is not None:
+                timing["front"] = self._exposure_time("front", front_frames.get_color_frame())
             front_full = np.asanyarray(front_frames.get_color_frame().get_data())
             if front_full.shape[:2] == (480, 640):
                 observation["front"] = front_full
             else:
                 observation["front"] = cv2.resize(front_full, (640, 480), interpolation=cv2.INTER_AREA)
         return observation
+
+    def get_observation(self):
+        observation = self._proprio_observation()
+        observation.update(self._image_observation())
+        return observation
+
+    def enable_timestamped_observations(self):
+        """Opt in before connect; only Stage-2 training enables this path."""
+        if self._connected:
+            raise RuntimeError("enable camera timestamps before connecting")
+        self._timestamped_observations = True
+        self._exposure_clocks = {name: ExposureClock() for name in self._cam_streams}
+
+    def _exposure_time(self, name, frame):
+        clock = self._exposure_clocks[name]
+        mono_before = time.monotonic()
+        wall = time.time()
+        mono = time.monotonic()
+        if mono - mono_before > 0.001:
+            return clock.invalidate("host_clock_sample_delayed")
+        try:
+            domain = str(frame.get_frame_timestamp_domain()).rsplit(".", 1)[-1]
+            if domain != "global_time":
+                return clock.invalidate("timestamp_domain_" + domain)
+            keys = (rs.frame_metadata_value.frame_timestamp,
+                    rs.frame_metadata_value.sensor_timestamp,
+                    rs.frame_metadata_value.actual_exposure)
+            if not all(frame.supports_frame_metadata(key) for key in keys):
+                return clock.invalidate("missing_exposure_metadata")
+            return clock.convert(
+                domain=domain, timestamp_ms=frame.get_timestamp(),
+                frame_us=frame.get_frame_metadata(keys[0]),
+                sensor_us=frame.get_frame_metadata(keys[1]),
+                exposure_us=frame.get_frame_metadata(keys[2]),
+                number=frame.get_frame_number(), wall_s=wall,
+                monotonic_s=(mono_before + mono) / 2,
+            )
+        except (RuntimeError, ValueError, AttributeError) as error:
+            return clock.invalidate("timestamp_read_error:" + type(error).__name__)
+
+    def get_timed_observation(self):
+        """Images with exposure freshness and a nearby coherent state snapshot.
+
+        Unverifiable timing returns the original pre-image state and call-start
+        freshness. The collector then uses its original boundary wait rule.
+        """
+        started = time.monotonic()
+        if not self._timestamped_observations:
+            return TimedObservation(self.get_observation(), started,
+                                    {"camera_boundary_mode": "legacy",
+                                     "camera_boundary_fallback_reason": "disabled"})
+        observation = self._proprio_observation()
+        timing = {}
+        observation.update(self._image_observation(timing))
+        reasons = {name: reason for name, (_, reason) in timing.items() if reason}
+        diagnostics = {"camera_boundary_mode": "legacy_fallback"}
+        fresh_after = started
+        if not reasons:
+            exposure_starts = [value[0][0] for value in timing.values()]
+            midpoints = [value[0][1] for value in timing.values()]
+            spread = max(midpoints) - min(midpoints)
+            diagnostics["camera_frame_spread_ms"] = spread * 1000
+            target = (min(midpoints) + max(midpoints)) / 2
+            snapshot = self.robot.get_state_near(target)
+            if spread > 1 / 30:
+                reasons["alignment"] = "camera_frames_too_far_apart"
+            elif snapshot is None:
+                reasons["alignment"] = "no_local_state_within_20ms"
+            elif not all(key in snapshot for key in ("joints", "joint_speeds", "pose")):
+                reasons["alignment"] = "incomplete_state_snapshot"
+            elif self._has_gripper and any(
+                snapshot.get("gripper_motion", {}).get(key) is None for key in ("width", "grasped")
+            ):
+                reasons["alignment"] = "incomplete_gripper_snapshot"
+            else:
+                observation.update(self._proprio_observation(snapshot))
+                fresh_after = min(min(exposure_starts), snapshot["ts"])
+                diagnostics.update(
+                    camera_boundary_mode="exposure_timestamp",
+                    camera_exposure_midpoint_monotonic_s=target,
+                    camera_state_skew_ms=(snapshot["ts"] - target) * 1000,
+                    camera_frame_age_ms=(time.monotonic() - target) * 1000,
+                    camera_timestamp_margin_ms=ExposureClock.MARGIN_S * 1000,
+                )
+        reason = ";".join(f"{name}:{value}" for name, value in reasons.items()) or None
+        diagnostics["camera_boundary_fallback_reason"] = reason
+        status = (diagnostics["camera_boundary_mode"], reason)
+        if status != self._timing_status:
+            logging.info("Stage-2 camera boundary mode=%s reason=%s", *status)
+            self._timing_status = status
+        return TimedObservation(observation, fresh_after, diagnostics)
 
     # -- collection health (camera + control-server liveness) ---------------
     def _read_camera_frame(self, camera: str, timeout_ms: int = CAM_FRAME_TIMEOUT_MS):

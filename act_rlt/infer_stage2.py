@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wrist-camera", default="349622072679")
     parser.add_argument("--front-camera", default="233522075778")
     parser.add_argument("--z-insertion-mode", action="store_true")
+    parser.add_argument(
+        "--randomize-reset-xy", action="store_true",
+        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p0 (default: fixed p0 XY)",
+    )
     parser.add_argument("--workspace-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--sample-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
@@ -44,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.randomize_reset_xy and not args.z_insertion_mode:
+        parser.error("--randomize-reset-xy requires --z-insertion-mode")
     if args.episodes <= 0 or not math.isfinite(args.episode_time) or args.episode_time <= 0:
         parser.error("--episodes and --episode-time must be positive")
     if args.fps is None:
@@ -174,7 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         robot.connect()
         reference_pose = None
         if args.z_insertion_mode:
-            reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot)
+            reference_pose, workspace_min, workspace_max = capture_centered_workspace(
+                robot, randomize_xy=args.randomize_reset_xy
+            )
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
         env = FrankaInsertionStage2Env(
@@ -183,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             max_step_m=config.max_step_m, max_step_rad=config.max_step_rad,
             camera_shapes=camera_shapes, z_insertion_mode=args.z_insertion_mode,
             reference_pose=reference_pose,
+            randomize_reset_xy=args.randomize_reset_xy,
             sample_min=None if args.sample_min is None else tuple(args.sample_min),
             sample_max=None if args.sample_max is None else tuple(args.sample_max),
         )

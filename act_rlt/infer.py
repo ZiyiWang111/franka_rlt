@@ -13,6 +13,12 @@ from uuid import uuid4
 
 import numpy as np
 
+from act_rlt.data_collection.sampling import (
+    SAMPLE_EULER_XYZ_DEG,
+    SAMPLE_ROTATION_VECTOR,
+    SAMPLE_Z_M,
+)
+
 
 ACTION_KEYS = ("dx", "dy", "dz", "drx", "dry", "drz")
 DEFAULT_RESET_SPEED_M_S = 0.02
@@ -24,10 +30,10 @@ RESIDUAL_LIMIT_M = 0.0003
 Z_STALL_WINDOW_S = 0.25
 Z_STALL_MIN_COMMAND_M = 0.0002
 Z_STALL_MAX_PROGRESS_M = 0.00005
-SAMPLE_LOWER_OFFSET_M = np.array([-0.02, -0.02, -0.005], dtype=float)
-SAMPLE_UPPER_OFFSET_M = np.array([0.02, 0.02, 0.005], dtype=float)
-WORKSPACE_LOWER_OFFSET_M = np.array([-0.10, -0.10, -0.03], dtype=float)
-WORKSPACE_UPPER_OFFSET_M = np.array([0.10, 0.10, 0.01], dtype=float)
+SAMPLE_LOWER_OFFSET_M = np.array([-0.02, -0.02, 0.0], dtype=float)
+SAMPLE_UPPER_OFFSET_M = np.array([0.02, 0.02, 0.0], dtype=float)
+WORKSPACE_LOWER_OFFSET_M = np.array([-np.inf, -np.inf, -0.035], dtype=float)
+WORKSPACE_UPPER_OFFSET_M = np.array([np.inf, np.inf, 0.01], dtype=float)
 
 
 @dataclass(frozen=True)
@@ -248,7 +254,7 @@ def bounded_action(values, max_translation, max_rotation):
 
 
 def sample_workspace_pose(workspace_min, workspace_max, orientation, xy_padding, rng):
-    """Sample XYZ inside the workspace, with padding on X/Y and fixed rotvec orientation."""
+    """Sample XYZ with optional fixed Z, XY padding, and fixed rotvec orientation."""
     lower = np.asarray(workspace_min, dtype=float)
     upper = np.asarray(workspace_max, dtype=float)
     orientation = np.asarray(orientation, dtype=float)
@@ -256,8 +262,8 @@ def sample_workspace_pose(workspace_min, workspace_max, orientation, xy_padding,
         raise ValueError("workspace bounds and reset orientation must be 3D")
     if not np.isfinite(np.concatenate([lower, upper, orientation])).all():
         raise ValueError("workspace bounds and reset orientation must be finite")
-    if np.any(lower >= upper):
-        raise ValueError("workspace min must be smaller than workspace max")
+    if np.any(lower[:2] >= upper[:2]) or lower[2] > upper[2]:
+        raise ValueError("workspace min must be smaller than max in XY and no greater in Z")
     if not np.isfinite(xy_padding) or xy_padding < 0:
         raise ValueError("reset XY padding must be finite and non-negative")
     sample_lower = lower.copy()
@@ -273,11 +279,12 @@ def sample_workspace_pose(workspace_min, workspace_max, orientation, xy_padding,
 
 
 def centered_bounds(measured_pose):
-    """Return sample and workspace XYZ bounds around a measured base-frame TCP pose."""
+    """Sample around measured XY at fixed Z; constrain workspace Z only."""
     pose = np.asarray(measured_pose, dtype=float)
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise ValueError(f"invalid measured TCP pose: {pose}")
-    center = pose[:3]
+    center = pose[:3].copy()
+    center[2] = SAMPLE_Z_M
     return (
         center + SAMPLE_LOWER_OFFSET_M,
         center + SAMPLE_UPPER_OFFSET_M,
@@ -287,16 +294,19 @@ def centered_bounds(measured_pose):
 
 
 def confirm_centered_bounds(robot):
-    """Capture the TCP pose at Enter, then enable its centered workspace."""
+    """Capture TCP XY at Enter; use the recorder's fixed sample Z and orientation."""
     while True:
         pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
         sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
-        print(f"Current TCP center XYZ (base frame, m): {format_pose(pose[:3])}", flush=True)
+        print(f"Current measured TCP XYZ (base frame, m): {format_pose(pose[:3])}", flush=True)
+        print(f"Fixed sample Z (base frame, m): {SAMPLE_Z_M:.6f}", flush=True)
         print(f"Current TCP orientation (rotation vector, rad): {format_pose(pose[3:])}", flush=True)
+        print(f"Fixed sample orientation (intrinsic XYZ Euler, deg): {SAMPLE_EULER_XYZ_DEG}", flush=True)
+        print(f"Fixed sample orientation (rotation vector, rad): {format_pose(SAMPLE_ROTATION_VECTOR)}", flush=True)
         print(f"Sample XYZ min/max (m): {format_pose(sample_min)} / {format_pose(sample_max)}", flush=True)
         print(f"Workspace XYZ min/max (m): {format_pose(workspace_min)} / {format_pose(workspace_max)}", flush=True)
         decision = prompt_choice(
-            "[Enter]=confirm current center, r=refresh measured pose, q=quit: ",
+            "[Enter]=confirm current XY center and fixed sample pose, r=refresh measured pose, q=quit: ",
             {"": "confirm", "r": "refresh", "q": "quit"},
         )
         if decision == "quit":
@@ -310,7 +320,7 @@ def confirm_centered_bounds(robot):
             print(f"Confirmed workspace XYZ min/max (m): {format_pose(workspace_min)} / {format_pose(workspace_max)}", flush=True)
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
-            return sample_min, sample_max, pose[3:].copy()
+            return sample_min, sample_max, np.asarray(SAMPLE_ROTATION_VECTOR, dtype=float).copy()
 
 
 def format_pose(pose):
@@ -383,6 +393,14 @@ def build_parser():
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--dry-run-episodes", type=int, metavar="N",
+        help="run N dry-run episodes automatically in one process, then exit",
+    )
+    parser.add_argument(
+        "--profile-timing", action="store_true",
+        help="log inference phases, CPU/CUDA timing, GC pauses and queue refill events",
+    )
+    parser.add_argument(
         "--log-dir", type=Path, default=Path("logs/act_rlt_infer"),
         help="directory for per-episode, per-step JSONL traces (default: logs/act_rlt_infer)",
     )
@@ -397,6 +415,9 @@ def build_parser():
 
 
 def validate_args(parser, args):
+    if args.dry_run_episodes is not None:
+        if not args.dry_run or args.dry_run_episodes < 1:
+            parser.error("dry-run-episodes requires --dry-run and a positive episode count")
     if not all(np.isfinite(x) and x > 0 for x in (args.duration, args.max_step_m, args.max_step_rad)):
         parser.error("duration and step limits must be finite and positive")
     if not np.isfinite(args.fps) or args.fps <= 0 or args.fps > 30:
@@ -409,21 +430,37 @@ def validate_args(parser, args):
         parser.error("temporal-ensemble-coeff must be finite and non-negative")
 
 
-def _predict_action_chunk(policy, pre, post, observation, args, camera_shapes=None) -> list[PreparedAction]:
+def _predict_action_chunk(policy, pre, post, observation, args, camera_shapes=None,
+                          timing=None) -> list[PreparedAction]:
     """Run preprocessing once, then drain one ACT action chunk.
 
     LeRobot's ``select_action`` performs a model forward only when its internal
     action queue is empty. Reusing the same batch for the remaining calls avoids
     recapturing, converting, and uploading images that the policy will ignore.
     """
-    batch = pre(observation_frame(observation, camera_shapes))
+    if timing is None:
+        batch = pre(observation_frame(observation, camera_shapes))
+    else:
+        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes)
+        batch = timing.call("preprocess", pre, frame)
     n_action_steps = int(policy.config.n_action_steps)
     prepared = []
-    for _ in range(n_action_steps):
-        values = post(policy.select_action(batch)).detach().cpu().numpy().reshape(-1)
-        action, translation_triggered, rotation_triggered = bounded_action_with_triggers(
-            values, args.max_step_m, args.max_step_rad
-        )
+    for index in range(n_action_steps):
+        if timing is None:
+            values = post(policy.select_action(batch)).detach().cpu().numpy().reshape(-1)
+            action, translation_triggered, rotation_triggered = bounded_action_with_triggers(
+                values, args.max_step_m, args.max_step_rad
+            )
+        else:
+            raw = timing.call(
+                "policy_first" if index == 0 else "policy_cached", policy.select_action, batch
+            )
+            processed = timing.call("postprocess", post, raw)
+            values = timing.call("cpu_copy", lambda: processed.detach().cpu().numpy().reshape(-1))
+            action, translation_triggered, rotation_triggered = timing.call(
+                "action_prepare", bounded_action_with_triggers,
+                values, args.max_step_m, args.max_step_rad,
+            )
         prepared.append(PreparedAction(
             action=action,
             values=values.copy(),
@@ -433,10 +470,18 @@ def _predict_action_chunk(policy, pre, post, observation, args, camera_shapes=No
     return prepared
 
 
-def _predict_full_action_chunk(policy, pre, post, observation, camera_shapes=None) -> np.ndarray:
+def _predict_full_action_chunk(policy, pre, post, observation, camera_shapes=None,
+                               timing=None) -> np.ndarray:
     """Predict and unnormalize the full ACT chunk for temporal ensembling."""
-    batch = pre(observation_frame(observation, camera_shapes))
-    values = post(policy.predict_action_chunk(batch)).detach().cpu().numpy()
+    if timing is None:
+        batch = pre(observation_frame(observation, camera_shapes))
+        values = post(policy.predict_action_chunk(batch)).detach().cpu().numpy()
+    else:
+        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes)
+        batch = timing.call("preprocess", pre, frame)
+        raw = timing.call("policy_first", policy.predict_action_chunk, batch)
+        processed = timing.call("postprocess", post, raw)
+        values = timing.call("cpu_copy", lambda: processed.detach().cpu().numpy())
     values = np.asarray(values, dtype=float).reshape(-1, 7)
     expected = int(policy.config.chunk_size)
     if values.shape != (expected, 7) or not np.isfinite(values).all():
@@ -514,7 +559,15 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         "deadline_misses": 0,
         "max_lateness_s": 0.0,
         "z_stall_events": 0,
+        "queue_underruns": 0,
     }
+    profile_timing = bool(getattr(args, "profile_timing", False))
+    inference_state = {"chunk_index": None, "phase": None}
+    gc_tracer = None
+    if profile_timing:
+        from act_rlt.infer_timing import ChunkTiming, GCPauseTracer
+
+        gc_tracer = GCPauseTracer(trace, inference_state)
     trace(
         "episode_start", episode_index=episode_index,
         checkpoint=str(args.checkpoint) if hasattr(args, "checkpoint") else None,
@@ -527,9 +580,12 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         z_stall_min_command_m=Z_STALL_MIN_COMMAND_M if residual_control else None,
         z_stall_max_progress_m=Z_STALL_MAX_PROGRESS_M if residual_control else None,
         dry_run=bool(args.dry_run),
-        workspace_min_xyz=list(robot.config.workspace_min_xyz)
+        profile_timing=profile_timing,
+        queue_capacity=action_queue.maxsize, low_watermark=low_watermark,
+        # JSON null denotes an unbounded axis; keep traces valid strict JSON.
+        workspace_min_xyz=[float(v) if np.isfinite(v) else None for v in robot.config.workspace_min_xyz]
         if getattr(getattr(robot, "config", None), "workspace_min_xyz", None) is not None else None,
-        workspace_max_xyz=list(robot.config.workspace_max_xyz)
+        workspace_max_xyz=[float(v) if np.isfinite(v) else None for v in robot.config.workspace_max_xyz]
         if getattr(getattr(robot, "config", None), "workspace_max_xyz", None) is not None else None,
     )
 
@@ -547,17 +603,25 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
     def camera_worker():
         try:
             while not stop_event.is_set():
+                capture_started = time.monotonic() if profile_timing else None
                 observation = robot.get_observation()
                 with observation_ready:
                     latest_observation["seq"] += 1
                     latest_observation["value"] = observation
                     latest_observation["captured_at"] = time.monotonic()
                     observation_ready.notify_all()
+                if profile_timing:
+                    trace(
+                        "camera_frame", observation_seq=latest_observation["seq"],
+                        capture_started_monotonic_s=capture_started,
+                        capture_s=time.monotonic() - capture_started,
+                    )
         except BaseException as exc:
             fail(exc)
 
     def inference_worker():
         last_observation_seq = 0
+        chunk_index = 0
         try:
             with torch.inference_mode():
                 while not stop_event.is_set():
@@ -573,6 +637,7 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                             and action_queue.qsize() > low_watermark):
                         continue
 
+                    observation_wait_start = time.monotonic()
                     with observation_ready:
                         observation_ready.wait_for(
                             lambda: stop_event.is_set()
@@ -585,14 +650,28 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                         observation_captured_at = latest_observation["captured_at"]
 
                     inference_start = time.monotonic()
+                    inference_cpu_start = time.thread_time() if profile_timing else None
+                    timing = None
+                    if profile_timing:
+                        inference_state["chunk_index"] = chunk_index
+                        timing = ChunkTiming(
+                            torch, getattr(policy.config, "device", "cpu"), inference_state
+                        )
+                        trace(
+                            "inference_started", chunk_index=chunk_index,
+                            observation_seq=last_observation_seq,
+                            observation_wait_s=inference_start - observation_wait_start,
+                            observation_age_s=inference_start - observation_captured_at,
+                            queue_remaining=action_queue.qsize(),
+                        )
                     if temporal_ensembler is None:
                         chunk = _predict_action_chunk(
-                            policy, pre, post, observation, args, camera_shapes
+                            policy, pre, post, observation, args, camera_shapes, timing
                         )
                     else:
                         start_step = latest_temporal_request["start_step"]
                         chunk = _predict_full_action_chunk(
-                            policy, pre, post, observation, camera_shapes
+                            policy, pre, post, observation, camera_shapes, timing
                         )
                     inference_elapsed = time.monotonic() - inference_start
                     trace(
@@ -600,8 +679,13 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                         observation_monotonic_s=observation_captured_at,
                         start_step=start_step if temporal_ensembler is not None else None,
                         inference_s=inference_elapsed,
+                        chunk_index=chunk_index,
+                        inference_started_monotonic_s=inference_start,
+                        inference_thread_cpu_s=time.thread_time() - inference_cpu_start
+                        if profile_timing else None,
                         actions=[item.values.tolist() for item in chunk]
                         if temporal_ensembler is None else chunk.tolist(),
+                        **(timing.summary() if timing is not None else {}),
                     )
                     if inference_elapsed > MAX_INFERENCE_S:
                         message = f"Preprocessing/inference took {inference_elapsed:.2f}s"
@@ -610,17 +694,28 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                         log_queue.put("WARNING: " + message + "; dry-run continues")
 
                     if temporal_ensembler is None:
+                        enqueue_start = time.monotonic()
+                        enqueued = 0
                         for prepared in chunk:
                             while not stop_event.is_set():
                                 try:
                                     action_queue.put(prepared, timeout=0.05)
+                                    enqueued += 1
                                     break
                                 except queue.Full:
                                     continue
+                        if profile_timing:
+                            trace(
+                                "chunk_enqueued", chunk_index=chunk_index,
+                                enqueue_s=time.monotonic() - enqueue_start,
+                                enqueued_actions=enqueued, queue_remaining=action_queue.qsize(),
+                            )
                     else:
                         temporal_ensembler.add_chunk(start_step, chunk)
                     if len(chunk) and not stop_event.is_set():
                         first_actions_ready.set()
+                    chunk_index += 1
+                    inference_state.update(chunk_index=None, phase=None)
         except BaseException as exc:
             fail(exc)
 
@@ -650,6 +745,13 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                     try:
                         prepared = action_queue.get_nowait()
                     except queue.Empty:
+                        stats["queue_underruns"] += 1
+                        trace(
+                            "queue_underrun", step=control_step, elapsed_s=now - start,
+                            deadline_lateness_ms=1000 * lateness,
+                            active_inference_chunk_index=inference_state["chunk_index"],
+                            active_inference_phase=inference_state["phase"],
+                        )
                         refill_event.set()
                         message = (
                             "ACT action queue underrun at the servo deadline; "
@@ -662,6 +764,11 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
                         control_step += 1
                         continue
                     if action_queue.qsize() <= low_watermark:
+                        if profile_timing and not refill_event.is_set():
+                            trace(
+                                "refill_requested", step=control_step,
+                                queue_remaining=action_queue.qsize(),
+                            )
                         refill_event.set()
                     queue_status = f"queue={action_queue.qsize()}"
                 else:
@@ -775,6 +882,8 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
         refill_event.set()
     else:
         temporal_request_event.set()
+    if gc_tracer is not None:
+        gc_tracer.start()
     for thread in threads:
         thread.start()
 
@@ -808,6 +917,8 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
 
         for thread in threads:
             thread.join()
+        if gc_tracer is not None:
+            gc_tracer.close()
         drain_trace()
         while True:
             try:
@@ -827,7 +938,8 @@ def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=N
             f"both={stats['both']} ({100 * stats['both'] / denominator:.1f}%), "
             f"deadline_misses={stats['deadline_misses']}, "
             f"max_lateness_ms={1000 * stats['max_lateness_s']:.2f}, "
-            f"z_stall_events={stats['z_stall_events']}",
+            f"z_stall_events={stats['z_stall_events']}, "
+            f"queue_underruns={stats['queue_underruns']}",
             flush=True,
         )
         trace(
@@ -902,14 +1014,19 @@ def main():
         policy.reset()
         if args.dry_run:
             episode_index = 0
-            while True:
-                action = prompt_choice(
-                    f"DRY RUN: [Enter/s]=start {args.duration:g}s inference, q=quit: ",
-                    {"": "start", "s": "start", "start": "start", "q": "quit", "quit": "quit"},
-                )
-                if action == "quit":
-                    break
+            while args.dry_run_episodes is None or episode_index < args.dry_run_episodes:
+                if args.dry_run_episodes is None:
+                    action = prompt_choice(
+                        f"DRY RUN: [Enter/s]=start {args.duration:g}s inference, q=quit: ",
+                        {"": "start", "s": "start", "start": "start", "q": "quit", "quit": "quit"},
+                    )
+                    if action == "quit":
+                        break
                 episode_index += 1
+                print(
+                    f"Starting dry-run episode {episode_index} for {args.duration:g}s.",
+                    flush=True,
+                )
                 run_inference_episode(
                     robot, policy, pre, post, args, torch, camera_shapes,
                     episode_index=episode_index,
@@ -921,7 +1038,7 @@ def main():
             return
         sample_min, sample_max, orientation = sample_bounds
         print(
-            "Sample reset orientation (confirmed TCP rotation vector, rad): "
+            "Sample reset orientation (fixed collection rotation vector, rad): "
             f"{format_pose(orientation)}",
             flush=True,
         )

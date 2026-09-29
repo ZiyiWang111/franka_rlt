@@ -20,6 +20,7 @@ robots/franka/adapter.py when FRANKA_CONTROL_IPC is set.
 """
 from __future__ import annotations
 
+from collections import deque
 import logging
 import os
 import threading
@@ -89,6 +90,7 @@ class FrankaArmControllerClient:
         self._lock = threading.Lock()        # serializes the command (DEALER) socket
         self._cache = None
         self._cache_lock = threading.Lock()
+        self._state_history = deque(maxlen=256)
         self._stream_on = True
         self.robot = None                     # truthy after connect() -- FrankaAdapter.is_connected probe
         # Streamed-servo faults observed so far. None = no baseline yet; the first
@@ -135,12 +137,32 @@ class FrankaArmControllerClient:
                 snap = msgpack.unpackb(raw, raw=False)
                 with self._cache_lock:
                     self._cache = snap
+                    self._state_history.append(snap)
             except zmq.Again:
                 continue
             except Exception:
                 if self._stream_on:
                     continue
                 break
+
+    def get_state_near(self, monotonic_s: float, max_skew_s: float = 0.020):
+        """Nearest coherent streamed snapshot; no RPC or wait.
+
+        Server snapshot timestamps share monotonic time only on the same host.
+        They timestamp the snapshot, not the robot's hardware acquisition.
+        Remote hosts require clock synchronization and therefore return None.
+        """
+        if self._host not in {"127.0.0.1", "localhost", "::1"}:
+            return None
+        with self._cache_lock:
+            candidates = [s for s in self._state_history
+                          if not s.get("state_stale", False)
+                          and isinstance(s.get("ts"), (int, float))
+                          and abs(s["ts"] - monotonic_s) <= max_skew_s]
+            if not candidates:
+                return None
+            snapshot = min(candidates, key=lambda s: abs(s["ts"] - monotonic_s))
+            return dict(snapshot)
 
     def _cached(self, key: str, default=None):
         """Read ONE field from the PUSH-stream cache, never blocking -- the single

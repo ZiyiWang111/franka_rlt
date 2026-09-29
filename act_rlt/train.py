@@ -31,7 +31,13 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--chunk-size", type=int, default=16)
     parser.add_argument("--n-action-steps", type=int, default=4)
-    parser.add_argument("--save-freq", type=int, default=5000)
+    parser.add_argument("--save-freq", type=int, default=10000)
+    parser.add_argument("--scheduler", choices=("cosine", "none"), default="cosine",
+                        help="Warmup + cosine decay (default), or a constant learning rate")
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Warmup steps, capped at 10%% of the run")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1,
+                        help="Final/initial learning-rate ratio for both parameter groups")
     parser.add_argument("--log-freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
@@ -48,6 +54,8 @@ def main():
         parser.error("workers must be non-negative and lr must be finite and positive")
     if args.n_action_steps > args.chunk_size:
         parser.error("n-action-steps must be <= chunk-size")
+    if args.warmup_steps < 0 or not 0 <= args.min_lr_ratio <= 1:
+        parser.error("warmup-steps must be non-negative and min-lr-ratio must be in [0, 1]")
 
     root = args.root.expanduser().resolve()
     if not (root / "meta/info.json").is_file():
@@ -88,7 +96,18 @@ def main():
         "seed": args.seed,
         "wandb.enable": args.wandb,
     }
-    command = [sys.executable, "-u", "-m", "lerobot.scripts.lerobot_train"]
+    if args.scheduler == "cosine":
+        options.update({
+            "scheduler.type": "cosine_decay_with_warmup",
+            "scheduler.num_warmup_steps": min(args.warmup_steps, steps // 10),
+            "scheduler.num_decay_steps": steps,
+            "scheduler.peak_lr": args.lr,
+            "scheduler.decay_lr": args.lr * args.min_lr_ratio,
+        })
+        # LeRobot's ACT preset otherwise replaces an explicit scheduler with None.
+        command = [sys.executable, "-u", str(Path(__file__).with_name("train_scheduled.py"))]
+    else:
+        command = [sys.executable, "-u", "-m", "lerobot.scripts.lerobot_train"]
     command += [f"--{key}={str(value).lower() if isinstance(value, bool) else value}"
                 for key, value in options.items()]
     print(shlex.join(command), flush=True)

@@ -9,6 +9,14 @@ from scipy.spatial.transform import Rotation as R  # noqa: N817
 ROTVEC_PI_BAND_RAD = 0.2  # canonical_rotvec ambiguity band around pi
 
 
+def euler_xyz_deg_to_rotvec(angles_deg: Sequence[float]) -> list[float]:
+    """Intrinsic XYZ Euler angles in degrees -> rotation vector in radians.
+
+    Uses SciPy's uppercase "XYZ" convention (rotations about moving axes).
+    """
+    return R.from_euler("XYZ", angles_deg, degrees=True).as_rotvec().tolist()
+
+
 def pose_to_matrix(pose_vec: Sequence[float]) -> np.ndarray:
     """[x, y, z, rx, ry, rz] (axis-angle) -> 4x4 homogeneous matrix."""
     T = np.eye(4)

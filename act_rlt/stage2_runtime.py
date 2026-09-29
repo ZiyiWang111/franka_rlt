@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import copy
 import queue
 import threading
@@ -11,7 +12,8 @@ from dataclasses import dataclass
 import torch
 
 from act_rlt.infer import MAX_INFERENCE_S, bounded_action, observation_frame
-from act_rlt.stage2 import ChunkExecution
+from act_rlt.stage2 import ACTStage2Policy, ChunkExecution
+from act_rlt.stage2_timing import Stage2Timing
 
 
 @dataclass
@@ -25,12 +27,16 @@ class Prediction:
     clipped: list[bool]
     human: bool = False
     gripper_values: list[float] | None = None
+    timing: Stage2Timing | None = None
+    ready_at: float = 0.0
 
 
 class FixedChunkRuntime:
     """One runtime per episode/collection phase; learning runs in the caller.
 
-    No temporal blending or mid-chunk replanning. The observation captured after
+    No temporal blending or mid-chunk replanning. Timestamp-verified exposure
+    (or conservative legacy call-start timing) selects a boundary observation.
+    The observation captured after
     the last command supplies BOTH replay's next state and the next prediction.
     Worker queues never repeat an action or silently discard a transition.
     """
@@ -51,6 +57,7 @@ class FixedChunkRuntime:
         self.observation_ready = threading.Condition()
         self.observation = None
         self.observation_started = -1.0
+        self.observation_history = deque(maxlen=8)
         self.requests = queue.Queue(maxsize=1)
         self.predictions = queue.Queue(maxsize=1)
         # Bound learner lag without dropping robot experience.
@@ -67,12 +74,14 @@ class FixedChunkRuntime:
             thread.start()
 
     def publish_actor(self, actor):
+        started = time.monotonic()
         if not self.warmup:
             # Called only by the learner thread, between optimizer steps. CPU
             # copies synchronize CUDA before another worker loads the snapshot.
             snapshot = {k: v.detach().cpu().clone() for k, v in actor.state_dict().items()}
             with self.actor_lock:
                 self.actor_state = snapshot
+        return (time.monotonic() - started) * 1000
 
     def _fail(self, error):
         with self.failure_lock:
@@ -86,42 +95,82 @@ class FixedChunkRuntime:
         try:
             while not self.stop.is_set():
                 started = time.monotonic()
-                observation = self.env.robot.get_observation()
+                timed_reader = getattr(self.env.robot, "get_timed_observation", None)
+                if callable(timed_reader):
+                    timed = timed_reader()
+                    observation, fresh_after = timed.observation, timed.fresh_after
+                    diagnostics = timed.diagnostics
+                else:
+                    observation = self.env.robot.get_observation()
+                    fresh_after = started
+                    diagnostics = {"camera_boundary_mode": "legacy",
+                                   "camera_boundary_fallback_reason": "timed_observation_unavailable"}
+                completed = time.monotonic()
                 with self.observation_ready:
                     self.observation = observation
                     self.observation_started = started
+                    self.observation_completed = completed
+                    self.observation_history.append(
+                        (started, completed, fresh_after, observation, diagnostics)
+                    )
                     self.observation_ready.notify_all()
         except BaseException as error:
             self._fail(error)
 
-    def _boundary_batch(self, after):
+    def _boundary_batch(self, after, timing=None):
+        started = time.monotonic()
+        def select():
+            history = getattr(self, "observation_history", None)
+            if history is None:  # Compatibility with minimal test/custom collectors.
+                if self.observation_started >= after:
+                    return (self.observation_started,
+                            getattr(self, "observation_completed", self.observation_started),
+                            self.observation_started, self.observation, {})
+                return None
+            return next((item for item in history if item[2] >= after), None)
+
         with self.observation_ready:
             ready = self.observation_ready.wait_for(
-                lambda: self.stop.is_set() or self.observation_started >= after,
+                lambda: self.stop.is_set() or select() is not None,
                 timeout=2.0,
             )
             if self.stop.is_set():
                 return None
             if not ready:
                 raise RuntimeError("Stage-2 camera did not supply a fresh boundary observation")
-            observation = self.observation
+            observation_started, observation_completed, fresh_after, observation, diagnostics = select()
+        if timing is not None:
+            timing.values.update(diagnostics)
+            timing.values["observation_fresh_after_request_ms"] = (fresh_after - after) * 1000
+            timing.values["camera_wait_wall_ms"] = (time.monotonic() - started) * 1000
+            timing.values["observation_start_after_request_ms"] = (observation_started - after) * 1000
+            timing.values["camera_capture_wall_ms"] = (observation_completed - observation_started) * 1000
+        started = time.monotonic()
         camera_shapes = getattr(self.env, "camera_shapes", None)
         frame = (
             observation_frame(observation)
             if camera_shapes is None
             else observation_frame(observation, camera_shapes)
         )
-        return self.env.pre(frame)
+        batch = self.env.pre(frame)
+        if timing is not None:
+            timing.values["preprocess_wall_ms"] = (time.monotonic() - started) * 1000
+        return batch
 
-    def _prediction(self, state, reference, full, *, human=False):
+    def _prediction(self, state, reference, full, *, human=False, timing=None):
+        timing = timing or Stage2Timing()
+        started = time.monotonic()
         if self.warmup or human:
             actions = reference
             mean_actions = reference
         else:
             with self.actor_lock:
                 snapshot, self.actor_state = self.actor_state, None
-            if snapshot is not None:
-                self.actor.load_state_dict(snapshot)
+            with timing.measure("actor_load", state.device):
+                if snapshot is not None:
+                    self.actor.load_state_dict(snapshot)
+            actor_started = time.monotonic()
+            actor_events = timing.start_cuda(state.device)
             if self.deterministic:
                 mean, _ = self.actor(
                     state, reference.flatten(start_dim=-2), training=False
@@ -131,6 +180,8 @@ class FixedChunkRuntime:
                 selected, mean = self.actor.sample(
                     state, reference.flatten(start_dim=-2), training=False
                 )
+            timing.finish_cuda("actor", actor_events)
+            timing.values["actor_wall_ms"] = (time.monotonic() - actor_started) * 1000
             actions = selected.reshape(
                 1, self.env.config.chunk_length, self.env.config.action_dim
             )
@@ -146,9 +197,12 @@ class FixedChunkRuntime:
                 raise RuntimeError("invalid Stage-2 physical action chunk")
             return physical
 
+        post_started = time.monotonic()
         physical = physical_actions(actions)
         reference_physical = physical_actions(reference)
         mean_physical = physical_actions(mean_actions)
+        timing.values["postprocess_cpu_wall_ms"] = (time.monotonic() - post_started) * 1000
+        commands_started = time.monotonic()
         commands, reference_commands, mean_commands, executed, clipped = [], [], [], [], []
         gripper_values = []
         for row, reference_row, mean_row in zip(
@@ -170,25 +224,36 @@ class FixedChunkRuntime:
             mean_commands.append(mean_command)
             executed.append(self.env._normalize_executed_action(actual))
             gripper_values.append(float(reference_row[self.env.config.action_dim]))
+        timing.values["command_prepare_wall_ms"] = (time.monotonic() - commands_started) * 1000
+        timing.values["prediction_wall_ms"] = (time.monotonic() - started) * 1000
         return Prediction(
             state, reference, commands, reference_commands, mean_commands,
-            torch.stack(executed), clipped, human, gripper_values,
+            torch.stack(executed), clipped, human, gripper_values, timing, time.monotonic(),
         )
+
+    def _encode(self, batch, timing):
+        with timing.measure("encode", batch.get("observation.state", torch.empty(0)).device):
+            if isinstance(self.policy, ACTStage2Policy):
+                return self.policy.encode_and_reference(batch, timing=timing)
+            return self.policy.encode_and_reference(batch)
 
     def _inference(self):
         try:
             with torch.inference_mode():
-                state, reference, full = self.policy.encode_and_reference(self.initial_batch)
-                self.predictions.put_nowait(self._prediction(state, reference, full, human=self.human))
+                timing = Stage2Timing()
+                state, reference, full = self._encode(self.initial_batch, timing)
+                self.predictions.put_nowait(self._prediction(state, reference, full, human=self.human, timing=timing))
                 while not self.stop.is_set():
                     try:
                         previous, execution, after, last, next_human = self.requests.get(timeout=0.05)
                     except queue.Empty:
                         continue
-                    batch = self._boundary_batch(after)
+                    timing = Stage2Timing()
+                    timing.values["request_queue_wall_ms"] = (time.monotonic() - after) * 1000
+                    batch = self._boundary_batch(after, timing)
                     if batch is None:
                         break
-                    state, reference, full = self.policy.encode_and_reference(batch)
+                    state, reference, full = self._encode(batch, timing)
                     execution.info["boundary_inference_ms"] = (time.monotonic() - after) * 1000
                     execution.next_batch = batch
                     execution.state_vec = previous.state
@@ -198,8 +263,11 @@ class FixedChunkRuntime:
                     if not last:
                         # Prepare the next command before CPU replay/logging work.
                         self.predictions.put_nowait(
-                            self._prediction(state, reference, full, human=next_human)
+                            self._prediction(state, reference, full, human=next_human, timing=timing)
                         )
+                    timing.values["boundary_total_wall_ms"] = (time.monotonic() - after) * 1000
+                    execution.info["_boundary_timing"] = timing
+                    execution.info["result_ready_monotonic_s"] = time.monotonic()
                     try:
                         self.results.put_nowait(execution)
                     except queue.Full:
@@ -253,6 +321,12 @@ class FixedChunkRuntime:
                     "deadline_misses": 0, "max_lateness_ms": 0.0,
                     "max_command_interval_ms": 0.0, "warmup": self.warmup,
                     "control_source": "human" if self.human else "policy",
+                    "_prediction_timing": prediction.timing,
+                    "prediction_queue_wait_wall_ms": (time.monotonic() - waiting_since) * 1000,
+                    "control_period_ms": self.env.period_s * 1000,
+                    "send_action_wall_ms_sum": 0.0,
+                    "send_action_wall_ms_max": 0.0,
+                    "resync_wall_ms_sum": 0.0,
                 }
                 actual = 0
                 sampled_sum = torch.zeros(self.env.config.action_dim)
@@ -290,8 +364,14 @@ class FixedChunkRuntime:
                         human_moving = moving
                     try:
                         if not self.human or human_moving:
+                            resync_started = time.monotonic()
                             self.env.robot.resync_command_pose()
+                            send_started = time.monotonic()
+                            info["resync_wall_ms_sum"] += (send_started - resync_started) * 1000
                             self.env.robot.send_action(command)
+                            send_ms = (time.monotonic() - send_started) * 1000
+                            info["send_action_wall_ms_sum"] += send_ms
+                            info["send_action_wall_ms_max"] = max(info["send_action_wall_ms_max"], send_ms)
                             servo_stopped = False
                     except RuntimeError as error:
                         if "refusing TCP target outside workspace" not in str(error):
@@ -302,6 +382,10 @@ class FixedChunkRuntime:
                         break
                     if not self.human or human_moving:
                         sent = time.monotonic()
+                        if index == 0:
+                            info["prediction_ready_to_first_send_ms"] = (sent - prediction.ready_at) * 1000
+                            if previous_send is not None:
+                                info["chunk_boundary_command_interval_ms"] = (sent - previous_send) * 1000
                         if previous_send is not None:
                             info["max_command_interval_ms"] = max(
                                 info["max_command_interval_ms"], (sent - previous_send) * 1000
@@ -342,6 +426,7 @@ class FixedChunkRuntime:
                 # In intervention mode the fourth action keeps its full control
                 # period. A Space press during that period still takes effect at
                 # this boundary, without shortening the four-step transition.
+                boundary_wait_started = time.monotonic()
                 boundary_waited = False
                 if (getattr(self.env, "enable_human_intervention", False) or pending_outcome is not None) and not done:
                     if self.stop.wait(max(0.0, deadline - time.monotonic())):
@@ -395,6 +480,7 @@ class FixedChunkRuntime:
                     intervention=prediction.human,
                     bc_target_chunk=executed.clone() if prediction.human else None,
                 )
+                info["boundary_finalize_wall_ms"] = (time.monotonic() - boundary_wait_started) * 1000
                 self.requests.put_nowait((prediction, result, time.monotonic(), last, next_human))
                 if last:
                     break
@@ -413,7 +499,14 @@ class FixedChunkRuntime:
             if self.failure is not None:
                 raise self.failure
             try:
-                return self.results.get(timeout=0.05)
+                result = self.results.get(timeout=0.05)
+                result.info["result_queue_wait_wall_ms"] = (time.monotonic() - result.info["result_ready_monotonic_s"]) * 1000
+                result.info["result_queue_depth"] = self.results.qsize()
+                for key, prefix in (("_prediction_timing", "current_"), ("_boundary_timing", "next_")):
+                    timing = result.info.pop(key, None)
+                    if timing is not None:
+                        result.info.update({prefix + k: v for k, v in timing.resolve().items()})
+                return result
             except queue.Empty:
                 if self.finished.is_set():
                     raise RuntimeError("Stage-2 collector exhausted its phase budget")

@@ -11,3 +11,4 @@ outputs/
 cache/
 wandb/
 datasets/
+/logs/

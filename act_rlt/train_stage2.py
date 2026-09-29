@@ -23,6 +23,11 @@ from typing import Any
 import numpy as np
 import torch
 
+from act_rlt.data_collection.sampling import (
+    SAMPLE_EULER_XYZ_DEG,
+    SAMPLE_ROTATION_VECTOR,
+    SAMPLE_Z_M,
+)
 from act_rlt.infer import (
     bounded_action,
     checkpoint_camera_shapes,
@@ -50,7 +55,6 @@ RESET_MOVE_SPEED_M_S = 0.02
 RESET_XY_MARGIN_M = 0.02
 STARTUP_WORKSPACE_HALF_RANGE_M = 0.03
 Z_SAMPLE_XY_HALF_RANGE_M = 0.01
-Z_SAMPLE_UP_RANGE_M = 0.02
 
 
 def retreat_pose_along_positive_y(
@@ -93,8 +97,10 @@ def sample_z_insertion_workspace_pose(
     reference: np.ndarray,
     workspace_min: np.ndarray,
     workspace_max: np.ndarray,
+    *,
+    randomize_xy: bool = False,
 ) -> np.ndarray:
-    """Sample x/y ±1 cm and z 0–2 cm above p0; retain p0 orientation."""
+    """Use p0 XY, optionally randomized ±1 cm, with fixed Z and orientation."""
     reference = np.asarray(reference, dtype=float)
     lower = np.asarray(workspace_min, dtype=float)
     upper = np.asarray(workspace_max, dtype=float)
@@ -106,16 +112,19 @@ def sample_z_insertion_workspace_pose(
         or np.any(lower >= upper)
     ):
         raise ValueError("invalid Z insertion workspace bounds")
-    sample_min = reference[:3] + [-Z_SAMPLE_XY_HALF_RANGE_M, -Z_SAMPLE_XY_HALF_RANGE_M, 0]
-    sample_max = reference[:3] + [Z_SAMPLE_XY_HALF_RANGE_M, Z_SAMPLE_XY_HALF_RANGE_M, Z_SAMPLE_UP_RANGE_M]
+    xy_half_range = Z_SAMPLE_XY_HALF_RANGE_M if randomize_xy else 0.0
+    sample_min = reference[:3] + [-xy_half_range, -xy_half_range, 0]
+    sample_max = reference[:3] + [xy_half_range, xy_half_range, 0]
+    sample_min[2] = sample_max[2] = SAMPLE_Z_M
     if np.any(sample_min < lower) or np.any(sample_max > upper):
         raise ValueError("Z insertion sample volume extends outside the safe workspace")
     if reference[2] - RESET_RETREAT_Z_M < lower[2]:
         raise ValueError("Z insertion endpoint extends below the safe workspace")
-    return np.concatenate([np.random.uniform(sample_min, sample_max), reference[3:]])
+    position = np.random.uniform(sample_min, sample_max) if randomize_xy else sample_min
+    return np.concatenate([position, SAMPLE_ROTATION_VECTOR])
 
 
-def capture_centered_workspace(robot) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Capture the current TCP pose on Enter, then bound XYZ to ±3 cm."""
     while True:
         choice = input(
@@ -135,6 +144,16 @@ def capture_centered_workspace(robot) -> tuple[np.ndarray, np.ndarray, np.ndarra
     print(
         f"Captured p0: {pose.tolist()}; workspace XYZ: "
         f"min={lower.tolist()}, max={upper.tolist()}",
+        flush=True,
+    )
+    xy_description = (
+        f"XY randomized +/-{Z_SAMPLE_XY_HALF_RANGE_M:.3f} m around p0"
+        if randomize_xy else "XY fixed at p0"
+    )
+    print(
+        f"Sample resets: {xy_description}, "
+        f"fixed absolute Z={SAMPLE_Z_M:.3f} m, "
+        f"intrinsic XYZ Euler={SAMPLE_EULER_XYZ_DEG} deg.",
         flush=True,
     )
     return pose, lower, upper
@@ -233,6 +252,7 @@ class FrankaInsertionStage2Env:
         sample_max: tuple[float, float, float] | None = None,
         camera_shapes: dict[str, tuple[int, int, int]] | None = None,
         z_insertion_mode: bool = False,
+        randomize_reset_xy: bool = False,
         reference_pose: np.ndarray | None = None,
         enable_human_intervention: bool = False,
         teleop_input_backend: str = "evdev",
@@ -268,6 +288,7 @@ class FrankaInsertionStage2Env:
             None if sample_max is None else np.asarray(sample_max, dtype=float)
         )
         self.z_insertion_mode = z_insertion_mode
+        self.randomize_reset_xy = randomize_reset_xy
         self._reference_pose = (
             None if reference_pose is None else np.asarray(reference_pose, dtype=float).copy()
         )
@@ -349,16 +370,23 @@ class FrankaInsertionStage2Env:
             )
             if measured.shape != (6,) or not np.isfinite(measured).all():
                 raise RuntimeError(f"invalid initial TCP pose: {measured}")
-            self._reset_orientation = measured[3:].copy()
+            self._reset_orientation = (
+                np.asarray(SAMPLE_ROTATION_VECTOR, dtype=float).copy()
+                if self.z_insertion_mode else measured[3:].copy()
+            )
+            orientation_label = (
+                "fixed collection" if self.z_insertion_mode else "current TCP"
+            )
             print(
-                "Using current TCP reset orientation: "
+                f"Using {orientation_label} reset orientation: "
                 f"{self._format_pose(self._reset_orientation)}",
                 flush=True,
             )
         while True:
             if self.z_insertion_mode:
                 target = sample_z_insertion_workspace_pose(
-                    self._reference_pose, self.workspace_min, self.workspace_max
+                    self._reference_pose, self.workspace_min, self.workspace_max,
+                    randomize_xy=self.randomize_reset_xy,
                 )
             else:
                 target = sample_workspace_pose(
@@ -512,8 +540,9 @@ class FrankaInsertionStage2Env:
             )
         elif self._runtime.warmup != warmup or self._runtime.deterministic != deterministic:
             raise RuntimeError("collector must pause at the warmup boundary")
-        self._runtime.publish_actor(policy.actor)
+        publish_ms = self._runtime.publish_actor(policy.actor)
         result = self._runtime.next_result()
+        result.info["actor_publish_wall_ms"] = publish_ms
         self._record_episode_action_comparison(result)
         if result.info["collector_paused"]:
             self._runtime.close()
@@ -721,10 +750,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--z-insertion-mode", action="store_true",
-        help="sample around fixed p0 (X/Y +/-1 cm, Z +0..2 cm) and retreat +Z 1 cm",
+        help="reset at p0 XY with fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
+    )
+    parser.add_argument(
+        "--randomize-reset-xy", action="store_true",
+        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p0 (default: fixed p0 XY)",
     )
     parser.add_argument("--fps", type=float, default=None,
                         help="control rate in Hz (default: 30 for Z insertion, 15 otherwise)")
+    parser.add_argument(
+        "--camera-boundary-mode", choices=("timestamp", "legacy"), default="timestamp",
+        help="timestamp: use verified exposure timing, falling back to legacy waits when unavailable",
+    )
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--max-step-m", type=float, default=0.002)
     parser.add_argument("--max-step-rad", type=float, default=0.02)
@@ -756,6 +793,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.randomize_reset_xy and not args.z_insertion_mode:
+        parser.error("--randomize-reset-xy requires --z-insertion-mode")
     if args.fps is None:
         args.fps = 30.0 if args.z_insertion_mode else 15.0
     if args.teleop_input_backend == "auto":
@@ -1128,6 +1167,8 @@ def main() -> int:
             workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
         )
     )
+    if args.camera_boundary_mode == "timestamp":
+        robot.enable_timestamped_observations()
     env = None
     output.mkdir(parents=True, exist_ok=True)
     (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
@@ -1144,7 +1185,9 @@ def main() -> int:
         robot.connect()
         reference_pose = None
         if args.z_insertion_mode:
-            reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot)
+            reference_pose, workspace_min, workspace_max = capture_centered_workspace(
+                robot, randomize_xy=args.randomize_reset_xy
+            )
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
         env = FrankaInsertionStage2Env(
@@ -1158,6 +1201,7 @@ def main() -> int:
             max_step_rad=args.max_step_rad,
             camera_shapes=camera_shapes,
             z_insertion_mode=args.z_insertion_mode,
+            randomize_reset_xy=args.randomize_reset_xy,
             reference_pose=reference_pose,
             sample_min=None if args.sample_min is None else tuple(args.sample_min),
             sample_max=None if args.sample_max is None else tuple(args.sample_max),

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -233,7 +234,7 @@ class ACTStage2Policy(nn.Module):
 
     @torch.no_grad()
     def encode_and_reference(
-        self, batch: dict[str, Tensor]
+        self, batch: dict[str, Tensor], *, timing=None
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Return ``state_vec``, Stage-2 reference, and full ACT reference.
 
@@ -241,8 +242,10 @@ class ACTStage2Policy(nn.Module):
         preprocessor. ACT and the RL Token encoder stay frozen and in eval mode.
         """
         self._stage1.eval()
-        full_ref, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(self._stage1._act, batch)
-        z_rl = self._stage1.rl_token.encode(hidden.float() + pos.float())
+        with timing.measure("act", batch[OBS_STATE].device) if timing else nullcontext():
+            full_ref, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(self._stage1._act, batch)
+        with timing.measure("rl_token", hidden.device) if timing else nullcontext():
+            z_rl = self._stage1.rl_token.encode(hidden.float() + pos.float())
         proprio = batch[OBS_STATE][:, : self.config.proprio_dim].float()
         state_vec = torch.cat([z_rl, proprio], dim=-1)
         ref = full_ref[:, : self.config.chunk_length, : self.config.action_dim].float()
@@ -700,8 +703,10 @@ def run_online_stage2(
         # Confirmed UTD: G updates per collected chunk, never G*C.
         if not warmup and len(replay) >= config.batch_size:
             updates = []
+            learner_started = time.monotonic()
             for _ in range(config.utd_ratio):
                 updates.append(learner.update_once(replay))
+            execution.info["learner_updates_wall_ms"] = (time.monotonic() - learner_started) * 1000
             metrics.last_learner = updates[-1]
             for name in ("critic_loss", "actor_loss", "critic_grad_norm", "actor_grad_norm"):
                 values = [getattr(u, name) for u in updates if getattr(u, name) is not None]

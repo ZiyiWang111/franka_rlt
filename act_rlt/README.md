@@ -51,7 +51,14 @@ Default model: ResNet18, transformer width 768, feedforward width 3200,
 steps per inference. Learning rates are 3e-5 for the main model and 1e-5 for
 the backbone. `--chunk-size` and `--n-action-steps` can override the horizon.
 Augmentation is enabled; `--no-augment` disables it. W&B is opt-in with
-`--wandb`. Checkpoints are saved every 5000 steps and at the end.
+`--wandb`. Checkpoints are saved every 10000 steps and at the end.
+By default, learning rates warm up for 1000 steps (capped at 10% of the run),
+then follow cosine decay to 10% of their initial values at the final step.
+The backbone learning rate follows the same factor. Use `--scheduler none`
+for constant learning rates, or override `--warmup-steps`, `--min-lr-ratio`,
+and `--save-freq`. Copy `act_rlt/train_scheduled.py` alongside `train.py` when
+running on another machine; it preserves the explicit scheduler while applying
+LeRobot's ACT optimizer preset.
 
 Training uses both cameras and the 22D `observation.state` to predict the
 7D `action` (measured TCP deltas plus gripper width). The command-action and
@@ -247,8 +254,12 @@ and add `--z-insertion-mode`. Stage 2 opens only the checkpoint's 1280x720 wrist
 camera. At startup it asks the operator to place the TCP at p0 and press Enter
 before moving. The TCP pose read at Enter becomes p0;
 its XYZ coordinates define the safety workspace at ±3 cm on each axis. It
-samples X/Y within ±1 cm of `p0`, Z from `p0` to `p0 + 2 cm`, and retreats +Z
-1 cm after each episode. Z insertion defaults to 30 Hz; the original reset
+uses fixed X/Y at `p0` by default; add `--randomize-reset-xy` to sample X/Y
+within ±1 cm of `p0`. Both modes use fixed absolute Z = 0.402 m and the
+recorder's intrinsic XYZ Euler orientation `(179.7, 1.4, 90.6)` degrees.
+The fixed sample must lie inside the captured workspace. The reference pose
+is retained as measured; the arm retreats +Z 1 cm after each episode.
+Z insertion defaults to 30 Hz; the original reset
 mode keeps its 15 Hz default. Omit `--workspace-min` / `--workspace-max` and
 `--sample-min` / `--sample-max` in Z insertion mode.
 During warmup and online episodes, `s` marks success and `f` marks failure
@@ -345,8 +356,9 @@ python -m act_rlt.infer_stage2 \
 ```
 
 The sample bounds are optional. For a Z-insertion checkpoint, pass its matching
-Stage-2 run and `--z-insertion-mode` instead of workspace/sample bounds. At
-startup, place the TCP at p0 and press Enter to capture the workspace. Every
+Stage-2 run and `--z-insertion-mode` instead of workspace/sample bounds.
+Reset X/Y stays at p0 by default; `--randomize-reset-xy` enables ±1 cm sampling.
+At startup, place the TCP at p0 and press Enter to capture the workspace. Every
 episode samples a reset pose and asks for confirmation before inference. During
 an episode, `s` or `f` ends after the current chunk, `q` stops the session, and
 `--episode-time` sets the maximum rollout duration (default 5 seconds). Gripper
@@ -375,15 +387,17 @@ omitted in this version, so the current grasp is held.
 
 For motion, omit `--dry-run`. After connecting and warming up, the script shows
 the measured TCP XYZ, rotation vector, and derived sample/workspace bounds.
-Press Enter to measure the TCP pose again and confirm its XYZ as the center and
-its rotation vector as the fixed reset orientation for this run. Press `r` to
+Press Enter to measure the TCP pose again and confirm its XY as the center.
+Sample resets use the recorder's fixed intrinsic XYZ Euler orientation
+`(179.7, 1.4, 90.6)` degrees, converted to a rotation vector. Press `r` to
 refresh the preview, or `q` to quit without moving. The sample
-space is X/Y ±2 cm and Z ±0.5 cm; the workspace guard is X/Y ±10 cm,
-Z −3 cm/+1 cm. Only after confirmation are these bounds installed. Each reset
+space is X/Y ±2 cm with fixed absolute Z = 0.402 m (base frame); the workspace
+guard leaves X/Y unrestricted and limits absolute Z from 0.367 to 0.412 m (−3.5 cm/+1 cm around
+the fixed sample height). Only after confirmation are these bounds installed. Each reset
 samples uniformly over the full sample space and moves there at 0.02 m/s.
 Place the arm at a safe center and orientation first and inspect the printed
-bounds; these relative limits do not check for fixtures or collisions. Every
-sampled reset target uses the confirmed TCP orientation, including the first
+bounds; these limits do not check for fixtures or collisions. Every
+sampled reset target uses the fixed collection orientation, including the first
 move. The policy may still rotate the TCP during inference. Override reset
 speed with `--reset-speed`.
 The first sampled move requires explicit authorization. At every sampled point,
@@ -406,6 +420,23 @@ cached TCP/joint state and raw base-frame external wrench immediately before
 sending, the attempted servo target TCP, and—when enabled—the bounded
 unexecuted-motion residual and Z-stall state. The `episode_start` event records
 whether `residual_control` was enabled.
+Add `--profile-timing` to record wall/CPU time for image conversion,
+preprocessing, policy calls, postprocessing, CPU copies and action preparation.
+It also records Python GC pauses with the executing thread and active inference
+phase, camera frame timings, refill requests, chunk enqueue times and underruns.
+CUDA events measure the first policy call without adding a CUDA synchronization;
+the CUDA interval can include host pauses between GPU launches.
+For an unattended live-camera test without arm motion, run several episodes in
+the same process (omit `--dry-run-episodes` to keep the interactive prompts):
+
+```bash
+python -m act_rlt.infer \
+  --checkpoint outputs/act_dataset_928_state7_act \
+  --fps 30 --no-temporal-ensemble --duration 6 \
+  --dry-run --dry-run-episodes 8 --profile-timing \
+  --log-dir logs/act_rlt_infer/timing_dry_run
+```
+
 The measured pose comes from the control client's state cache, and the
 target is fire-and-forget: a row does not prove the robot reached that target.
 Compare a step's `target_tcp_sent` with subsequent steps' `measured_tcp_before`
@@ -444,32 +475,34 @@ and front RealSense cameras, starts the recorder, and shuts down the exact
 server process when recording exits.
 
 At startup, hand-guide the TCP to the reference pose `p0` and press `Enter`.
-The full 6D pose is stored for this process.  Samples preserve its orientation
-and are drawn uniformly in the robot base frame:
+Its XY position defines the sample box. Samples use a fixed absolute Z and TCP
+orientation, and are drawn uniformly in the robot base frame:
 
 ```text
-x in [x0 - 0.01, x0 + 0.01] m
-y in [y0,        y0 + 0.02] m
-z in [z0 - 0.01, z0 + 0.01] m
+x in [x0 - 0.02, x0 + 0.02] m
+y in [y0 + 0.015, y0 + 0.025] m
+z = 0.402 m
+TCP XYZ Euler angle = [179.7, 1.4, 90.6] degrees
 ```
 
-The bounds above intentionally follow the requested numeric convention.  If
-`p0` is physically the maximum-Y boundary but your robot coordinate system
-increases toward the workspace interior, change `--y-range` handling before a
-real run; the current implementation always samples toward `+Y`.
+The recorder stores the complete hand-taught reference pose, including its
+orientation. Only sampled starts use the fixed Euler angle above, converted to
+the rotation-vector representation used by the Franka control API. Moving to a
+sample changes to that fixed orientation; returning to `p0` restores the taught
+orientation. Insertion and retreat keep the taught orientation.
 
 For each episode, the robot is positioned at the sampled pose outside
-recording. After a 0.5-second settling delay, recording starts automatically:
+recording. After a 1.0-second settling delay, recording starts automatically:
 
 ```text
-sample -> reference p0 -> p0 + [0, -0.01, 0]
+sample -> reference p0 -> p0 + [0, 0, -0.01]
 ```
 
-The episode is saved automatically, followed by a 0.5-second delay. The robot
-then returns `+1 cm` to `p0`, samples the next pose, moves there outside
-recording, waits 0.5 seconds, and starts the next episode without confirmation.
+The episode is saved automatically, followed by a 1.0-second delay. The robot
+then returns `+1 cm` along Z to `p0`, samples the next pose, moves there outside
+recording, waits 1.0 seconds, and starts the next episode without confirmation.
 
-During either 0.5-second non-episode window:
+During either 1.0-second non-episode window:
 
 - `1`: move to the immutable reference pose.
 - `2`: move to the current sampled pose.
@@ -483,7 +516,7 @@ immediate motion stop and discard the entire buffered episode.  Automatic
 motion stays paused after an abort; press `Enter` when it is safe to resample,
 reposition, and continue.
 
-Only `sample -> p0 -> -Y` is recorded. Sampling, repositioning, retreating,
+Only `sample -> p0 -> -Z` is recorded. Sampling, repositioning, retreating,
 and numeric-key moves are excluded from the dataset. Saved data uses a 22D
 observed state and two native `640x480` RGB streams. It records both action
 representations:
@@ -505,26 +538,12 @@ bash act_rlt/data_collection/collect_sample_space.sh --help
 ```
 
 Default motion speeds are `0.02 m/s` for repositioning and sample-to-reference,
-and `0.01 m/s` for the final `-Y` segment. Adjust them independently with
+and `0.01 m/s` for the final `-Z` segment. Adjust them independently with
 `--move-speed` and `--insertion-speed`. The transition delays can be changed
 with `--pre-episode-sleep` and `--post-episode-sleep`.
-Recording frequency is selected with `--fps`; supported values are `15`, `30`,
-and `50` Hz, with `15` Hz as the default.
-
-For vertical insertion collection, add `--z-insertion-mode`. It changes the
-recorded trajectory to `sample -> p0 -> p0 + [0, 0, -0.01]`; after saving, the
-robot makes the non-recorded `+Z 1 cm` retreat to `p0` before moving to the next
-sample. Its sample space is `x0 +/- 1 cm`, `y0 +/- 1 cm`, and
-`z in [z0, z0 + 2 cm]` (using the existing `--x-half-range` and `--y-range`
-values; their defaults are 1 cm and 2 cm). The Z depth defaults to 1 cm and
-can be set with `--insert-minus-z`. For example:
-
-```bash
-bash act_rlt/data_collection/collect_sample_space.sh \
-  --dataset act_rlt_z_insert \
-  --episodes 20 \
-  --z-insertion-mode
-```
+Recording frequency is selected with `--fps`; supported values are `15` and
+`30` Hz, with `15` Hz as the default. The Z insertion depth defaults to 1 cm
+and can be set with `--insert-minus-z`.
 
 Use a one-episode low-speed dry run before a larger collection:
 
