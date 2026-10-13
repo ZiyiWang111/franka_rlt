@@ -65,6 +65,11 @@ COMMAND_ACTION_NAMES = [
     "speed_m_s",
 ]
 SUPPORTED_FPS = (15, 30)
+FORCE_FEEDBACK_NAMES = {
+    "joint_torque": [f"tau_J_{i}" for i in range(7)],
+    "external_joint_torque": [f"tau_ext_hat_filtered_{i}" for i in range(7)],
+    "external_wrench": ["fx", "fy", "fz", "mx", "my", "mz"],
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -445,6 +450,7 @@ class EpisodeRecorder:
             )
         observation_started = time.perf_counter()
         self.last_sample_started_at = observation_started
+        force_feedback = self.robot.robot.get_force_feedback()
         observation = self.robot.get_observation()
         self.check_deadline()
         self.health["last_obs_ms"] = (time.perf_counter() - observation_started) * 1000.0
@@ -465,10 +471,14 @@ class EpisodeRecorder:
             for axis in ("x", "y", "z", "rx", "ry", "rz")
         ]
         gripper_width = float(observation["gripper_width"])
+        processed_observation = self.observation_processor(observation)
+        for name, names in FORCE_FEEDBACK_NAMES.items():
+            value = np.asarray(force_feedback[name], dtype=np.float32)
+            if value.shape != (len(names),) or not np.isfinite(value).all():
+                raise RuntimeError(f"invalid {name} feedback: {value}")
+            processed_observation.update(zip(names, value, strict=True))
         observation_frame = build_dataset_frame(
-            self.dataset.features,
-            self.observation_processor(observation),
-            prefix=OBS_STR,
+            self.dataset.features, processed_observation, prefix=OBS_STR,
         )
         if self.pending is not None:
             previous_frame, previous_pose, _, previous_command = self.pending
@@ -611,6 +621,10 @@ def build_dataset_and_robot(args: argparse.Namespace):
         "shape": (len(COMMAND_ACTION_NAMES),),
         "names": COMMAND_ACTION_NAMES,
     }
+    for name, names in FORCE_FEEDBACK_NAMES.items():
+        features[f"observation.{name}"] = {
+            "dtype": "float32", "shape": (len(names),), "names": names,
+        }
 
     if args.resume:
         dataset = LeRobotDataset.resume(
@@ -647,6 +661,15 @@ def build_dataset_and_robot(args: argparse.Namespace):
             f"dataset is missing {COMMAND_ACTION_KEY}; create a new ACT-RLT dataset instead of "
             "resuming a dataset recorded with the old schema"
         )
+    for name, names in FORCE_FEEDBACK_NAMES.items():
+        key = f"observation.{name}"
+        actual = dataset.features.get(key, {})
+        if (actual.get("dtype") != "float32"
+                or tuple(actual.get("shape", ())) != (len(names),)
+                or actual.get("names") != names):
+            raise ValueError(
+                f"dataset is missing or has incompatible {key}; create a new ACT dataset"
+            )
     _write_schema_metadata(
         dataset,
         collector_policy_id_codebook={str(COLLECTOR_HUMAN): "human-taught-script"},

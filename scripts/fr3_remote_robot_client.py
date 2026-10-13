@@ -123,7 +123,10 @@ def import_zmq():
 
 
 class RemoteInferenceClient:
-    def __init__(self, endpoint: str, timeout_s: float) -> None:
+    def __init__(self, endpoint: str, timeout_s: float, protocol=None) -> None:
+        if protocol is None:
+            from evo_rlt.adapters.lerobot.franka_remote import protocol
+        self.protocol = protocol
         self.zmq = import_zmq()
         self.context = self.zmq.Context.instance()
         self.endpoint = endpoint
@@ -149,10 +152,10 @@ class RemoteInferenceClient:
         except self.zmq.Again as exc:
             self._reset_socket()
             raise TimeoutError(f"inference request {request_id} timed out; no action was executed") from exc
-        return decode_response(response_frames, request_id)
+        return self.protocol.decode_response(response_frames, request_id)
 
     def ping(self) -> dict[str, Any]:
-        response = self.request(encode_ping(0), 0)
+        response = self.request(self.protocol.encode_ping(0), 0)
         if not isinstance(response, dict):
             raise RuntimeError("expected ready response")
         return response

@@ -295,6 +295,40 @@ def test_frame_stores_actual_and_command_actions_separately():
     assert recorder.dataset.frame[COMMAND_ACTION_KEY].tolist() == list(range(10, 17))
 
 
+def test_capture_keeps_force_feedback_with_its_observation(monkeypatch):
+    feedback = {
+        "joint_torque": list(range(7)),
+        "external_joint_torque": list(range(10, 17)),
+        "external_wrench": list(range(20, 26)),
+    }
+    observation = {f"ee_{axis}": 0.0 for axis in ("x", "y", "z", "rx", "ry", "rz")}
+    observation["gripper_width"] = 0.04
+    robot = SimpleNamespace(
+        robot=SimpleNamespace(get_force_feedback=lambda: feedback),
+        get_observation=lambda: observation,
+    )
+    recorder = EpisodeRecorder(
+        robot=robot, dataset=SimpleNamespace(features={
+            f"observation.{name}": {
+                "dtype": "float32", "shape": (len(names),), "names": names,
+            } for name, names in collector.FORCE_FEEDBACK_NAMES.items()
+        }),
+        observation_processor=lambda obs: obs, action_names=[],
+        task="test", fps=30, episode_time=60,
+    )
+    monkeypatch.setattr(collector, "manual_demo_health_tick", lambda **kwargs: None)
+    written = []
+    recorder._add_frame = lambda frame, *args: written.append(frame)
+    recorder.start()
+    recorder.capture()
+    feedback["joint_torque"] = [99.0] * 7
+    recorder.capture()
+    assert written[0]["observation.joint_torque"].tolist() == list(range(7))
+    assert written[0]["observation.external_joint_torque"].tolist() == list(range(10, 17))
+    assert written[0]["observation.external_wrench"].tolist() == list(range(20, 26))
+    assert recorder.pending[0]["observation.joint_torque"].tolist() == [99.0] * 7
+
+
 def test_scalar_buffer_normalization_leaves_vector_actions_unchanged():
     scalar_values = [np.array([0.0], dtype=np.float32), np.array([1.0], dtype=np.float32)]
     command_values = [np.arange(7, dtype=np.float32), np.arange(7, dtype=np.float32) + 1]

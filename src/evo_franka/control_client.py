@@ -302,6 +302,14 @@ class FrankaArmControllerClient:
     def get_tool_force_raw(self):
         return list(self._snap().get("force_raw") or [0.0] * 6)
 
+    def get_force_feedback(self):
+        """Read all force signals from one streamed snapshot."""
+        snapshot = self._snap()
+        feedback = snapshot.get("force_feedback")
+        if feedback is None or snapshot.get("state_stale", False):
+            raise RuntimeError("force feedback unavailable; restart the updated control server")
+        return {key: list(value) for key, value in feedback.items()}
+
     def is_running(self):
         return bool(self._snap().get("is_running", False))
 

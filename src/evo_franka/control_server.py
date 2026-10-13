@@ -243,7 +243,8 @@ class ControlServer:
         if name == "get_state":
             return self._state_reply()
         if name == "ping":
-            return {"success": True, "connected": self._connected, "busy": self._busy}
+            return {"success": True, "connected": self._connected, "busy": self._busy,
+                    "capabilities": ["motion_dynamics"]}
         if name == "shutdown":
             self._running = False
             return {"success": True}
@@ -605,6 +606,7 @@ class ControlServer:
         rd("joint_speeds", ctrl.get_joint_speeds, [0.0] * 7)
         rd("pose", ctrl.get_tool_pose, [0.0] * 6)
         rd("force_raw", ctrl.get_tool_force_raw, [0.0] * 6)
+        rd("force_feedback", ctrl.get_force_feedback, None)
         rd("is_running", ctrl.is_running, False)
         rd("robot_mode", ctrl.robot_mode, "")
         rd("is_user_stopped", ctrl.is_user_stopped, False)

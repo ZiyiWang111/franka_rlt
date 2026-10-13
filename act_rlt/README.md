@@ -1,5 +1,8 @@
 # ACT-RLT
 
+起点、重置方式以及数采 / ACT infer / Stage 2 训练与推理流程的中文说明见
+[ACT 数采、推理与 Stage 2：起点和执行流程](README_START_AND_INFERENCE.md)。
+
 This directory is isolated from the original `src/evo_rlt` implementation. It
 holds ACT-RLT, in which ACT replaces the original VLA reference policy. The
 first component is the FR3 sample-space data collector.
@@ -192,7 +195,7 @@ Workers also stop at episode boundaries and the online budget. Reset and human
 outcome prompts run only after the servo worker stops. A checkpoint contains
 consumed replay transitions; in-flight collection is not resumed after restart.
 
-Stage-2 training defaults to `--observation-selection latest`: the camera keeps
+Stage-2 training and frozen inference default to `--observation-selection latest`: the camera keeps
 capturing during execution, and at each chunk boundary inference consumes the
 newest cached observation with a sequence newer than the last one used. It only
 waits for the camera if no newer observation exists. One encoding still supplies
@@ -201,8 +204,8 @@ state/reference. A cached observation can precede the final command, so this is
 not a guarantee of a physically post-chunk replay state. Logs report selection,
 sequence, cache hit, and observation ages. Use `--observation-selection boundary`
 to restore strict post-command selection. `--camera-boundary-mode` independently
-controls exposure/state timestamp pairing. The frozen `infer_stage2` runtime
-keeps its existing strict boundary selection.
+controls exposure/state timestamp pairing and defaults to `timestamp` in both
+training and frozen inference; use `legacy` for ordinary observations.
 
 This change does not enable early chunk prediction, temporal blending, or forced
 downward actions. Inference still begins after the four-step chunk, but camera
@@ -390,6 +393,17 @@ an episode, `s` or `f` ends after the current chunk, `q` stops the session, and
 commands remain held. The Stage-2 checkpoint records the original ACT and
 Stage-1 paths; if those checkpoints moved, supply `--act-checkpoint` and
 `--stage1-checkpoint` with their new locations.
+Camera handling matches training by default: `--observation-selection latest`
+uses a newer cached observation, and `--camera-boundary-mode timestamp` enables
+exposure/state timestamp pairing when available. Both options accept the same
+`boundary` and `legacy` alternatives as training.
+The inference terminal groups model/control settings at startup, displays reset
+coordinates in millimetres, and refreshes running status at most once per second.
+Interactive terminals reuse one status line; redirected output uses plain lines.
+Each episode ends with a success/failure, workspace, or stop result, cumulative
+clipping counts and average boundary timing. The session summary reports outcome
+counts and success rate over completed episodes. These summaries are terminal
+output only; inference does not append training metrics or save checkpoints.
 
 ## ACT inference (first version)
 
@@ -549,8 +563,22 @@ reposition, and continue.
 
 Only `sample -> p0 -> -Z` is recorded. Sampling, repositioning, retreating,
 and numeric-key moves are excluded from the dataset. Saved data uses a 22D
-observed state and two native `640x480` RGB streams. It records both action
-representations:
+observed state and two native `640x480` RGB streams.
+
+Each frame also records three independent float32 observation vectors:
+`observation.joint_torque` (7 measured `tau_J` values, Nm),
+`observation.external_joint_torque` (7 filtered `tau_ext_hat_filtered`
+estimates, Nm), and `observation.external_wrench` (raw `O_F_ext_hat_K`,
+`[fx, fy, fz, mx, my, mz]`, N/Nm, expressed in the robot base frame).
+They come from one RobotState read and the latest streamed server snapshot;
+the existing 22D `observation.state` is unchanged. They are recorded at the
+requested `--fps` (15 or 30), with existing last-good fallback behavior on
+transient state-read failures. This is a recording cadence, not a guarantee
+of distinct fresh hardware samples at every frame. Restart the updated
+control server and create a new dataset; older datasets without these fields
+cannot be resumed with this collector.
+
+It records both action representations:
 
 - `action`: 7D actual action measured between consecutive observations
   (`dx..drz` plus measured gripper width).

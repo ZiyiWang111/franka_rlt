@@ -1477,7 +1477,10 @@ def test_resume_allows_safe_schedule_changes(
     new_warmup,
     new_total,
 ) -> None:
-    saved_config = _config(warmup_steps=saved_warmup, total_env_steps=saved_total)
+    saved_config = _config(
+        warmup_steps=saved_warmup, total_env_steps=saved_total,
+        beta=0.5, actor_fixed_std=0.2,
+    )
     saved_policy = _FakeStage2Policy(saved_config)
     saved_learner = Stage2Learner(saved_policy, saved_config)
     saved_replay = ReplayBuffer(saved_config.replay_capacity)
@@ -1510,3 +1513,6 @@ def test_resume_allows_safe_schedule_changes(
 
     assert restored.warmup_env_steps == warmup_progress
     assert restored.online_env_steps == online_progress
+    assert resumed_learner.config.beta == 2.0
+    assert resumed_policy.actor.fixed_std == 0.3
+    assert resumed_learner.target_actor.fixed_std == 0.3

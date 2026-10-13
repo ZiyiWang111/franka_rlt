@@ -99,6 +99,10 @@ class FakeController:
             return list(self.pose)
 
     def get_tool_force_raw(self): return [0.0] * 6
+    def get_force_feedback(self):
+        return {"joint_torque": list(range(7)),
+                "external_joint_torque": list(range(10, 17)),
+                "external_wrench": list(range(20, 26))}
     def is_running(self): return False
     def robot_mode(self): return "Idle"
     def is_user_stopped(self): return False
@@ -228,6 +232,11 @@ def test_connect_and_state_stream():
         q = cli.get_joint_angles()
         assert isinstance(q, list) and len(q) == 7, q
         assert cli.robot_mode() == "Idle", cli.robot_mode()
+        assert cli.get_force_feedback() == {
+            "joint_torque": list(range(7)),
+            "external_joint_torque": list(range(10, 17)),
+            "external_wrench": list(range(20, 26)),
+        }
     finally:
         _teardown(srv, cli, th)
 

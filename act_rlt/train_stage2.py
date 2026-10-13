@@ -161,13 +161,18 @@ def read_reset_point_choice(prompt: str) -> str:
         print(flush=True)
 
 
-def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def capture_centered_workspace(
+    robot, *, randomize_xy: bool = False, terminal=None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Capture the current TCP pose on Enter, then bound XYZ to ±5 cm."""
     while True:
-        choice = input(
+        prompt = (
             "Place TCP at Z insertion p1; press Enter to capture its pose "
             "and set XYZ workspace to +/-5 cm (q to stop): "
-        ).strip().lower()
+        )
+        if terminal is not None:
+            prompt = terminal.prompt("Place TCP at p1. Enter: capture reference and workspace | q: exit")
+        choice = input(prompt).strip().lower()
         if not choice:
             break
         if choice in {"q", "quit"}:
@@ -178,6 +183,10 @@ def capture_centered_workspace(robot, *, randomize_xy: bool = False) -> tuple[np
         raise RuntimeError(f"invalid TCP pose at workspace capture: {pose}")
     lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
     upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
+    if terminal is not None:
+        points = None if randomize_xy else fixed_z_insertion_reset_points(pose, lower, upper)
+        terminal.workspace(pose, lower, upper, points)
+        return pose, lower, upper
     print(
         f"Captured p1 reference: {pose.tolist()}; workspace XYZ: "
         f"min={lower.tolist()}, max={upper.tolist()}",
@@ -300,6 +309,7 @@ class FrankaInsertionStage2Env:
         teleop_keyboard: str | None = None,
         teleop_speed_m_s: float = 0.01,
         observation_selection: str = "boundary",
+        inference_terminal=None,
     ) -> None:
         self.robot = robot
         self.pre = preprocessor
@@ -311,6 +321,7 @@ class FrankaInsertionStage2Env:
         except StopIteration as error:
             raise ValueError("ACT preprocessor has no NormalizerProcessorStep") from error
         self.config = config
+        self.inference_terminal = inference_terminal
         self.camera_shapes = camera_shapes
         self.period_s = 1.0 / fps
         self.episode_time_s = episode_time_s
@@ -374,7 +385,11 @@ class FrankaInsertionStage2Env:
         return " ".join(f"{value:+.6f}" for value in pose)
 
     def _move_reset_pose(self, target: np.ndarray, *, label: str) -> None:
-        print(f"{label}: {self._format_pose(target)}", flush=True)
+        terminal = getattr(self, "inference_terminal", None)
+        if terminal is not None:
+            terminal.moving(target, label)
+        else:
+            print(f"{label}: {self._format_pose(target)}", flush=True)
         measured = np.asarray(
             self.robot.robot.move_tool(target.tolist(), speed=RESET_MOVE_SPEED_M_S),
             dtype=float,
@@ -382,7 +397,10 @@ class FrankaInsertionStage2Env:
         if measured.shape != (6,) or not np.isfinite(measured).all():
             raise RuntimeError(f"invalid measured pose after {label}: {measured}")
         self.robot.resync_command_pose()
-        print(f"Reached {label}: {self._format_pose(measured)}", flush=True)
+        if terminal is not None:
+            terminal.arrived(measured)
+        else:
+            print(f"Reached {label}: {self._format_pose(measured)}", flush=True)
 
     def _retreat_after_outcome(self) -> None:
         measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
@@ -399,6 +417,7 @@ class FrankaInsertionStage2Env:
         self._move_reset_pose(retreat, label=label)
 
     def _move_to_accepted_workspace_sample(self) -> None:
+        terminal = getattr(self, "inference_terminal", None)
         if self.z_insertion_mode and self._reference_pose is None:
             measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
             if measured.shape != (6,) or not np.isfinite(measured).all():
@@ -424,11 +443,12 @@ class FrankaInsertionStage2Env:
             orientation_label = (
                 "fixed collection" if self.z_insertion_mode else "current TCP"
             )
-            print(
-                f"Using {orientation_label} reset orientation: "
-                f"{self._format_pose(self._reset_orientation)}",
-                flush=True,
-            )
+            if terminal is None:
+                print(
+                    f"Using {orientation_label} reset orientation: "
+                    f"{self._format_pose(self._reset_orientation)}",
+                    flush=True,
+                )
         fixed_points_mode = self.z_insertion_mode and not self.randomize_reset_xy
         if fixed_points_mode and self._fixed_reset_points is None:
             self._fixed_reset_points = fixed_z_insertion_reset_points(
@@ -454,10 +474,15 @@ class FrankaInsertionStage2Env:
                 )
                 label = "sampled workspace reset pose"
             if self._first_reset_move:
-                choice = input(
+                prompt = (
                     "First sampled reset target is "
                     f"{self._format_pose(target)}. Press Enter/y to move, q to stop: "
-                ).strip().lower()
+                )
+                if terminal is not None:
+                    prompt = terminal.prompt(
+                        f"First target: {terminal.pose(target)}\n  Enter/y: move | q: exit"
+                    )
+                choice = input(prompt).strip().lower()
                 if choice not in {"", "y", "yes"}:
                     if choice in {"q", "quit"}:
                         raise KeyboardInterrupt
@@ -467,10 +492,15 @@ class FrankaInsertionStage2Env:
             self._move_reset_pose(target, label=label)
             if fixed_points_mode:
                 while True:
-                    choice = read_reset_point_choice(
+                    prompt = (
                         f"At p{self._selected_reset_point + 1}: "
                         "1/2/3=move to p1/p2/p3, Enter=start episode, q=stop: "
                     )
+                    if terminal is not None:
+                        prompt = terminal.prompt(
+                            f"At p{self._selected_reset_point + 1} | 1/2/3: move | Enter: start | q: exit"
+                        )
+                    choice = read_reset_point_choice(prompt)
                     if choice == "":
                         return
                     if choice in {"1", "2", "3"}:
@@ -480,10 +510,13 @@ class FrankaInsertionStage2Env:
                         raise KeyboardInterrupt
                     print("Please use 1, 2, 3, Enter, or q.", flush=True)
                 continue
-            choice = input(
+            prompt = (
                 "Sample point OK? [Enter/y]=start episode, r=move to a new sample, "
                 "q=stop training: "
-            ).strip().lower()
+            )
+            if terminal is not None:
+                prompt = terminal.prompt("Reset ready | Enter/y: start | r: new sample | q: exit")
+            choice = input(prompt).strip().lower()
             if choice in {"", "y", "yes"}:
                 return
             if choice in {"r", "retry", "n", "no"}:
@@ -510,7 +543,11 @@ class FrankaInsertionStage2Env:
         self._close_monitor()
         self._control_mode = "policy"
         phase = "ACT WARMUP" if warmup else "RLT ACTOR"
-        print(f"\nPreparing Episode {episode_id} [{phase}] with automatic reset.", flush=True)
+        terminal = getattr(self, "inference_terminal", None)
+        if terminal is not None:
+            terminal.prepare_episode(episode_id)
+        else:
+            print(f"\nPreparing Episode {episode_id} [{phase}] with automatic reset.", flush=True)
         self._move_to_accepted_workspace_sample()
         self._needs_automatic_reset = False
         self.robot.resync_command_pose()
@@ -531,7 +568,10 @@ class FrankaInsertionStage2Env:
             )
         else:
             self._monitor = OutcomeMonitor()
-            print("Episode active: s/f=finish after this 4-step chunk; q=stop training", flush=True)
+            if terminal is not None:
+                terminal.active()
+            else:
+                print("Episode active: s/f=finish after this 4-step chunk; q=stop training", flush=True)
         self._episode_start = time.monotonic()
         return batch
 
@@ -615,6 +655,8 @@ class FrankaInsertionStage2Env:
         publish_ms = self._runtime.publish_actor(policy.actor)
         result = self._runtime.next_result()
         result.info["actor_publish_wall_ms"] = publish_ms
+        if getattr(self, "inference_terminal", None) is not None:
+            result.info["episode_elapsed_s"] = time.monotonic() - self._episode_start
         self._record_episode_action_comparison(result)
         if result.info["collector_paused"]:
             self._runtime.close()
@@ -622,7 +664,16 @@ class FrankaInsertionStage2Env:
 
         if result.info.get("timed_out"):
             self._close_monitor()
-            key = self._prompt_outcome_after_timeout()
+            terminal = getattr(self, "inference_terminal", None)
+            if terminal is None:
+                key = self._prompt_outcome_after_timeout()
+            else:
+                terminal.write("  TIME LIMIT | motion stopped; waiting for your outcome")
+                while True:
+                    key = input(terminal.prompt("s: success | f: failure | q: exit")).strip().lower()
+                    if key in {"s", "f", "q"}:
+                        break
+                    terminal.write("  Choose s, f, or q.")
             if key == "s":
                 result.reward_seq[result.actual_steps - 1] = 1.0
                 result.info["success"] = True
@@ -859,10 +910,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fusion-dim", type=int, default=128,
                         help="width of each token, joint, and action input branch (default: 128)")
     parser.add_argument("--utd-ratio", type=int, default=5)
-    parser.add_argument("--beta", type=float, default=0.5,
-                        help="BC regularization coefficient in -Q + beta * BC (default: 0.5)")
-    parser.add_argument("--exploration-sigma", type=float, default=0.2,
-                        help="fixed normalized action standard deviation during collection (default: 0.2)")
+    parser.add_argument("--beta", type=float, default=2.0,
+                        help="BC regularization coefficient in -Q + beta * BC (default: 2.0)")
+    parser.add_argument("--exploration-sigma", type=float, default=0.3,
+                        help="fixed normalized action standard deviation during collection (default: 0.3)")
     parser.add_argument("--save-every-env-steps", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     return parser
@@ -990,9 +1041,9 @@ def load_checkpoint(
     saved_config.setdefault(
         "temporal_ensemble_coeff", current_config["temporal_ensemble_coeff"]
     )
-    # Beta changes only the Actor objective on future updates; it does not
-    # invalidate the learned network, optimizer state, or replay contents.
-    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta"}
+    # Beta and exploration std affect future updates/collection, without
+    # invalidating the network, optimizer state, or replay contents.
+    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta", "actor_fixed_std"}
     incompatible = {
         key: (saved_config.get(key), current_config.get(key))
         for key in set(saved_config) | set(current_config)

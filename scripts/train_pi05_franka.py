@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--base-model", type=Path, required=True, help="Local PI05 base checkpoint directory")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs/pi05_dataset_928_state7_action6")
     parser.add_argument("--gpu", type=int, default=2)
+    parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs for DDP; batch-size is the global batch")
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
@@ -55,6 +56,11 @@ def main():
                         help="Optional VLM-freezing experiment; full fine-tuning is the default")
     parser.add_argument("--dry-run", action="store_true", help="Validate dataset and print command; does not load weights")
     args = parser.parse_args()
+    gpus = args.gpus if args.gpus is not None else [args.gpu]
+    if len(set(gpus)) != len(gpus) or any(gpu < 0 for gpu in gpus):
+        parser.error("GPU IDs must be unique and non-negative")
+    if args.batch_size % len(gpus):
+        parser.error("Global batch-size must be divisible by GPU count")
     if min(args.steps, args.batch_size, args.chunk_size, args.n_action_steps, args.save_freq, args.log_freq) <= 0:
         parser.error("Steps, batch size, horizons and logging/saving intervals must be positive")
     if args.gpu < 0 or args.workers < 0 or args.warmup_steps < 0:
@@ -83,16 +89,19 @@ def main():
         "policy.freeze_vision_encoder": args.train_expert_only,
         "policy.train_expert_only": args.train_expert_only,
         "use_policy_training_preset": True,
-        "batch_size": args.batch_size, "steps": args.steps, "num_workers": args.workers,
+        "batch_size": args.batch_size // len(gpus), "steps": args.steps, "num_workers": args.workers,
         "save_checkpoint": True, "save_freq": min(args.save_freq, args.steps),
         "log_freq": min(args.log_freq, args.steps), "eval_freq": 0,
         "tolerance_s": 1e-4, "seed": args.seed, "wandb.enable": False,
         "output_dir": output, "job_name": "pi05_franka_state7_action6",
     }
     command = [sys.executable, "-u", "-m", "evo_rlt.cli.train_pi05_masked"]
+    if len(gpus) > 1:
+        command = [sys.executable, "-u", "-m", "torch.distributed.run", "--standalone",
+                   f"--nproc_per_node={len(gpus)}", "--module", "evo_rlt.cli.train_pi05_masked"]
     command += [f"--{k}={str(v).lower() if isinstance(v, bool) else v}" for k, v in options.items()]
     print(f"Dataset: {root} ({info['total_episodes']} episodes, {info['total_frames']} frames)", flush=True)
-    print(f"GPU: {args.gpu}; state7 + camera + task -> TCP6; gripper held by deployment controller", flush=True)
+    print(f"GPUs: {gpus}; global batch={args.batch_size}; state7 + camera + task -> TCP6; gripper held by deployment controller", flush=True)
     print(shlex.join(command), flush=True)
     if args.dry_run:
         if not (base / "config.json").is_file():
@@ -102,15 +111,16 @@ def main():
         parser.error(f"Missing local base checkpoint files: {base}")
     if json.loads((base / "config.json").read_text()).get("type") != "pi05":
         parser.error("Base checkpoint must be pi05")
-    query = ["nvidia-smi", f"--id={args.gpu}", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"]
-    used, util = [int(v.strip()) for v in subprocess.check_output(query, text=True).strip().split(",")]
-    processes = subprocess.check_output(
-        ["nvidia-smi", f"--id={args.gpu}", "--query-compute-apps=pid", "--format=csv,noheader,nounits"], text=True
-    ).strip()
-    if used > 1024 or util > 10 or processes:
-        parser.error(f"GPU {args.gpu} is busy: {used} MiB, {util}%, processes={processes!r}")
+    for gpu in gpus:
+        query = ["nvidia-smi", f"--id={gpu}", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"]
+        used, util = [int(v.strip()) for v in subprocess.check_output(query, text=True).strip().split(",")]
+        processes = subprocess.check_output(
+            ["nvidia-smi", f"--id={gpu}", "--query-compute-apps=pid", "--format=csv,noheader,nounits"], text=True
+        ).strip()
+        if used > 1024 or util > 10 or processes:
+            parser.error(f"GPU {gpu} is busy: {used} MiB, {util}%, processes={processes!r}")
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PROJECT_ROOT / "src"), str(PROJECT_ROOT), env.get("PYTHONPATH")]))
     env["PYTHONUNBUFFERED"] = "1"
     raise SystemExit(subprocess.call(command, cwd=PROJECT_ROOT, env=env))

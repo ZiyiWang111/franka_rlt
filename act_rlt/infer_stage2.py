@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from act_rlt.infer import checkpoint_camera_shapes, robot_camera_kwargs
+from act_rlt.infer_stage2_terminal import InferenceTerminal
 from act_rlt.stage2 import ACTStage2Config, ACTStage2Policy, resolve_pretrained_model
 from act_rlt.train_stage2 import (
     FrankaInsertionStage2Env,
@@ -43,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--sample-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument(
+        "--camera-boundary-mode", choices=("timestamp", "legacy"), default="timestamp",
+        help="timestamp: align image/state when available; legacy: use ordinary observations",
+    )
+    parser.add_argument(
+        "--observation-selection", choices=("latest", "boundary"), default="latest",
+        help="latest: use newer cached observations like ACT infer; boundary: require post-command observations",
+    )
     parser.add_argument("--episode-time", type=float, default=5.0)
     return parser
 
@@ -101,7 +111,7 @@ def load_frozen_policy(
     config_data = dict(saved["config"])
     config_data["device"] = device or config_data["device"]
     if device is None and str(config_data["device"]).startswith("cuda") and not torch.cuda.is_available():
-        print("CUDA is unavailable; loading on CPU for checkpoint validation.", flush=True)
+        print("CUDA unavailable; using CPU.", flush=True)
         config_data["device"] = "cpu"
     for key, override in (("stage1_checkpoint", stage1_checkpoint),
                           ("act_checkpoint", act_checkpoint)):
@@ -120,34 +130,48 @@ def run_episodes(env: FrankaInsertionStage2Env, policy: ACTStage2Policy, episode
     # A duration bound is applied inside the servo worker. The generous step
     # budget is only a fallback if wall-clock accounting is delayed.
     step_budget = max(1000, math.ceil(env.episode_time_s / env.period_s) + policy.config.chunk_length)
-    for episode_id in range(episodes):
-        batch = env.reset(episode_id=episode_id, warmup=False)
-        steps = 0
-        while True:
-            execution = env.execute_policy_chunk(
-                policy, batch, warmup=False,
-                remaining_steps=step_budget - steps, deterministic=True,
-            )
-            steps += execution.actual_steps
-            batch = execution.next_batch
-            print(
-                f"Episode {episode_id}: steps={steps} "
-                f"success={execution.info.get('success', False)} "
-                f"clipped={execution.info.get('safety_clip_steps', 0)} "
-                f"boundary_inference_ms={execution.info.get('boundary_inference_ms', 0):.1f}",
-                flush=True,
-            )
-            if execution.stop_requested:
-                return
-            if execution.done or execution.info.get("collector_paused"):
+    terminal = getattr(env, "inference_terminal", None) or InferenceTerminal(episodes, env.episode_time_s)
+    stopped = False
+    try:
+        for episode_id in range(episodes):
+            batch = env.reset(episode_id=episode_id, warmup=False)
+            started = time.monotonic()
+            steps = clipped = 0
+            boundary_times = []
+            while True:
+                execution = env.execute_policy_chunk(
+                    policy, batch, warmup=False,
+                    remaining_steps=step_budget - steps, deterministic=True,
+                )
+                steps += execution.actual_steps
+                clipped += execution.info.get("safety_clip_steps", 0)
+                if "boundary_inference_ms" in execution.info:
+                    boundary_times.append(execution.info["boundary_inference_ms"])
+                elapsed = execution.info.get("episode_elapsed_s", time.monotonic() - started)
+                batch = execution.next_batch
+                if execution.stop_requested or execution.done or execution.info.get("collector_paused"):
+                    terminal.finish_episode(episode_id, execution, elapsed, steps, clipped, boundary_times)
+                    stopped = execution.stop_requested
+                    break
+                terminal.status(
+                    episode_id, elapsed, steps, clipped,
+                    execution.info.get("boundary_inference_ms", 0.0),
+                )
+            if stopped:
                 break
+    except BaseException as error:
+        terminal.session_summary("interrupted" if isinstance(error, KeyboardInterrupt) else "aborted")
+        raise
+    terminal.session_summary("stopped" if stopped else "complete")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)
+    terminal = InferenceTerminal(args.episodes, args.episode_time)
     checkpoint = resolve_stage2_checkpoint(args.checkpoint)
+    terminal.write(f"Loading Stage-2 checkpoint: {checkpoint}")
     policy, config = load_frozen_policy(
         checkpoint, device=args.device,
         stage1_checkpoint=args.stage1_checkpoint, act_checkpoint=args.act_checkpoint,
@@ -160,11 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         policy.stage1._act.config, pretrained_path=str(act_path),
         preprocessor_overrides={"device_processor": {"device": config.device}},
     )
-    print(f"Frozen Stage-2 Actor loaded: {checkpoint}", flush=True)
-    print(f"ACT: {act_path}; Stage 1: {config.stage1_checkpoint}", flush=True)
-    print(f"Cameras: {camera_shapes}; device: {config.device}", flush=True)
+    terminal.configuration(checkpoint, act_path, config, camera_shapes, args)
     if args.dry_run:
-        print("Dry run complete; robot not connected.", flush=True)
+        terminal.write("[READY] Model check complete. Robot was not connected.")
         return 0
 
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
@@ -175,13 +197,17 @@ def main(argv: list[str] | None = None) -> int:
         workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
         workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
     ))
+    if args.camera_boundary_mode == "timestamp":
+        robot.enable_timestamped_observations()
     env = None
     try:
+        terminal.write(f"\nConnecting to robot {args.robot_ip} ...")
         robot.connect()
+        terminal.write("[READY] Robot and cameras connected.")
         reference_pose = None
         if args.z_insertion_mode:
             reference_pose, workspace_min, workspace_max = capture_centered_workspace(
-                robot, randomize_xy=args.randomize_reset_xy
+                robot, randomize_xy=args.randomize_reset_xy, terminal=terminal,
             )
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
@@ -194,11 +220,13 @@ def main(argv: list[str] | None = None) -> int:
             randomize_reset_xy=args.randomize_reset_xy,
             sample_min=None if args.sample_min is None else tuple(args.sample_min),
             sample_max=None if args.sample_max is None else tuple(args.sample_max),
+            observation_selection=args.observation_selection,
+            inference_terminal=terminal,
         )
         with torch.inference_mode():
             run_episodes(env, policy, args.episodes)
     except KeyboardInterrupt:
-        print("Stopped by operator.", flush=True)
+        terminal.write("[STOP] Stopped by operator.")
     finally:
         try:
             if env is not None:
@@ -209,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                     robot.robot.stop_move()
                 finally:
                     robot.disconnect()
+                    terminal.write("[CLOSED] Robot disconnected.")
     return 0
 
 

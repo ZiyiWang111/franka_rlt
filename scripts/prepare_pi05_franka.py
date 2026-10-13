@@ -113,7 +113,10 @@ def prepare_dataset(source, destination, task=TASK):
         if set(task_table.column_names) != {"task_index", "task"}:
             raise ValueError("Unexpected task-table schema")
         task_table = pa.Table.from_pylist([{"task_index": 0, "task": task}], schema=task_table.schema)
-        write_table(task_table, tasks_path)
+        # LeRobot reads task text from the pandas index, not the task column.
+        # Preserve this metadata; stripping it silently turns task text into row numbers.
+        task_frame = task_table.to_pandas().set_index("task")
+        task_frame.to_parquet(tasks_path)
         stats_path = staging / "meta/stats.json"
         stats = json.loads(stats_path.read_text())
         stats.update(global_stats)

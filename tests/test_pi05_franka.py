@@ -86,6 +86,8 @@ def test_dataset_conversion_relabels_and_computes_global_quantiles(source, tmp_p
     np.testing.assert_allclose(stats["action"]["q01"], np.quantile(expected, .01, axis=0))
     assert stats["action"]["q01"] != json.loads((source / "meta/stats.json").read_text())["action"]["q01"][:6]
     assert pq.read_table(dst / "meta/tasks.parquet").to_pylist() == [{"task_index": 0, "task": prepare.TASK}]
+    from lerobot.datasets.io_utils import load_tasks
+    assert load_tasks(dst).iloc[0].name == prepare.TASK
     eps = pq.read_table(dst / "meta/episodes/chunk-000/file-000.parquet").to_pylist()
     for ep in eps:
         assert ep["tasks"] == [prepare.TASK]
@@ -155,3 +157,13 @@ def test_training_recipe_keeps_state_and_disables_relative_actions(source, tmp_p
     assert cfg.gradient_checkpointing and cfg.chunk_size == 10
     assert cfg.scheduler_decay_steps == 30000
     assert cfg.get_scheduler_preset().decay_lr == pytest.approx(5e-6)
+
+    multi = subprocess.run([
+        sys.executable, str(PROJECT / "scripts/train_pi05_franka.py"), "--root", str(dst),
+        "--base-model", str(tmp_path / "base"), "--output", str(tmp_path / "run"),
+        "--gpus", "2", "4", "--batch-size", "16", "--dry-run",
+    ], text=True, capture_output=True, check=True)
+    command = shlex.split(multi.stdout.splitlines()[-1])
+    assert command[3] == "torch.distributed.run"
+    assert "--nproc_per_node=2" in command and "--batch_size=8" in command
+    assert "--steps=30000" in command and "--policy.scheduler_decay_steps=30000" in command

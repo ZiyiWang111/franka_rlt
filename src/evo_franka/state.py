@@ -149,6 +149,24 @@ class StateMixin:
         """Measured TCP pose [x, y, z, rx, ry, rz] in the working frame."""
         return self._base_to_new(self._tool_pose_base())
 
+    def get_force_feedback(self) -> dict[str, list[float]]:
+        """Measured and estimated joint torques (Nm), plus raw base wrench (N/Nm).
+
+        All three signals come from one Franky RobotState read.
+        """
+        def read():
+            state = self.robot.state
+            return {
+                "joint_torque": np.asarray(state.tau_J, dtype=float).reshape(7).tolist(),
+                "external_joint_torque": np.asarray(
+                    state.tau_ext_hat_filtered, dtype=float
+                ).reshape(7).tolist(),
+                "external_wrench": np.asarray(
+                    state.O_F_ext_hat_K, dtype=float
+                ).reshape(6).tolist(),
+            }
+        return self._read_with_fallback("force_feedback", read)
+
     def get_tool_force(self) -> list[float]:
         """Estimated external TCP wrench [fx, fy, fz, mx, my, mz] (working
         frame, O_F_ext_hat_K -- model-based estimate, no dedicated F/T sensor),

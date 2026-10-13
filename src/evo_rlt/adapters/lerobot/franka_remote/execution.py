@@ -120,8 +120,8 @@ def clip_tcp_action(
     max_rotation_rad: float,
 ) -> dict[str, float]:
     values = np.asarray(action, dtype=np.float64)
-    if values.shape != (7,) or not np.isfinite(values).all():
-        raise ProtocolError(f"action must be finite shape (7,), got {values.shape}")
+    if values.shape not in {(6,), (7,)} or not np.isfinite(values).all():
+        raise ProtocolError(f"action must be finite shape (6,) or (7,), got {values.shape}")
     clipped = values[:6].copy()
     for start, limit in ((0, max_translation_m), (3, max_rotation_rad)):
         clipped[start : start + 3] = _limit_vector_norm(clipped[start : start + 3], limit)

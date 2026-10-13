@@ -17,10 +17,10 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "datasets/franka_m1_manual_demo_state15_action7"
+DEFAULT_DATASET_ROOT = PROJECT_ROOT / "datasets/pi05_dataset_928_state7_action6"
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
-    / "outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k"
+    / "outputs/pi05_dataset_928_state7_action6"
     / "checkpoints/030000/pretrained_model"
 )
 
@@ -28,6 +28,7 @@ DEFAULT_CHECKPOINT = (
 # Keep those transient files outside the repository and prohibit network access.
 os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/fr3_pi05_offline_inference_hf_cache")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -57,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument(
         "--dataset-repo-id",
-        default="franka_m1_manual_demo_state15_action7",
+        default=None,
         help="Local LeRobotDataset repo_id (no Hub access is performed).",
     )
     parser.add_argument("--sample-index", type=int, default=0)
@@ -215,9 +216,9 @@ def main() -> None:
     print(f"Checkpoint: {checkpoint}")
     print(f"Dataset:    {dataset_root}")
     dataset = LeRobotDataset(
-        repo_id=args.dataset_repo_id,
+        repo_id=args.dataset_repo_id or dataset_root.name,
         root=dataset_root,
-        video_backend="torchcodec",
+        video_backend="pyav",
     )
     if not 0 <= args.sample_index < len(dataset):
         raise IndexError(f"sample-index {args.sample_index} is outside [0, {len(dataset)})")

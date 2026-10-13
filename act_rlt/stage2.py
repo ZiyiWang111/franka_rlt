@@ -63,7 +63,7 @@ class ACTStage2Config:
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
     fusion_dim: int = 128
-    actor_fixed_std: float = 0.2
+    actor_fixed_std: float = 0.3
     actor_ref_dropout_p: float = 0.5
     actor_lr: float = 3e-4
 
@@ -72,7 +72,7 @@ class ACTStage2Config:
     critic_lr: float = 3e-4
 
     gamma: float = 0.99
-    beta: float = 0.5
+    beta: float = 2.0
     tau: float = 0.005
     batch_size: int = 256
     utd_ratio: int = 5

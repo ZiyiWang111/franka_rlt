@@ -15,6 +15,26 @@ class DeadRobot:
         raise AssertionError("diagnostics attempted hardware I/O")
 
 
+def test_force_feedback_uses_one_robot_state_read():
+    class Robot:
+        reads = 0
+
+        @property
+        def state(self):
+            self.reads += 1
+            return SimpleNamespace(tau_J=list(range(7)),
+                                   tau_ext_hat_filtered=list(range(10, 17)),
+                                   O_F_ext_hat_K=list(range(20, 26)))
+
+    robot = Robot()
+    ctrl = SimpleNamespace(robot=robot, _read_with_fallback=lambda key, read: read())
+    feedback = StateMixin.get_force_feedback(ctrl)
+    assert robot.reads == 1
+    assert feedback == {"joint_torque": list(range(7)),
+                        "external_joint_torque": list(range(10, 17)),
+                        "external_wrench": list(range(20, 26))}
+
+
 def cached():
     return dict(ts=time.monotonic(), wall_time=time.time(), mode="RobotMode.Move",
                 ccsr=0.985, current_errors="[]", last_motion_errors="[]", has_errors=False)

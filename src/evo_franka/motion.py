@@ -37,6 +37,7 @@ from evo_franka._franky import (
     Measure,
     ControlException,
     NetworkException,
+    RelativeDynamicsFactor,
     _FRANKY_EXC,
 )
 from evo_franka.errors import (
@@ -451,13 +452,16 @@ class MotionMixin:
     def move_tool(self, pose: Sequence[float], speed: float = DEFAULT_TOOL_SPEED_M_S,
                   max_angular_vel: float = DEFAULT_MAX_ANGULAR_VEL_RAD_S,
                   acceleration: Optional[float] = None,
-                  is_async: bool = False) -> list[float]:
+                  is_async: bool = False, *,
+                  motion_dynamics: Optional[Sequence[float]] = None) -> list[float]:
         """Move the TCP to a pose [x, y, z, rx, ry, rz]. `speed` (m/s) paces the
         motion (average TCP speed ~= speed). Executed as IK + joint motion (one
         motion path); the path arcs slightly instead of being perfectly straight.
         `acceleration` is accepted for compatibility and ignored (the dynamics
         factor governs). Returns the measured TCP pose after the call (the
-        reached pose for blocking calls; the in-motion pose when is_async)."""
+        reached pose for blocking calls; the in-motion pose when is_async).
+        Optional motion_dynamics=[velocity, acceleration, jerk] multiplies the
+        session limits ONLY for this motion; it never changes robot-wide limits."""
         self._require()
         pose = list(pose)
         if len(pose) != 6:
@@ -465,6 +469,7 @@ class MotionMixin:
         return self.move_tool_traj(
             [pose + [float(speed), 0.0, 0.0]], is_async=is_async,
             max_angular_vel=max_angular_vel,
+            motion_dynamics=motion_dynamics,
         )
 
     # ---------------- trajectory motion ----------------
@@ -562,7 +567,8 @@ class MotionMixin:
 
     def _solve_branch_continuous_ik(self, start_pose: Sequence[float],
                                     parsed, max_angular_vel: float,
-                                    max_joint_swing_rad: "float | None" = None):
+                                    max_joint_swing_rad: "float | None" = None,
+                                    motion_dynamics: Optional[Sequence[float]] = None):
         """IK a TCP waypoint path into BRANCH-CONTINUOUS joint waypoints.
 
         Each leg is densely sampled (linear position + slerp orientation) and
@@ -629,6 +635,10 @@ class MotionMixin:
         self._log_traj_excursion(solved_q)
         joint_waypoints: list = []
         v_lim = self._joint_velocity_ceiling()
+        acceleration_scale = 1.0
+        if motion_dynamics is not None:
+            v_lim = v_lim * motion_dynamics[0]
+            acceleration_scale = motion_dynamics[1]
         for i, (q, min_time_s, blend) in enumerate(legs):
             kwargs = {}
             if min_time_s > MIN_SEGMENT_TIME_S:
@@ -637,7 +647,9 @@ class MotionMixin:
                 kwargs["hold_target_duration"] = Duration(FINAL_WAYPOINT_HOLD_MS)
             state = JointState(q.tolist())
             if blend > 0.0 and i + 1 < len(legs):   # intermediate + marked: pass through
-                v = self._passthrough_velocity(q, legs[i + 1][0], legs[i + 1][1], v_lim)
+                v = self._passthrough_velocity(
+                    q, legs[i + 1][0], legs[i + 1][1], v_lim,
+                    acceleration_scale=acceleration_scale)
                 if v is not None:
                     state = JointState(q.tolist(), v.tolist())
             joint_waypoints.append(JointWaypoint(state, **kwargs))
@@ -659,7 +671,8 @@ class MotionMixin:
 
     @staticmethod
     def _passthrough_velocity(q_here: np.ndarray, q_next: np.ndarray,
-                              t_next: float, v_lim: np.ndarray) -> "np.ndarray | None":
+                              t_next: float, v_lim: np.ndarray,
+                              acceleration_scale: float = 1.0) -> "np.ndarray | None":
         """Target joint velocity for PASSING THROUGH a blend>0 waypoint: the next
         leg's average joint velocity, scaled (as one vector, preserving direction)
         so that per joint it can still brake to zero within that leg's own travel
@@ -673,7 +686,8 @@ class MotionMixin:
         if float(d_abs.max()) < 1e-9:
             return None
         v = d / max(float(t_next), 1e-6)
-        a_eff = FR3_MIN_RATED_JOINT_ACCEL_RAD_S2 * ACCELERATION_DYNAMICS_FACTOR
+        a_eff = (FR3_MIN_RATED_JOINT_ACCEL_RAD_S2 * ACCELERATION_DYNAMICS_FACTOR
+                 * acceleration_scale)
         v_eff = np.asarray(v_lim, dtype=float) * PASSTHROUGH_VEL_HEADROOM
         scale = 1.0
         for vj, dj, v_eff_j in zip(np.abs(v), d_abs, v_eff):
@@ -685,7 +699,8 @@ class MotionMixin:
 
     def move_tool_traj(self, path: Sequence[Sequence[float]], is_async: bool = False,
                        max_angular_vel: float = DEFAULT_MAX_ANGULAR_VEL_RAD_S,
-                       max_joint_swing_rad: "float | None" = None) -> list[float]:
+                       max_joint_swing_rad: "float | None" = None, *,
+                       motion_dynamics: Optional[Sequence[float]] = None) -> list[float]:
         """TCP waypoint path executed as ONE jerk-limited JOINT-space trajectory.
 
         Each waypoint is [x, y, z, rx, ry, rz, speed, acceleration, blend]
@@ -694,6 +709,10 @@ class MotionMixin:
         waypoint; blend > 0 on an intermediate waypoint -> passed through with a
         bounded joint velocity (the corner is rounded, no stop -- see
         _passthrough_velocity). The last waypoint always stops.
+
+        motion_dynamics optionally supplies three factors in (0, 1]: velocity,
+        acceleration, jerk. Franky multiplies them with the session's factors
+        inside this trajectory object; no global configuration is mutated.
 
         Execution: the Cartesian path is densely sampled
         and IK'd with each solve warm-started from the previous DENSE solution
@@ -711,15 +730,28 @@ class MotionMixin:
         straight line) and the arm stops at blend-0 waypoints. This is the only
         supported trajectory execution path. Returns the measured TCP
         pose after the call."""
+        factors = None
+        if motion_dynamics is not None:
+            factors = np.asarray(motion_dynamics, dtype=float)
+            if factors.shape != (3,) or not np.all(np.isfinite(factors)) \
+                    or np.any(factors <= 0.0) or np.any(factors > 1.0):
+                raise ValueError("motion_dynamics must be [velocity, acceleration, jerk] in (0, 1]")
+            factors = factors.tolist()
         self._require()
         self._require_hand_idle_for_arm_motion()
         parsed = self._parse_tcp_waypoints(path, "move_tool_traj")
         self._require_kin()
         start_pose = self._tool_pose_base()
         joint_waypoints = self._solve_branch_continuous_ik(
-            start_pose, parsed, max_angular_vel, max_joint_swing_rad=max_joint_swing_rad)
+            start_pose, parsed, max_angular_vel, max_joint_swing_rad=max_joint_swing_rad,
+            motion_dynamics=factors)
+        if factors is None:
+            motion = JointWaypointMotion(joint_waypoints)
+        else:
+            motion = JointWaypointMotion(
+                joint_waypoints, relative_dynamics_factor=RelativeDynamicsFactor(*factors))
         self._warn_and_recover()
-        self._safe_move(JointWaypointMotion(joint_waypoints), is_async)
+        self._safe_move(motion, is_async)
         return self.get_tool_pose()
 
     # ---------------- servo control ----------------
