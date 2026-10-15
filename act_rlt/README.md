@@ -171,6 +171,11 @@ from the episode timeout. The frozen ACT and RL Token encoder remain unchanged.
 
 Success supplies a single terminal +1; other steps supply zero. The target is
 `sum(gamma**i * reward[i]) + gamma**actual_steps * (1-done) * clamp(min_target_Q, 0, 1)`.
+Bootstrap Q clipping is enabled by default (`--target-q-clipping`). Use
+`--no-target-q-clipping` to use the raw minimum target Q instead. Finite-value
+checks remain active. This toggle is saved in checkpoints and may be changed
+with `--resume`; older checkpoints default to clipping enabled. Diagnostics
+include `target_q_clipping_enabled`; clip fractions are zero when disabled.
 Unexecuted reward padding is masked. Truncations (including workspace refusals)
 are treated as episode ends with no bootstrap, matching this reset-based task.
 The deterministic target Actor supplies next actions. Both target actions and
@@ -430,10 +435,12 @@ Press Enter to measure the TCP pose again and confirm its XY as the center.
 Sample resets use the recorder's fixed intrinsic XYZ Euler orientation
 `(179.7, 1.4, 90.6)` degrees, converted to a rotation vector. Press `r` to
 refresh the preview, or `q` to quit without moving. The sample
-space is X/Y ±2 cm with fixed absolute Z = 0.402 m (base frame); the workspace
-guard leaves X/Y unrestricted and limits absolute Z from 0.367 to 0.412 m (−3.5 cm/+1 cm around
-the fixed sample height). Only after confirmation are these bounds installed. Each reset
-samples uniformly over the full sample space and moves there at 0.02 m/s.
+space defaults to fixed reference X/Y (0 cm half range) with absolute Z = 0.402 m.
+The workspace is the captured TCP XYZ ±5 cm. Reset selection accepts `=` / `-`
+to adjust the next sample half range by 0.5 cm (0–5 cm), `r` to resample,
+and Enter/y to start. The initial reference XY remains unchanged. Only after
+confirmation are workspace bounds installed; sample bounds and +Z retreats
+are checked against the workspace. Resets move at 0.02 m/s.
 Place the arm at a safe center and orientation first and inspect the printed
 bounds; these limits do not check for fixtures or collisions. Every
 sampled reset target uses the fixed collection orientation, including the first

@@ -16,7 +16,9 @@ from act_rlt.stage2 import ACTStage2Config, ACTStage2Policy, resolve_pretrained_
 from act_rlt.train_stage2 import (
     FrankaInsertionStage2Env,
     RESET_XY_MARGIN_M,
+    Z_SAMPLE_XY_HALF_RANGE_M,
     capture_centered_workspace,
+    restore_training_reference,
 )
 
 
@@ -37,8 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--front-camera", default="233522075778")
     parser.add_argument("--z-insertion-mode", action="store_true")
     parser.add_argument(
-        "--randomize-reset-xy", action="store_true",
-        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p1 (default: select p1/p2/p3)",
+        "--randomize-reset-xy", action="store_true", default=True,
+        help="compatibility option; Z insertion always uses random XY reset by default",
     )
     parser.add_argument("--workspace-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
@@ -58,8 +60,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.randomize_reset_xy and not args.z_insertion_mode:
-        parser.error("--randomize-reset-xy requires --z-insertion-mode")
     if args.episodes <= 0 or not math.isfinite(args.episode_time) or args.episode_time <= 0:
         parser.error("--episodes and --episode-time must be positive")
     if args.fps is None:
@@ -74,7 +74,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("supply both sample bounds")
     if args.z_insertion_mode:
         if args.workspace_min is not None or args.sample_min is not None:
-            parser.error("Z insertion captures its workspace at startup; omit workspace/sample bounds")
+            parser.error("Z insertion restores or captures its workspace; omit workspace/sample bounds")
     elif not args.dry_run and args.workspace_min is None:
         parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
     if args.workspace_min is not None:
@@ -102,9 +102,12 @@ def resolve_stage2_checkpoint(path: Path) -> Path:
 def load_frozen_policy(
     checkpoint: Path, *, device: str | None = None,
     stage1_checkpoint: Path | None = None, act_checkpoint: Path | None = None,
+    startup_metadata: dict | None = None,
 ) -> tuple[ACTStage2Policy, ACTStage2Config]:
     # Stage-2 checkpoints contain Python replay objects; load only trusted local runs.
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if startup_metadata is not None:
+        startup_metadata["startup_reference"] = saved.get("startup_reference")
     learner = saved["learner"]
     if learner.get("learner_version") != 3 or not learner.get("initialized"):
         raise ValueError("Stage-2 inference requires an initialized v3 Actor checkpoint")
@@ -165,6 +168,34 @@ def run_episodes(env: FrankaInsertionStage2Env, policy: ACTStage2Policy, episode
     terminal.session_summary("stopped" if stopped else "complete")
 
 
+def select_run_reference(robot, saved_reference, *, randomize_xy, terminal):
+    """Choose the immutable reference and workspace for this inference run."""
+    if saved_reference is not None:
+        while True:
+            choice = input(terminal.prompt(
+                "Run reference: t: saved training point | c: current TCP | q: exit"
+            )).strip().lower()
+            if choice == "t":
+                reference, lower, upper = restore_training_reference(saved_reference)
+                terminal.write("[REFERENCE] Using saved training reference and workspace for this run.")
+                terminal.workspace(reference, lower, upper, None)
+                terminal.write("[REFERENCE] Before each episode, press 4 to move to the full first training pose.")
+                return reference, lower, upper, reference.copy()
+            if choice in {"c", "current"}:
+                break
+            if choice in {"q", "quit"}:
+                raise KeyboardInterrupt
+            terminal.write("Please use t, c, or q.")
+        terminal.write("[REFERENCE] Capture current TCP for this run; key 4 is unavailable.")
+    else:
+        terminal.write("[REFERENCE] No saved training point; capture current TCP. Key 4 is unavailable.")
+    reference, lower, upper = capture_centered_workspace(
+        robot, randomize_xy=randomize_xy, terminal=terminal,
+    )
+    terminal.write("[REFERENCE] Using captured TCP reference and XYZ +/-5 cm workspace for this run.")
+    return reference, lower, upper, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -172,9 +203,11 @@ def main(argv: list[str] | None = None) -> int:
     terminal = InferenceTerminal(args.episodes, args.episode_time)
     checkpoint = resolve_stage2_checkpoint(args.checkpoint)
     terminal.write(f"Loading Stage-2 checkpoint: {checkpoint}")
+    startup_metadata = {}
     policy, config = load_frozen_policy(
         checkpoint, device=args.device,
         stage1_checkpoint=args.stage1_checkpoint, act_checkpoint=args.act_checkpoint,
+        startup_metadata=startup_metadata,
     )
     from lerobot.policies.factory import make_pre_post_processors
 
@@ -184,6 +217,9 @@ def main(argv: list[str] | None = None) -> int:
         policy.stage1._act.config, pretrained_path=str(act_path),
         preprocessor_overrides={"device_processor": {"device": config.device}},
     )
+    saved_reference = startup_metadata.get("startup_reference")
+    args.reset_xy_half_range_m = (saved_reference.get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
+                                 if saved_reference is not None else Z_SAMPLE_XY_HALF_RANGE_M)
     terminal.configuration(checkpoint, act_path, config, camera_shapes, args)
     if args.dry_run:
         terminal.write("[READY] Model check complete. Robot was not connected.")
@@ -205,9 +241,11 @@ def main(argv: list[str] | None = None) -> int:
         robot.connect()
         terminal.write("[READY] Robot and cameras connected.")
         reference_pose = None
+        initial_reference_pose = None
         if args.z_insertion_mode:
-            reference_pose, workspace_min, workspace_max = capture_centered_workspace(
-                robot, randomize_xy=args.randomize_reset_xy, terminal=terminal,
+            reference_pose, workspace_min, workspace_max, initial_reference_pose = select_run_reference(
+                robot, startup_metadata.get("startup_reference"),
+                randomize_xy=args.randomize_reset_xy, terminal=terminal,
             )
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
@@ -217,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
             max_step_m=config.max_step_m, max_step_rad=config.max_step_rad,
             camera_shapes=camera_shapes, z_insertion_mode=args.z_insertion_mode,
             reference_pose=reference_pose,
+            initial_reference_pose=initial_reference_pose,
+            reset_xy_half_range_m=args.reset_xy_half_range_m,
             randomize_reset_xy=args.randomize_reset_xy,
             sample_min=None if args.sample_min is None else tuple(args.sample_min),
             sample_max=None if args.sample_max is None else tuple(args.sample_max),

@@ -100,3 +100,63 @@ def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, time
         *options,
     ]) == 0
     assert events == (["timestamp"] if timestamped else []) + ["connect", "env", "run", "close", "stop", "disconnect"]
+
+
+def _saved_reference():
+    return dict(version=1, mode="z_insertion", frame="base", position_unit="m",
+                orientation="rotation_vector_rad", reference_pose=[0.4, -0.2, 0.4, 1, 2, 3],
+                workspace_min_xyz=[0.35, -0.25, 0.35], workspace_max_xyz=[0.45, -0.15, 0.45])
+
+
+@pytest.mark.parametrize("choice", ["t"])
+def test_run_reference_uses_saved_training_point(monkeypatch, choice):
+    import io
+    import numpy as np
+    from act_rlt.infer_stage2_terminal import InferenceTerminal
+
+    monkeypatch.setattr("builtins.input", lambda prompt: choice)
+    monkeypatch.setattr(infer_stage2, "capture_centered_workspace",
+                        lambda *a, **k: pytest.fail("training choice must not capture TCP"))
+    reference, lower, upper, initial = infer_stage2.select_run_reference(
+        object(), _saved_reference(), randomize_xy=True,
+        terminal=InferenceTerminal(1, 10, stream=io.StringIO()),
+    )
+    np.testing.assert_allclose(reference, [0.4, -0.2, 0.4, 1, 2, 3])
+    np.testing.assert_allclose(lower, [0.35, -0.25, 0.35])
+    np.testing.assert_allclose(upper, [0.45, -0.15, 0.45])
+    np.testing.assert_array_equal(initial, reference)
+    assert initial is not reference
+
+
+@pytest.mark.parametrize("saved,answers", [(_saved_reference(), ["", "train", "invalid", "c", ""]),
+                                          (None, [""])])
+def test_run_reference_captures_current_tcp_and_new_workspace(monkeypatch, saved, answers):
+    import io
+    import numpy as np
+    from act_rlt.infer_stage2_terminal import InferenceTerminal
+
+    answers = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    # Real capture reads the TCP only after its Enter confirmation.
+    current = [0.6, 0.1, 0.41, 4, 5, 6]
+    robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=lambda: current))
+    reference, lower, upper, initial = infer_stage2.select_run_reference(
+        robot, saved, randomize_xy=True,
+        terminal=InferenceTerminal(1, 10, stream=io.StringIO()),
+    )
+    np.testing.assert_array_equal(reference, current)
+    np.testing.assert_allclose(lower, [0.55, 0.05, 0.36])
+    np.testing.assert_allclose(upper, [0.65, 0.15, 0.46])
+    assert initial is None  # No training-pose shortcut in the newly captured workspace.
+
+
+def test_run_reference_quit_does_not_read_or_move_robot(monkeypatch):
+    import io
+    from act_rlt.infer_stage2_terminal import InferenceTerminal
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "q")
+    with pytest.raises(KeyboardInterrupt):
+        infer_stage2.select_run_reference(
+            object(), _saved_reference(), randomize_xy=True,
+            terminal=InferenceTerminal(1, 10, stream=io.StringIO()),
+        )

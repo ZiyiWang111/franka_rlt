@@ -21,6 +21,9 @@ from act_rlt.infer import (
     build_parser,
     checkpoint_camera_shapes,
     centered_bounds,
+    adjust_reset_xy_range,
+    validate_sample_bounds,
+    prompt_reset_choice,
     confirm_centered_bounds,
     move_to_next_sample,
     observation_frame,
@@ -117,13 +120,13 @@ def test_motion_cli_uses_confirmed_center_instead_of_workspace_arguments():
         parser.parse_args(["--checkpoint", "model", "--workspace-min", "0", "0", "0"])
 
 
-def test_centered_xy_with_fixed_absolute_sample_and_workspace_z():
+def test_centered_xy_defaults_to_zero_range_and_measured_xyz_workspace():
     pose = [0.4, -0.2, 0.3, 1, 2, 3]
     sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
-    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.402])
-    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.402])
-    np.testing.assert_allclose(workspace_min, [-np.inf, -np.inf, 0.367])
-    np.testing.assert_allclose(workspace_max, [np.inf, np.inf, 0.412])
+    np.testing.assert_allclose(sample_min, [0.4, -0.2, 0.402])
+    np.testing.assert_allclose(sample_max, [0.4, -0.2, 0.402])
+    np.testing.assert_allclose(workspace_min, [0.35, -0.25, 0.25])
+    np.testing.assert_allclose(workspace_max, [0.45, -0.15, 0.35])
     rng = np.random.default_rng(0)
     for _ in range(20):
         sampled = sample_workspace_pose(sample_min, sample_max, [1, 2, 3], 0.0, rng)
@@ -162,7 +165,7 @@ def test_confirm_centered_bounds_only_enables_limits_after_enter():
     config = SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None)
     robot = SimpleNamespace(
         config=config,
-        robot=SimpleNamespace(get_tool_pose=lambda: [0.4, -0.2, 0.3, 1, 2, 3]),
+        robot=SimpleNamespace(get_tool_pose=lambda: [0.4, -0.2, 0.4, 1, 2, 3]),
     )
     with patch("builtins.input", return_value="q"):
         assert confirm_centered_bounds(robot) is None
@@ -171,25 +174,25 @@ def test_confirm_centered_bounds_only_enables_limits_after_enter():
 
     with patch("builtins.input", return_value=""):
         sample_min, sample_max, orientation = confirm_centered_bounds(robot)
-    np.testing.assert_allclose(sample_min, [0.38, -0.22, 0.402])
-    np.testing.assert_allclose(sample_max, [0.42, -0.18, 0.402])
+    np.testing.assert_allclose(sample_min, [0.4, -0.2, 0.402])
+    np.testing.assert_allclose(sample_max, [0.4, -0.2, 0.402])
     expected_rotation = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True)
     np.testing.assert_allclose(Rotation.from_rotvec(orientation).as_matrix(), expected_rotation.as_matrix())
-    np.testing.assert_allclose(config.workspace_min_xyz, [-np.inf, -np.inf, 0.367])
-    np.testing.assert_allclose(config.workspace_max_xyz, [np.inf, np.inf, 0.412])
+    np.testing.assert_allclose(config.workspace_min_xyz, [0.35, -0.25, 0.35])
+    np.testing.assert_allclose(config.workspace_max_xyz, [0.45, -0.15, 0.45])
 
 
 def test_enter_captures_latest_xy_but_samples_use_fixed_collection_z_and_orientation():
     config = SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None)
     poses = iter([
-        [0.4, -0.2, 0.3, 1, 2, 3],  # preview before Enter
+        [0.4, -0.2, 0.4, 1, 2, 3],  # preview before Enter
         [0.5, -0.1, 0.4, 4, 5, 6],  # measured when Enter is pressed
     ])
     robot = SimpleNamespace(config=config, robot=SimpleNamespace(get_tool_pose=lambda: next(poses)))
     with patch("builtins.input", return_value=""):
         sample_min, sample_max, orientation = confirm_centered_bounds(robot)
-    np.testing.assert_allclose(sample_min, [0.48, -0.12, 0.402])
-    np.testing.assert_allclose(sample_max, [0.52, -0.08, 0.402])
+    np.testing.assert_allclose(sample_min, [0.5, -0.1, 0.402])
+    np.testing.assert_allclose(sample_max, [0.5, -0.1, 0.402])
     expected_rotation = Rotation.from_euler("XYZ", [179.7, 1.4, 90.6], degrees=True)
     rng = np.random.default_rng(0)
     for _ in range(20):
@@ -200,8 +203,8 @@ def test_enter_captures_latest_xy_but_samples_use_fixed_collection_z_and_orienta
         np.testing.assert_allclose(
             Rotation.from_rotvec(sampled[3:]).as_matrix(), expected_rotation.as_matrix()
         )
-    np.testing.assert_allclose(config.workspace_min_xyz, [-np.inf, -np.inf, 0.367])
-    np.testing.assert_allclose(config.workspace_max_xyz, [np.inf, np.inf, 0.412])
+    np.testing.assert_allclose(config.workspace_min_xyz, [0.45, -0.15, 0.35])
+    np.testing.assert_allclose(config.workspace_max_xyz, [0.55, -0.05, 0.45])
 
 
 def test_reset_orientation_is_not_a_cli_argument():
@@ -494,31 +497,28 @@ def test_franka_residual_target_uses_offset_and_preserves_workspace_guard():
     assert len(sent) == 2
 
 
-def test_infer_workspace_allows_far_xy_but_rejects_z_outside_bounds():
+def test_infer_workspace_rejects_targets_outside_captured_xyz_bounds():
     from evo_rlt.adapters.lerobot.franka_robot.franka_robot import FrankaRobot
 
     _, _, lower, upper = centered_bounds([0.4, -0.2, 0.402, 0, 0, 0])
     sent = []
     robot = SimpleNamespace(
         robot=SimpleNamespace(
-            get_tool_pose=lambda: [0.8, 0.3, 0.402, 0, 0, 0],
+            get_tool_pose=lambda: [0.4, -0.2, 0.402, 0, 0, 0],
             servo_tool=lambda pose: sent.append(pose),
         ),
         config=SimpleNamespace(workspace_min_xyz=tuple(lower), workspace_max_xyz=tuple(upper)),
         _cmd_pose=None,
     )
     FrankaRobot.send_action(robot, _xyz_action(dx=0.001, dy=0.001))
-    np.testing.assert_allclose(sent[-1][:3], [0.801, 0.301, 0.402])
-    robot.robot.get_tool_pose = lambda: [0.8, 0.3, 0.369, 0, 0, 0]
-    robot._cmd_pose = None
-    FrankaRobot.send_action(robot, _xyz_action())
-    np.testing.assert_allclose(sent[-1][:3], [0.8, 0.3, 0.369])
-    for z in (0.366, 0.413):
-        robot.robot.get_tool_pose = lambda z=z: [0.8, 0.3, z, 0, 0, 0]
+    np.testing.assert_allclose(sent[-1][:3], [0.401, -0.199, 0.402])
+    for xyz in ([0.8, -0.2, 0.402], [0.4, 0.3, 0.402],
+                [0.4, -0.2, 0.351], [0.4, -0.2, 0.453]):
+        robot.robot.get_tool_pose = lambda xyz=xyz: [*xyz, 0, 0, 0]
         robot._cmd_pose = None
         with TestCase().assertRaisesRegex(RuntimeError, "outside workspace"):
             FrankaRobot.send_action(robot, _xyz_action())
-    assert len(sent) == 2
+    assert len(sent) == 1
 
 
 def test_temporal_ensemble_uses_paper_log_weights_for_same_timestep():
@@ -577,9 +577,8 @@ def test_full_trace_records_every_step_chunks_and_tcp_targets(tmp_path):
     events = [json.loads(line) for line in paths[0].read_text().splitlines()]
     assert events[0]["event"] == "episode_start"
     assert events[0]["episode_index"] == 6
-    assert events[0]["workspace_min_xyz"] == [None, None, 0.367]
-    np.testing.assert_allclose(events[0]["workspace_max_xyz"][2], 0.412)
-    assert events[0]["workspace_max_xyz"][:2] == [None, None]
+    np.testing.assert_allclose(events[0]["workspace_min_xyz"], lower)
+    np.testing.assert_allclose(events[0]["workspace_max_xyz"], upper)
     assert events[-1]["event"] == "episode_end"
     chunks = [event for event in events if event["event"] == "model_chunk"]
     steps = [event for event in events if event["event"] == "control_step"]
@@ -854,3 +853,45 @@ if __name__ == "__main__":
     test_action_limits_preserve_direction_and_hold_gripper()
     test_invalid_action_is_rejected()
     print("3 checks passed")
+
+
+def test_reset_range_steps_and_limits():
+    assert adjust_reset_xy_range(0, "-") == 0
+    assert adjust_reset_xy_range(0, "=") == 0.005
+    assert adjust_reset_xy_range(0.01, "-") == 0.005
+    assert adjust_reset_xy_range(0.05, "=") == 0.05
+
+
+def test_adjusted_sampling_keeps_reference_and_fixed_collection_pose():
+    reference = np.array([0.4, -0.2, 0.4, 1, 2, 3])
+    original = reference.copy()
+    rng = np.random.default_rng(0)
+    for radius in (0, 0.005, 0.05):
+        lower, upper, workspace_min, workspace_max = centered_bounds(reference, radius)
+        validate_sample_bounds(lower, upper, workspace_min, workspace_max)
+        pose = sample_workspace_pose(lower, upper, [1, 2, 3], 0, rng)
+        assert np.all(pose[:3] >= lower) and np.all(pose[:3] <= upper)
+        np.testing.assert_allclose((lower[:2] + upper[:2]) / 2, reference[:2])
+        assert pose[2] == 0.402
+    np.testing.assert_array_equal(reference, original)
+    with TestCase().assertRaises(ValueError):
+        centered_bounds(reference, 0.051)
+    lower, upper, workspace_min, workspace_max = centered_bounds([0.4, -0.2, 0.3, 1, 2, 3])
+    with TestCase().assertRaisesRegex(ValueError, "outside the safe workspace"):
+        validate_sample_bounds(lower, upper, workspace_min, workspace_max)
+
+
+def test_lift_outside_workspace_does_not_move():
+    robot = SimpleNamespace(
+        config=SimpleNamespace(workspace_min_xyz=(0.35, -0.25, 0.35),
+                               workspace_max_xyz=(0.45, -0.15, 0.45)),
+        robot=SimpleNamespace(get_tool_pose=lambda: [0.4, -0.2, 0.445, 1, 2, 3],
+                              move_tool=lambda *a, **k: TestCase().fail("must not move")),
+    )
+    with TestCase().assertRaisesRegex(RuntimeError, "retreat would leave workspace"):
+        move_to_next_sample(robot, [0.4, -0.2, 0.402, 1, 2, 3], 0.02)
+
+
+def test_reset_choice_non_tty_accepts_range_key():
+    with patch("sys.stdin.isatty", return_value=False), patch("builtins.input", return_value="="):
+        assert prompt_reset_choice("reset", {"=": "increase"}) == "increase"

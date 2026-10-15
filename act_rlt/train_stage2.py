@@ -14,6 +14,7 @@ import random
 import select
 import sys
 import termios
+import tempfile
 import time
 import tty
 from dataclasses import asdict
@@ -56,7 +57,8 @@ RESET_MOVE_SPEED_M_S = 0.02
 RESET_XY_MARGIN_M = 0.02
 STARTUP_WORKSPACE_HALF_RANGE_M = 0.05
 Z_SAMPLE_XY_HALF_RANGE_M = 0.01
-FIXED_RESET_XY_OFFSETS_M = ((0.0, 0.0), (-0.02, -0.02), (0.02, -0.02))
+RESET_XY_RANGE_STEP_M = 0.005
+RESET_XY_MAX_HALF_RANGE_M = 0.05
 
 
 def retreat_pose_along_positive_y(
@@ -100,9 +102,10 @@ def sample_z_insertion_workspace_pose(
     workspace_min: np.ndarray,
     workspace_max: np.ndarray,
     *,
-    randomize_xy: bool = False,
+    randomize_xy: bool = True,
+    xy_half_range: float = Z_SAMPLE_XY_HALF_RANGE_M,
 ) -> np.ndarray:
-    """Use p1 XY, optionally randomized ±1 cm, with fixed Z and orientation."""
+    """Sample around the immutable reference XY, with fixed Z and orientation."""
     reference = np.asarray(reference, dtype=float)
     lower = np.asarray(workspace_min, dtype=float)
     upper = np.asarray(workspace_max, dtype=float)
@@ -114,7 +117,9 @@ def sample_z_insertion_workspace_pose(
         or np.any(lower >= upper)
     ):
         raise ValueError("invalid Z insertion workspace bounds")
-    xy_half_range = Z_SAMPLE_XY_HALF_RANGE_M if randomize_xy else 0.0
+    if not np.isfinite(xy_half_range) or not 0 <= xy_half_range <= RESET_XY_MAX_HALF_RANGE_M:
+        raise ValueError("reset XY half range must be between 0 and 0.05 m")
+    xy_half_range = xy_half_range if randomize_xy else 0.0
     sample_min = reference[:3] + [-xy_half_range, -xy_half_range, 0]
     sample_max = reference[:3] + [xy_half_range, xy_half_range, 0]
     sample_min[2] = sample_max[2] = SAMPLE_Z_M
@@ -124,20 +129,6 @@ def sample_z_insertion_workspace_pose(
         raise ValueError("Z insertion endpoint extends below the safe workspace")
     position = np.random.uniform(sample_min, sample_max) if randomize_xy else sample_min
     return np.concatenate([position, SAMPLE_ROTATION_VECTOR])
-
-
-def fixed_z_insertion_reset_points(
-    reference: np.ndarray,
-    workspace_min: np.ndarray,
-    workspace_max: np.ndarray,
-) -> np.ndarray:
-    """Build p1/p2/p3 reset targets with base-frame XY offsets in metres."""
-    base = sample_z_insertion_workspace_pose(reference, workspace_min, workspace_max)
-    points = np.tile(base, (3, 1))
-    points[:, :2] += np.asarray(FIXED_RESET_XY_OFFSETS_M)
-    if np.any(points[:, :3] < workspace_min) or np.any(points[:, :3] > workspace_max):
-        raise ValueError("p1/p2/p3 reset points extend outside the safe workspace")
-    return points
 
 
 def read_reset_point_choice(prompt: str) -> str:
@@ -162,7 +153,7 @@ def read_reset_point_choice(prompt: str) -> str:
 
 
 def capture_centered_workspace(
-    robot, *, randomize_xy: bool = False, terminal=None,
+    robot, *, randomize_xy: bool = True, terminal=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Capture the current TCP pose on Enter, then bound XYZ to ±5 cm."""
     while True:
@@ -184,28 +175,38 @@ def capture_centered_workspace(
     lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
     upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
     if terminal is not None:
-        points = None if randomize_xy else fixed_z_insertion_reset_points(pose, lower, upper)
-        terminal.workspace(pose, lower, upper, points)
+        terminal.workspace(pose, lower, upper, None)
         return pose, lower, upper
     print(
         f"Captured p1 reference: {pose.tolist()}; workspace XYZ: "
         f"min={lower.tolist()}, max={upper.tolist()}",
         flush=True,
     )
-    xy_description = (
-        f"XY randomized +/-{Z_SAMPLE_XY_HALF_RANGE_M:.3f} m around p1"
-        if randomize_xy else "select fixed p1/p2/p3 with keys 1/2/3"
-    )
+    xy_description = f"XY randomized +/-{Z_SAMPLE_XY_HALF_RANGE_M:.3f} m around initial reference"
     print(
         f"Sample resets: {xy_description}, "
         f"fixed absolute Z={SAMPLE_Z_M:.3f} m, "
         f"intrinsic XYZ Euler={SAMPLE_EULER_XYZ_DEG} deg.",
         flush=True,
     )
-    if not randomize_xy:
-        points = fixed_z_insertion_reset_points(pose, lower, upper)
-        for index, point in enumerate(points, start=1):
-            print(f"Recorded reset p{index} (m, rotvec rad): {point.tolist()}", flush=True)
+    return pose, lower, upper
+
+
+def restore_training_reference(saved: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate the base-frame pose and workspace recorded with this checkpoint."""
+    saved = saved.get("initial_reference", saved)
+    if (saved.get("version") != 1 or saved.get("mode") != "z_insertion"
+            or saved.get("frame") != "base" or saved.get("position_unit") != "m"
+            or saved.get("orientation") != "rotation_vector_rad"):
+        raise ValueError("unsupported saved training reference metadata")
+    pose = np.asarray(saved["reference_pose"], dtype=float)
+    lower = np.asarray(saved["workspace_min_xyz"], dtype=float)
+    upper = np.asarray(saved["workspace_max_xyz"], dtype=float)
+    if (pose.shape != (6,) or lower.shape != (3,) or upper.shape != (3,)
+            or not all(np.isfinite(value).all() for value in (pose, lower, upper))
+            or np.any(lower >= upper) or np.any(pose[:3] < lower)
+            or np.any(pose[:3] > upper)):
+        raise ValueError("invalid saved training reference pose or workspace")
     return pose, lower, upper
 
 
@@ -302,8 +303,11 @@ class FrankaInsertionStage2Env:
         sample_max: tuple[float, float, float] | None = None,
         camera_shapes: dict[str, tuple[int, int, int]] | None = None,
         z_insertion_mode: bool = False,
-        randomize_reset_xy: bool = False,
+        randomize_reset_xy: bool = True,
         reference_pose: np.ndarray | None = None,
+        initial_reference_pose: np.ndarray | None = None,
+        reset_xy_half_range_m: float = Z_SAMPLE_XY_HALF_RANGE_M,
+        save_snapshot=None,
         enable_human_intervention: bool = False,
         teleop_input_backend: str = "evdev",
         teleop_keyboard: str | None = None,
@@ -322,6 +326,7 @@ class FrankaInsertionStage2Env:
             raise ValueError("ACT preprocessor has no NormalizerProcessorStep") from error
         self.config = config
         self.inference_terminal = inference_terminal
+        self.save_snapshot = save_snapshot
         self.camera_shapes = camera_shapes
         self.period_s = 1.0 / fps
         self.episode_time_s = episode_time_s
@@ -344,12 +349,20 @@ class FrankaInsertionStage2Env:
             None if sample_max is None else np.asarray(sample_max, dtype=float)
         )
         self.z_insertion_mode = z_insertion_mode
-        self.randomize_reset_xy = randomize_reset_xy
+        self.randomize_reset_xy = True
+        if (not np.isfinite(reset_xy_half_range_m)
+                or not 0 <= reset_xy_half_range_m <= RESET_XY_MAX_HALF_RANGE_M):
+            raise ValueError("reset XY half range must be between 0 and 0.05 m")
+        self.reset_xy_half_range_m = float(reset_xy_half_range_m)
         self._reference_pose = (
             None if reference_pose is None else np.asarray(reference_pose, dtype=float).copy()
         )
-        self._fixed_reset_points: np.ndarray | None = None
-        self._selected_reset_point = 0
+        self._initial_reference_pose = (
+            None if initial_reference_pose is None
+            else np.asarray(initial_reference_pose, dtype=float).copy()
+        )
+        if self._initial_reference_pose is not None:
+            self._reference_pose = self._initial_reference_pose.copy()
         if (
             self.workspace_min.shape != (3,)
             or self.workspace_max.shape != (3,)
@@ -358,6 +371,12 @@ class FrankaInsertionStage2Env:
             or np.any(self.workspace_min >= self.workspace_max)
         ):
             raise ValueError("automatic reset requires valid 3D workspace bounds")
+        if self._initial_reference_pose is not None:
+            pose = self._initial_reference_pose
+            if (pose.shape != (6,) or not np.isfinite(pose).all()
+                    or np.any(pose[:3] < self.workspace_min)
+                    or np.any(pose[:3] > self.workspace_max)):
+                raise ValueError("initial training reference pose must be finite and inside workspace")
         self._monitor: OutcomeMonitor | None = None
         self._episode_start = 0.0
         self._reset_orientation: np.ndarray | None = None
@@ -449,19 +468,12 @@ class FrankaInsertionStage2Env:
                     f"{self._format_pose(self._reset_orientation)}",
                     flush=True,
                 )
-        fixed_points_mode = self.z_insertion_mode and not self.randomize_reset_xy
-        if fixed_points_mode and self._fixed_reset_points is None:
-            self._fixed_reset_points = fixed_z_insertion_reset_points(
-                self._reference_pose, self.workspace_min, self.workspace_max
-            )
         while True:
-            if fixed_points_mode:
-                target = self._fixed_reset_points[self._selected_reset_point].copy()
-                label = f"reset p{self._selected_reset_point + 1}"
-            elif self.z_insertion_mode:
+            at_reference = False
+            if self.z_insertion_mode:
                 target = sample_z_insertion_workspace_pose(
                     self._reference_pose, self.workspace_min, self.workspace_max,
-                    randomize_xy=self.randomize_reset_xy,
+                    xy_half_range=self.reset_xy_half_range_m,
                 )
                 label = "sampled workspace reset pose"
             else:
@@ -482,48 +494,82 @@ class FrankaInsertionStage2Env:
                     prompt = terminal.prompt(
                         f"First target: {terminal.pose(target)}\n  Enter/y: move | q: exit"
                     )
-                choice = input(prompt).strip().lower()
-                if choice not in {"", "y", "yes"}:
+                if self.z_insertion_mode:
+                    prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range"
+                if self._initial_reference_pose is not None:
+                    prompt += " | 4: first training reference"
+                if self.save_snapshot is not None:
+                    prompt += " | p: save episode snapshot"
+                if self.z_insertion_mode or self._initial_reference_pose is not None or self.save_snapshot is not None:
+                    prompt += ": "
+                    choice = read_reset_point_choice(prompt)
+                else:
+                    choice = input(prompt).strip().lower()
+                if choice == "p" and self.save_snapshot is not None:
+                    self.save_snapshot()
+                    continue
+                if choice in {"=", "-"} and self.z_insertion_mode:
+                    self._adjust_reset_xy_range(choice)
+                    continue
+                if choice == "4" and self._initial_reference_pose is not None:
+                    target = self._initial_reference_pose.copy()
+                    label = "first training reference pose"
+                    at_reference = True
+                elif choice not in {"", "y", "yes"}:
                     if choice in {"q", "quit"}:
                         raise KeyboardInterrupt
                     print("First automatic reset not authorized; stopping.", flush=True)
                     raise KeyboardInterrupt
                 self._first_reset_move = False
             self._move_reset_pose(target, label=label)
-            if fixed_points_mode:
-                while True:
-                    prompt = (
-                        f"At p{self._selected_reset_point + 1}: "
-                        "1/2/3=move to p1/p2/p3, Enter=start episode, q=stop: "
+            while True:
+                reference_hint = ("4=first training reference, "
+                                  if self._initial_reference_pose is not None else "")
+                location = "First training reference" if at_reference else "Sample point"
+                prompt = (f"{location} OK? [Enter/y]=start episode, r=move to a new sample, "
+                          f"{reference_hint}q=stop: ")
+                if terminal is not None:
+                    prompt = terminal.prompt(
+                        f"{location} ready | Enter/y: start | r: new sample | {reference_hint}q: exit"
                     )
-                    if terminal is not None:
-                        prompt = terminal.prompt(
-                            f"At p{self._selected_reset_point + 1} | 1/2/3: move | Enter: start | q: exit"
-                        )
-                    choice = read_reset_point_choice(prompt)
-                    if choice == "":
-                        return
-                    if choice in {"1", "2", "3"}:
-                        self._selected_reset_point = int(choice) - 1
-                        break
-                    if choice in {"q", "quit"}:
-                        raise KeyboardInterrupt
-                    print("Please use 1, 2, 3, Enter, or q.", flush=True)
-                continue
-            prompt = (
-                "Sample point OK? [Enter/y]=start episode, r=move to a new sample, "
-                "q=stop training: "
-            )
-            if terminal is not None:
-                prompt = terminal.prompt("Reset ready | Enter/y: start | r: new sample | q: exit")
-            choice = input(prompt).strip().lower()
-            if choice in {"", "y", "yes"}:
-                return
-            if choice in {"r", "retry", "n", "no"}:
-                continue
-            if choice in {"q", "quit"}:
-                raise KeyboardInterrupt
-            print("Please enter y, r, or q.", flush=True)
+                if self.z_insertion_mode:
+                    prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range: "
+                if self.save_snapshot is not None:
+                    prompt += " p: save episode snapshot: "
+                choice = (read_reset_point_choice(prompt)
+                          if self.z_insertion_mode or self._initial_reference_pose is not None or self.save_snapshot is not None
+                          else input(prompt).strip().lower())
+                if choice == "p" and self.save_snapshot is not None:
+                    self.save_snapshot()
+                    continue
+                if choice in {"=", "-"} and self.z_insertion_mode:
+                    self._adjust_reset_xy_range(choice)
+                    continue
+                if choice in {"", "y", "yes"}:
+                    return
+                if choice == "4" and self._initial_reference_pose is not None:
+                    self._move_reset_pose(self._initial_reference_pose.copy(),
+                                          label="first training reference pose")
+                    at_reference = True
+                    continue
+                if choice in {"r", "retry", "n", "no"}:
+                    break
+                if choice in {"q", "quit"}:
+                    raise KeyboardInterrupt
+                print(f"Please use Enter/y, r, {reference_hint}or q.", flush=True)
+
+    def _adjust_reset_xy_range(self, key: str) -> None:
+        steps = round(self.reset_xy_half_range_m / RESET_XY_RANGE_STEP_M)
+        steps = max(0, min(round(RESET_XY_MAX_HALF_RANGE_M / RESET_XY_RANGE_STEP_M),
+                           steps + (1 if key == "=" else -1)))
+        self.reset_xy_half_range_m = steps * RESET_XY_RANGE_STEP_M
+        message = (f"Next reset: XY +/-{self.reset_xy_half_range_m * 100:g} cm "
+                   f"around initial reference {self._reference_pose[:2].tolist()}; "
+                   "current pose unchanged. Press r to sample now.")
+        if self.inference_terminal is not None:
+            self.inference_terminal.write(message)
+        else:
+            print(message, flush=True)
 
     @staticmethod
     def _prompt_outcome_after_timeout() -> str:
@@ -873,11 +919,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--z-insertion-mode", action="store_true",
-        help="reset at selectable p1/p2/p3 with fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
+        help="random XY reset around initial reference, fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
     )
     parser.add_argument(
-        "--randomize-reset-xy", action="store_true",
-        help="with --z-insertion-mode, randomize reset X/Y +/-1 cm around p1 (default: select p1/p2/p3)",
+        "--randomize-reset-xy", action="store_true", default=True,
+        help="compatibility option; Z insertion always uses random XY reset by default",
     )
     parser.add_argument("--fps", type=float, default=None,
                         help="control rate in Hz (default: 30 for Z insertion, 15 otherwise)")
@@ -914,14 +960,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="BC regularization coefficient in -Q + beta * BC (default: 2.0)")
     parser.add_argument("--exploration-sigma", type=float, default=0.3,
                         help="fixed normalized action standard deviation during collection (default: 0.3)")
+    parser.add_argument(
+        "--target-q-clipping", action=argparse.BooleanOptionalAction, default=True,
+        help="clip bootstrap next-Q to [0,1] (default: enabled; --no-target-q-clipping disables it)",
+    )
     parser.add_argument("--save-every-env-steps", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.randomize_reset_xy and not args.z_insertion_mode:
-        parser.error("--randomize-reset-xy requires --z-insertion-mode")
     if args.fps is None:
         args.fps = 30.0 if args.z_insertion_mode else 15.0
     if args.teleop_input_backend == "auto":
@@ -997,12 +1045,14 @@ def save_checkpoint(
     learner: Stage2Learner,
     replay: ReplayBuffer,
     metrics: OnlineStage2Metrics,
+    *, startup_reference: dict | None = None,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "config": config.to_dict(),
+        "startup_reference": startup_reference,
         "learner": learner.state_dict(),
         "replay": list(replay.buffer),
         "metrics": {
@@ -1026,8 +1076,11 @@ def load_checkpoint(
     config: ACTStage2Config,
     learner: Stage2Learner,
     replay: ReplayBuffer,
+    *, startup_metadata: dict | None = None,
 ) -> OnlineStage2Metrics:
     saved = torch.load(path, map_location="cpu", weights_only=False)
+    if startup_metadata is not None:
+        startup_metadata["startup_reference"] = saved.get("startup_reference")
     if saved["learner"].get("learner_version") != 3:
         raise ValueError(
             "old Stage-2 network cannot resume with balanced input fusion; "
@@ -1041,9 +1094,10 @@ def load_checkpoint(
     saved_config.setdefault(
         "temporal_ensemble_coeff", current_config["temporal_ensemble_coeff"]
     )
-    # Beta and exploration std affect future updates/collection, without
+    saved_config.setdefault("target_q_clipping", True)
+    # Beta, exploration std, and Q clipping affect future updates/collection, without
     # invalidating the network, optimizer state, or replay contents.
-    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta", "actor_fixed_std"}
+    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta", "actor_fixed_std", "target_q_clipping"}
     incompatible = {
         key: (saved_config.get(key), current_config.get(key))
         for key in set(saved_config) | set(current_config)
@@ -1228,6 +1282,7 @@ def main() -> int:
         utd_ratio=args.utd_ratio,
         beta=args.beta,
         actor_fixed_std=args.exploration_sigma,
+        target_q_clipping=args.target_q_clipping,
         seed=args.seed,
         temporal_ensemble_coeff=args.temporal_ensemble_coeff,
         bc_init_steps=args.bc_init_steps,
@@ -1256,8 +1311,10 @@ def main() -> int:
     learner.configure_action_projection(post)
     replay = ReplayBuffer(config.replay_capacity)
     metrics = OnlineStage2Metrics()
+    startup_metadata = {"startup_reference": None}
     if args.resume:
-        metrics = load_checkpoint(output / "checkpoints/latest.pt", config, learner, replay)
+        metrics = load_checkpoint(output / "checkpoints/latest.pt", config, learner, replay,
+                                  startup_metadata=startup_metadata)
     elif args.replay_from:
         metrics = import_replay(args.replay_from, config, replay)
     if args.dry_run:
@@ -1271,7 +1328,8 @@ def main() -> int:
         learner.initialize(replay)
         metrics.critic_updates = learner.critic_updates
         metrics.actor_updates = learner.actor_updates
-        save_checkpoint(output, config, learner, replay, metrics)
+        save_checkpoint(output, config, learner, replay, metrics,
+                        startup_reference=startup_metadata["startup_reference"])
         (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
         print(f"Prepared v3 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
         return 0
@@ -1301,12 +1359,50 @@ def main() -> int:
     last_save_step = metrics.env_steps
     metrics_writer = None
 
+    def current_reference() -> dict | None:
+        reference = startup_metadata["startup_reference"]
+        if reference is not None and env is not None:
+            reference["reset_xy_half_range_m"] = env.reset_xy_half_range_m
+        return reference
+
+    def save_episode_snapshot() -> None:
+        if metrics.episodes == 0:
+            print("No completed episode to snapshot yet.", flush=True)
+            return
+        snapshot_output = output.with_name(f"{output.name}_step{metrics.env_steps}")
+        if snapshot_output.exists():
+            print(f"Snapshot already exists; kept unchanged: {snapshot_output}", flush=True)
+            return
+        reference = current_reference()
+        try:
+            # Publish a complete sibling output only after all files are written.
+            with tempfile.TemporaryDirectory(prefix=f".{snapshot_output.name}_", dir=output.parent) as temporary:
+                staged = Path(temporary)
+                save_checkpoint(staged, config, learner, replay, metrics,
+                                startup_reference=reference)
+                (staged / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
+                if reference is not None:
+                    (staged / "startup_reference.json").write_text(json.dumps(reference, indent=2) + "\n")
+                (staged / "snapshot.json").write_text(json.dumps({
+                    "source_output": str(output), "env_steps": metrics.env_steps,
+                    "episodes": metrics.episodes, "created_at_unix_s": time.time(),
+                    "actor_initialized": bool(learner.initialized),
+                    "reset_xy_half_range_m": env.reset_xy_half_range_m if env is not None else None,
+                }, indent=2) + "\n")
+                staged.rename(snapshot_output)
+        except Exception as exc:
+            print(f"Snapshot save failed; training can continue: {exc}", flush=True)
+            return
+        print(f"Episode snapshot saved: {snapshot_output}\n"
+              "Continue training here; resume or infer can load the snapshot output separately.", flush=True)
+
     def on_chunk(current: OnlineStage2Metrics, execution: ChunkExecution) -> None:
         nonlocal last_save_step
         assert metrics_writer is not None
         append_metrics(metrics_writer, current, execution)
         if execution.done or current.env_steps - last_save_step >= args.save_every_env_steps:
-            save_checkpoint(output, config, learner, replay, current)
+            save_checkpoint(output, config, learner, replay, current,
+                            startup_reference=current_reference())
             last_save_step = current.env_steps
 
     try:
@@ -1316,11 +1412,43 @@ def main() -> int:
         robot.connect()
         reference_pose = None
         if args.z_insertion_mode:
-            reference_pose, workspace_min, workspace_max = capture_centered_workspace(
-                robot, randomize_xy=args.randomize_reset_xy
-            )
+            saved_reference = startup_metadata["startup_reference"]
+            if saved_reference is not None:
+                reference_pose, workspace_min, workspace_max = restore_training_reference(saved_reference)
+                print(f"Restored initial training reference: {reference_pose.tolist()}", flush=True)
+            else:
+                reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot)
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
+            startup_reference = {
+                "version": 1,
+                "mode": "z_insertion",
+                "frame": "base",
+                "position_unit": "m",
+                "orientation": "rotation_vector_rad",
+                "captured_at_unix_s": time.time(),
+                "reference_pose": reference_pose.tolist(),
+                "workspace_min_xyz": workspace_min.tolist(),
+                "workspace_max_xyz": workspace_max.tolist(),
+                "reset_z_m": SAMPLE_Z_M,
+                "reset_rotation_vector": np.asarray(SAMPLE_ROTATION_VECTOR).tolist(),
+                "randomize_reset_xy": True,
+                "reset_xy_half_range_m": (saved_reference.get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
+                                          if saved_reference is not None else Z_SAMPLE_XY_HALF_RANGE_M),
+            }
+            previous_reference = startup_metadata["startup_reference"]
+            startup_reference["initial_reference"] = (
+                previous_reference.get("initial_reference", previous_reference)
+                if previous_reference is not None else dict(startup_reference)
+            )
+            startup_metadata["startup_reference"] = startup_reference
+            reference_file = output / "startup_reference.json"
+            temporary_reference = output / "startup_reference.json.tmp"
+            temporary_reference.write_text(json.dumps(startup_reference, indent=2) + "\n")
+            temporary_reference.replace(reference_file)
+            save_checkpoint(output, config, learner, replay, metrics,
+                            startup_reference=startup_reference)
+            print(f"Saved training reference and workspace: {reference_file}", flush=True)
         env = FrankaInsertionStage2Env(
             robot=robot,
             preprocessor=pre,
@@ -1334,6 +1462,9 @@ def main() -> int:
             z_insertion_mode=args.z_insertion_mode,
             randomize_reset_xy=args.randomize_reset_xy,
             reference_pose=reference_pose,
+            reset_xy_half_range_m=(startup_metadata["startup_reference"].get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
+                                   if startup_metadata["startup_reference"] is not None else Z_SAMPLE_XY_HALF_RANGE_M),
+            save_snapshot=save_episode_snapshot,
             sample_min=None if args.sample_min is None else tuple(args.sample_min),
             sample_max=None if args.sample_max is None else tuple(args.sample_max),
             enable_human_intervention=args.enable_human_intervention,
@@ -1366,7 +1497,8 @@ def main() -> int:
                         robot.disconnect()
             finally:
                 try:
-                    save_checkpoint(output, config, learner, replay, metrics)
+                    save_checkpoint(output, config, learner, replay, metrics,
+                                    startup_reference=current_reference())
                 finally:
                     if metrics_writer is not None:
                         metrics_writer.close()

@@ -24,10 +24,10 @@ import numpy as np
 
 
 KEY_DIRECTIONS = {
-    "KEY_W": np.array([1.0, 0.0, 0.0]),
-    "KEY_S": np.array([-1.0, 0.0, 0.0]),
-    "KEY_A": np.array([0.0, 1.0, 0.0]),
-    "KEY_D": np.array([0.0, -1.0, 0.0]),
+    "KEY_W": np.array([-1.0, 0.0, 0.0]),
+    "KEY_S": np.array([1.0, 0.0, 0.0]),
+    "KEY_A": np.array([0.0, -1.0, 0.0]),
+    "KEY_D": np.array([0.0, 1.0, 0.0]),
     "KEY_P": np.array([0.0, 0.0, 1.0]),
     "KEY_L": np.array([0.0, 0.0, -1.0]),
 }
@@ -531,7 +531,7 @@ def run_evdev(device: Any, teleop: Teleop) -> None:
         getattr(ecodes, RECORD_WAYPOINT_KEY): RECORD_WAYPOINT_KEY,
     }
     print(
-        "Ready: W/S=+X/-X, A/D=+Y/-Y, P/L=+Z/-Z; C=close, O=open (only when "
+        "Ready: W/S=-X/+X, A/D=-Y/+Y, P/L=+Z/-Z; C=close, O=open (only when "
         "motion keys are released); R then 1-9=save waypoint, 1-9=recall; ESC exits.",
         flush=True,
     )
@@ -625,7 +625,7 @@ def run_pynput(teleop: Teleop, *, suppress: bool) -> None:
 
     listener = start_listener()
     print(
-        "Ready via ToDesk/X11: W/S=+X/-X, A/D=+Y/-Y, P/L=+Z/-Z; "
+        "Ready via ToDesk/X11: W/S=-X/+X, A/D=-Y/+Y, P/L=+Z/-Z; "
         "C=close, O=open when motion keys are released; "
         "R then 1-9=save waypoint, 1-9=recall; "
         f"release debounce={teleop.args.pynput_release_debounce_ms:g}ms; ESC exits.",

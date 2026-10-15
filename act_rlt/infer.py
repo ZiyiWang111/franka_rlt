@@ -2,9 +2,14 @@
 
 import argparse
 import json
+import os
 import queue
+import select
+import sys
+import termios
 import threading
 import time
+import tty
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,10 +36,10 @@ RESIDUAL_LIMIT_M = 0.0003
 Z_STALL_WINDOW_S = 0.25
 Z_STALL_MIN_COMMAND_M = 0.0002
 Z_STALL_MAX_PROGRESS_M = 0.00005
-SAMPLE_LOWER_OFFSET_M = np.array([-0.02, -0.02, 0.0], dtype=float)
-SAMPLE_UPPER_OFFSET_M = np.array([0.02, 0.02, 0.0], dtype=float)
-WORKSPACE_LOWER_OFFSET_M = np.array([-np.inf, -np.inf, -0.035], dtype=float)
-WORKSPACE_UPPER_OFFSET_M = np.array([np.inf, np.inf, 0.01], dtype=float)
+DEFAULT_RESET_XY_HALF_RANGE_M = 0.0
+RESET_XY_RANGE_STEP_M = 0.005
+RESET_XY_MAX_HALF_RANGE_M = 0.05
+STARTUP_WORKSPACE_HALF_RANGE_M = 0.05
 
 
 @dataclass(frozen=True)
@@ -263,15 +268,15 @@ def sample_workspace_pose(workspace_min, workspace_max, orientation, xy_padding,
         raise ValueError("workspace bounds and reset orientation must be 3D")
     if not np.isfinite(np.concatenate([lower, upper, orientation])).all():
         raise ValueError("workspace bounds and reset orientation must be finite")
-    if np.any(lower[:2] >= upper[:2]) or lower[2] > upper[2]:
-        raise ValueError("workspace min must be smaller than max in XY and no greater in Z")
+    if np.any(lower[:2] > upper[:2]) or lower[2] > upper[2]:
+        raise ValueError("workspace min must be no greater than max")
     if not np.isfinite(xy_padding) or xy_padding < 0:
         raise ValueError("reset XY padding must be finite and non-negative")
     sample_lower = lower.copy()
     sample_upper = upper.copy()
     sample_lower[:2] += xy_padding
     sample_upper[:2] -= xy_padding
-    if np.any(sample_lower[:2] >= sample_upper[:2]):
+    if np.any(sample_lower[:2] > sample_upper[:2]) or (xy_padding > 0 and np.any(sample_lower[:2] == sample_upper[:2])):
         raise ValueError(
             f"workspace X/Y spans must each exceed {2 * xy_padding:.3f} m "
             f"for {xy_padding:.3f} m reset padding"
@@ -279,23 +284,68 @@ def sample_workspace_pose(workspace_min, workspace_max, orientation, xy_padding,
     return np.concatenate([rng.uniform(sample_lower, sample_upper), orientation])
 
 
-def centered_bounds(measured_pose):
-    """Sample around measured XY at fixed Z; constrain workspace Z only."""
+def centered_bounds(measured_pose, xy_half_range=DEFAULT_RESET_XY_HALF_RANGE_M):
+    """Sample fixed collection Z/orientation around immutable reference XY."""
     pose = np.asarray(measured_pose, dtype=float)
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise ValueError(f"invalid measured TCP pose: {pose}")
+    if not np.isfinite(xy_half_range) or not 0 <= xy_half_range <= RESET_XY_MAX_HALF_RANGE_M:
+        raise ValueError("reset XY half range must be between 0 and 0.05 m")
     center = pose[:3].copy()
     center[2] = SAMPLE_Z_M
+    offset = np.array([xy_half_range, xy_half_range, 0.0])
     return (
-        center + SAMPLE_LOWER_OFFSET_M,
-        center + SAMPLE_UPPER_OFFSET_M,
-        center + WORKSPACE_LOWER_OFFSET_M,
-        center + WORKSPACE_UPPER_OFFSET_M,
+        center - offset, center + offset,
+        pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M,
+        pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M,
     )
 
 
+def validate_sample_bounds(sample_min, sample_max, workspace_min, workspace_max):
+    if (np.any(sample_min < np.asarray(workspace_min))
+            or np.any(sample_max > np.asarray(workspace_max))):
+        raise ValueError("Z insertion sample volume extends outside the safe workspace")
+
+
+def adjust_reset_xy_range(half_range, key):
+    steps = round(half_range / RESET_XY_RANGE_STEP_M)
+    steps = max(0, min(round(RESET_XY_MAX_HALF_RANGE_M / RESET_XY_RANGE_STEP_M),
+                       steps + (1 if key == "=" else -1)))
+    result = steps * RESET_XY_RANGE_STEP_M
+    print(f"Next reset: XY +/-{result * 100:g} cm around initial reference; "
+          "current pose unchanged. Press r to sample now.", flush=True)
+    return result
+
+
+def prompt_reset_choice(prompt, choices):
+    """Use immediate single-key input for reset selection, as in Stage 2."""
+    while True:
+        if not sys.stdin.isatty():
+            choice = input(prompt).strip().lower()
+        else:
+            fd = sys.stdin.fileno()
+            previous = termios.tcgetattr(fd)
+            print(prompt, end="", flush=True)
+            try:
+                tty.setcbreak(fd)
+                key = os.read(fd, 1)
+                if not key:
+                    raise EOFError("terminal closed during reset point selection")
+                if key == b"\x03":
+                    raise KeyboardInterrupt
+                choice = key.decode(errors="ignore").lower()
+                if choice in {"\r", "\n"}:
+                    choice = ""
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+                print(flush=True)
+        if choice in choices:
+            return choices[choice]
+        print("Invalid choice; please use one of the keys shown.", flush=True)
+
+
 def confirm_centered_bounds(robot):
-    """Capture TCP XY at Enter; use the recorder's fixed sample Z and orientation."""
+    """Capture full TCP reference at Enter; use fixed collection Z and orientation."""
     while True:
         pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
         sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
@@ -307,7 +357,7 @@ def confirm_centered_bounds(robot):
         print(f"Sample XYZ min/max (m): {format_pose(sample_min)} / {format_pose(sample_max)}", flush=True)
         print(f"Workspace XYZ min/max (m): {format_pose(workspace_min)} / {format_pose(workspace_max)}", flush=True)
         decision = prompt_choice(
-            "[Enter]=confirm current XY center and fixed sample pose, r=refresh measured pose, q=quit: ",
+            "[Enter]=capture current reference and XYZ workspace +/-5 cm, r=refresh measured pose, q=quit: ",
             {"": "confirm", "r": "refresh", "q": "quit"},
         )
         if decision == "quit":
@@ -319,6 +369,7 @@ def confirm_centered_bounds(robot):
             print(f"Confirmed TCP pose (m, rad): {format_pose(pose)}", flush=True)
             print(f"Confirmed sample XYZ min/max (m): {format_pose(sample_min)} / {format_pose(sample_max)}", flush=True)
             print(f"Confirmed workspace XYZ min/max (m): {format_pose(workspace_min)} / {format_pose(workspace_max)}", flush=True)
+            validate_sample_bounds(sample_min, sample_max, workspace_min, workspace_max)
             robot.config.workspace_min_xyz = tuple(workspace_min)
             robot.config.workspace_max_xyz = tuple(workspace_max)
             return sample_min, sample_max, np.asarray(SAMPLE_ROTATION_VECTOR, dtype=float).copy()
@@ -341,15 +392,26 @@ def move_to_pose(robot, target, speed, *, label):
     return measured
 
 
-def move_to_next_sample(robot, target, speed):
-    """Lift the measured TCP 1 cm in base +Z before moving to a new sample."""
+def move_to_start_with_lift(robot, target, speed, *, label):
+    """Lift the measured TCP 1 cm in base +Z before moving to an inference start."""
     current = np.asarray(robot.robot.get_tool_pose(), dtype=float)
     if current.shape != (6,) or not np.isfinite(current).all():
-        raise RuntimeError(f"invalid measured pose before sample transition: {current}")
+        raise RuntimeError(f"invalid measured pose before {label}: {current}")
     lift_target = current.copy()
     lift_target[2] += SAMPLE_TRANSITION_LIFT_M
-    move_to_pose(robot, lift_target, speed, label="lift before next sampled inference start")
-    return move_to_pose(robot, target, speed, label="sampled inference start")
+    config = getattr(robot, "config", None)
+    lower = getattr(config, "workspace_min_xyz", None)
+    upper = getattr(config, "workspace_max_xyz", None)
+    if lower is not None and upper is not None:
+        if np.any(lift_target[:3] < lower) or np.any(lift_target[:3] > upper):
+            raise RuntimeError("+Z reset retreat would leave workspace")
+    move_to_pose(robot, lift_target, speed, label=f"lift before {label}")
+    return move_to_pose(robot, target, speed, label=label)
+
+
+def move_to_next_sample(robot, target, speed):
+    """Lift the measured TCP 1 cm in base +Z before moving to a new sample."""
+    return move_to_start_with_lift(robot, target, speed, label="sampled inference start")
 
 
 def prompt_choice(prompt, choices):
@@ -491,17 +553,17 @@ def _predict_full_action_chunk(policy, pre, post, observation, camera_shapes=Non
 
 
 def run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=None,
-                          *, episode_index=None):
+                          *, episode_index=None, run_timing=None):
     """Defer automatic cyclic GC until all episode workers have stopped."""
     with EpisodeGarbageCollection() as episode_gc:
         return _run_inference_episode(
             robot, policy, pre, post, args, torch, camera_shapes,
-            episode_index=episode_index, episode_gc=episode_gc,
+            episode_index=episode_index, episode_gc=episode_gc, run_timing=run_timing,
         )
 
 
 def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=None,
-                           *, episode_index=None, episode_gc):
+                           *, episode_index=None, episode_gc, run_timing=None):
     """Run camera, ACT, and servo as three independently scheduled workers."""
     trace_file = None
     trace_queue = None
@@ -545,6 +607,12 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
         )
     residual_control = bool(getattr(args, "residual_control", False))
     residual_controller = ResidualMotionAccumulator() if residual_control else None
+    if run_timing is None:
+        run_timing = {"count": 0, "total_s": 0.0}
+    run_timing.setdefault("total_episodes", 0)
+    run_timing.setdefault("success_episodes", 0)
+    episode_timing = {"control_start": None, "control_end": None,
+                      "end_reason": "interrupted"}
     # Start producing the next chunk with half of the current chunk still buffered.
     # This gives inference time to finish without keeping a full extra chunk stale.
     low_watermark = max(0, n_action_steps // 2)
@@ -740,6 +808,7 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
 
             period = 1.0 / args.fps
             start = time.monotonic()
+            episode_timing["control_start"] = start
             deadline = start
             end = start + args.duration
             control_step = 0
@@ -794,6 +863,15 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                         )
                     queue_status = f"ensemble_votes={vote_count}"
 
+                measured_pose = None
+                measured_joint = None
+                external_wrench = None
+                target_pose = None
+                residual_xyz = None
+                newly_stalled = False
+                if trace_queue is not None or (not args.dry_run and residual_control):
+                    # ControlClient reads this from its state cache, not a control RPC.
+                    measured_pose = robot.robot.get_tool_pose()
                 stats["translation"] += int(prepared.translation_triggered)
                 stats["rotation"] += int(prepared.rotation_triggered)
                 stats["either"] += int(
@@ -804,20 +882,12 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                 )
                 step_index = stats["ticks"]
                 stats["ticks"] += 1
-
-                measured_pose = None
-                measured_joint = None
-                external_wrench = None
-                target_pose = None
-                residual_xyz = None
-                newly_stalled = False
-                if trace_queue is not None or (not args.dry_run and residual_control):
-                    # ControlClient reads this from its state cache, not a control RPC.
-                    measured_pose = robot.robot.get_tool_pose()
                 if trace_queue is not None:
                     measured_joint = robot.robot.get_joint_angles()
                     external_wrench = robot.robot.get_tool_force_raw()
                     state_sample_monotonic_s = time.monotonic()
+                if stop_event.is_set():
+                    break
                 send_start = time.monotonic()
                 if not args.dry_run:
                     if residual_control:
@@ -876,9 +946,12 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                     temporal_request_event.set()
                 deadline += period
                 control_step += 1
+            if not stop_event.is_set():
+                episode_timing["end_reason"] = "duration"
         except BaseException as exc:
             fail(exc)
         finally:
+            episode_timing["control_end"] = time.monotonic()
             stop_event.set()
             refill_event.set()
             temporal_request_event.set()
@@ -897,18 +970,44 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
         temporal_request_event.set()
     stop_error = None
     started_threads = []
+    operator_cancelled = False
+    operator_success = False
+    terminal_fd = None
+    terminal_settings = None
+    inference_started_at = time.monotonic()
     try:
+        if sys.stdin.isatty():
+            terminal_fd = sys.stdin.fileno()
+            terminal_settings = termios.tcgetattr(terminal_fd)
+            tty.setcbreak(terminal_fd, termios.TCSANOW)
+            print("During inference: s = success and stop; x or Esc = fail and stop (excluded from average).", flush=True)
         if gc_tracer is not None:
             gc_tracer.start()
         for thread in threads:
             thread.start()
             started_threads.append(thread)
-        while not servo_finished.wait(timeout=0.1):
+        while not servo_finished.wait(timeout=0.02):
+            if terminal_fd is not None and select.select([terminal_fd], [], [], 0)[0]:
+                key = os.read(terminal_fd, 1)
+                if key in (b"s", b"S"):
+                    operator_success = True
+                    trace("operator_success", key="s")
+                    stop_event.set()
+                    break
+                if key in (b"x", b"X", b"\x1b"):
+                    operator_cancelled = True
+                    trace("operator_stop", key="esc" if key == b"\x1b" else "x")
+                    stop_event.set()
+                    break
             while True:
                 try:
                     print(log_queue.get_nowait(), flush=True)
                 except queue.Empty:
                     break
+    except KeyboardInterrupt:
+        operator_cancelled = True
+        trace("operator_stop", key="ctrl_c")
+        raise
     finally:
         stop_event.set()
         first_actions_ready.set()
@@ -929,6 +1028,17 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
             except BaseException as exc:
                 stop_error = exc
 
+        # Include first prediction and stop acknowledgement; exclude joins/GC.
+        inference_duration_s = time.monotonic() - inference_started_at
+        if terminal_settings is not None:
+            # Flush remaining keystrokes so they cannot answer the next menu.
+            termios.tcsetattr(terminal_fd, termios.TCSANOW, terminal_settings)
+            termios.tcflush(terminal_fd, termios.TCIFLUSH)
+        if not operator_cancelled:
+            run_timing["count"] += 1
+            run_timing["total_s"] += inference_duration_s
+        run_average_s = (run_timing["total_s"] / run_timing["count"]
+                         if run_timing["count"] else None)
         for thread in started_threads:
             thread.join()
         drain_trace()
@@ -945,6 +1055,27 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                 break
 
         denominator = max(stats["ticks"], 1)
+        end_reason = ("operator_stop" if operator_cancelled else
+                      "error" if failures or stop_error else
+                      "operator_success" if operator_success else episode_timing["end_reason"])
+        episode_success = end_reason in ("duration", "operator_success")
+        run_timing["total_episodes"] += 1
+        run_timing["success_episodes"] += int(episode_success)
+        run_fail_episodes = run_timing["total_episodes"] - run_timing["success_episodes"]
+        average_display = f"{run_average_s:.3f}s" if run_average_s is not None else "N/A"
+        print(
+            f"Inference timing: episode={episode_index}, reason={end_reason}, "
+            f"elapsed={inference_duration_s:.3f}s, run_average={average_display} "
+            f"over {run_timing['count']} included episodes"
+            + (" (this episode excluded)" if operator_cancelled else ""),
+            flush=True,
+        )
+        print(
+            f"Episode result: {'success' if episode_success else 'fail'}, "
+            f"success/total episodes={run_timing['success_episodes']}/{run_timing['total_episodes']}, "
+            f"fail={run_fail_episodes}",
+            flush=True,
+        )
         print(
             "Action-limit report: "
             f"steps={stats['ticks']}, "
@@ -962,6 +1093,15 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
         )
         trace(
             "episode_end", stats=stats.copy(),
+            end_reason=end_reason, inference_duration_s=inference_duration_s,
+            included_in_run_average=not operator_cancelled,
+            episode_success=episode_success,
+            run_success_episodes=run_timing["success_episodes"],
+            run_total_episodes=run_timing["total_episodes"],
+            run_fail_episodes=run_fail_episodes,
+            control_duration_s=(episode_timing["control_end"] - episode_timing["control_start"])
+            if episode_timing["control_start"] is not None else None,
+            run_episode_count=run_timing["count"], run_average_inference_s=run_average_s,
             gc_after_episode=episode_gc.after,
             error=str(failures[0]) if failures else str(stop_error) if stop_error else None,
             measured_tcp_after_stop=robot.robot.get_tool_pose()
@@ -1024,6 +1164,7 @@ def main():
         flush=True,
     )
     rng = np.random.default_rng(args.sampling_seed)
+    run_timing = {"count": 0, "total_s": 0.0}
     try:
         robot.connect()
         # Warm up kernels using real observations before allowing motion.
@@ -1048,6 +1189,7 @@ def main():
                 run_inference_episode(
                     robot, policy, pre, post, args, torch, camera_shapes,
                     episode_index=episode_index,
+                    run_timing=run_timing,
                 )
             return
 
@@ -1060,6 +1202,8 @@ def main():
             f"{format_pose(orientation)}",
             flush=True,
         )
+        reference_xy = sample_min[:2].copy()
+        half_range = DEFAULT_RESET_XY_HALF_RANGE_M
         episode_start = None
         need_new_sample = True
         lift_before_next_sample = False
@@ -1067,6 +1211,11 @@ def main():
         episode_index = 0
         while True:
             if need_new_sample:
+                sample_min[:2] = reference_xy - half_range
+                sample_max[:2] = reference_xy + half_range
+                validate_sample_bounds(sample_min, sample_max,
+                                       robot.config.workspace_min_xyz,
+                                       robot.config.workspace_max_xyz)
                 target = sample_workspace_pose(
                     sample_min,
                     sample_max,
@@ -1075,17 +1224,22 @@ def main():
                     rng,
                 )
                 if first_move:
-                    decision = prompt_choice(
+                    decision = prompt_reset_choice(
                         "First sampled reset target is "
-                        f"{format_pose(target)}. [Enter/y]=move, n=new sample, q=quit: ",
+                        f"{format_pose(target)}. XY +/-{half_range * 100:g} cm. "
+                        "[Enter/y]=move, r=new sample, =/-=adjust range, q=quit: ",
                         {
                             "": "move", "y": "move", "yes": "move",
-                            "n": "new", "new": "new",
+                            "r": "new", "n": "new", "new": "new",
+                            "=": "increase", "-": "decrease",
                             "q": "quit", "quit": "quit",
                         },
                     )
                     if decision == "quit":
                         break
+                    if decision in {"increase", "decrease"}:
+                        half_range = adjust_reset_xy_range(half_range, "=" if decision == "increase" else "-")
+                        continue
                     if decision == "new":
                         continue
                     first_move = False
@@ -1098,18 +1252,22 @@ def main():
                     )
                 need_new_sample = False
 
-            decision = prompt_choice(
+            decision = prompt_reset_choice(
                 "At inference start "
-                f"{format_pose(episode_start)}. [Enter/s]=start inference, "
-                "n=move to next sample, q=quit: ",
+                f"{format_pose(episode_start)}. XY +/-{half_range * 100:g} cm. "
+                "[Enter/y]=start inference, r=new sample, =/-=adjust range, q=quit: ",
                 {
-                    "": "start", "s": "start", "start": "start",
-                    "n": "new", "new": "new",
+                    "": "start", "y": "start", "s": "start", "start": "start",
+                    "r": "new", "n": "new", "new": "new",
+                    "=": "increase", "-": "decrease",
                     "q": "quit", "quit": "quit",
                 },
             )
             if decision == "quit":
                 break
+            if decision in {"increase", "decrease"}:
+                half_range = adjust_reset_xy_range(half_range, "=" if decision == "increase" else "-")
+                continue
             if decision == "new":
                 need_new_sample = True
                 continue
@@ -1119,6 +1277,7 @@ def main():
             run_inference_episode(
                 robot, policy, pre, post, args, torch, camera_shapes,
                 episode_index=episode_index,
+                run_timing=run_timing,
             )
             print(f"Inference episode {episode_index} finished.", flush=True)
             decision = prompt_choice(
@@ -1138,7 +1297,7 @@ def main():
                 need_new_sample = True
                 lift_before_next_sample = True
                 continue
-            episode_start = move_to_pose(
+            episode_start = move_to_start_with_lift(
                 robot, episode_start, args.reset_speed, label="previous inference start"
             )
     except KeyboardInterrupt:

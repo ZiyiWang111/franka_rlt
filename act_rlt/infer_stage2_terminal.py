@@ -52,8 +52,8 @@ class InferenceTerminal:
             ("Step limits", f"{config.max_step_m * 1000:g} mm translation | {config.max_step_rad:g} rad rotation"),
         ]
         if args.z_insertion_mode:
-            rows.append(("Reset", "random XY +/-10 mm around p1" if args.randomize_reset_xy
-                         else "fixed p1/p2/p3 | select with 1/2/3"))
+            half_range_mm = getattr(args, "reset_xy_half_range_m", 0.01) * 1000
+            rows.append(("Reset", f"random XY +/-{half_range_mm:g} mm around initial reference | =/-: range +/-5 mm (0..50 mm)"))
         else:
             rows.append(("Reset", "random within configured sample/workspace bounds"))
         self.write("\nSTAGE-2 INFERENCE")
@@ -64,14 +64,11 @@ class InferenceTerminal:
 
     def workspace(self, reference, lower, upper, points):
         self.write("\nREFERENCE & RESET")
-        self.write(f"  p1 measured: {self.pose(reference)}")
+        self.write(f"  Initial reference: {self.pose(reference)}")
         for index, axis in enumerate("XYZ"):
             self.write(f"  Workspace {axis} [mm]  {lower[index] * 1000:.1f} .. {upper[index] * 1000:.1f}")
         self.write(f"  Reset Z {SAMPLE_Z_M * 1000:g} mm | Euler XYZ [deg] {SAMPLE_EULER_XYZ_DEG}")
-        if points is not None:
-            self.write("  Point      X [mm]      Y [mm]      Z [mm]")
-            for index, point in enumerate(points, 1):
-                self.write(f"  p{index:<5}" + "".join(f"{v * 1000:12.1f}" for v in point[:3]))
+        self.write("  Random XY reset around this reference | =/-: next range | r: resample")
 
     def prepare_episode(self, episode_id):
         self._last_status_at = -float("inf")
@@ -80,8 +77,6 @@ class InferenceTerminal:
     def moving(self, target, label):
         if label == "sampled workspace reset pose":
             label = "random start"
-        elif label.startswith("reset p"):
-            label = label.removeprefix("reset ")
         elif label == "+Z 1 cm retreat":
             label = "retreat +Z 10 mm"
         self.write(f"  Move    {label} | {self.pose(target)}")

@@ -79,6 +79,7 @@ class ACTStage2Config:
     actor_update_interval: int = 2
     grad_clip_norm: float = 1.0
     target_q_clip: float = 1.0
+    target_q_clipping: bool = True
     learner_version: int = 3
     bc_init_steps: int = 1000
     critic_init_steps: int = 1000
@@ -93,7 +94,9 @@ class ACTStage2Config:
 
     def __post_init__(self) -> None:
         if self.target_q_clip != 1.0 or self.learner_version != 3:
-            raise ValueError("Stage-2 v3 requires terminal-success targets in [0,1]")
+            raise ValueError("Stage-2 v3 requires target_q_clip=1; use target_q_clipping=False to disable clipping")
+        if not isinstance(self.target_q_clipping, bool):
+            raise ValueError("target_q_clipping must be boolean")
         if self.bc_init_steps < 0 or self.critic_init_steps < 0:
             raise ValueError("initialization steps must be non-negative")
         if self.temporal_collection:
@@ -384,11 +387,13 @@ class Stage2Learner:
             next_action, _ = self.target_actor(batch["next_state_vec"], batch["next_ref_flat"])
             next_action = self.action_projection(next_action)
             raw_next_q = self.target_critic.min_q(batch["next_state_vec"], next_action)
-            next_q = raw_next_q.clamp(0.0, 1.0)
+            next_q = raw_next_q.clamp(0.0, 1.0) if self.config.target_q_clipping else raw_next_q
             reward = discounted_chunk_return(batch["reward_seq"], self.config.gamma, batch["actual_steps"])
             target = reward + self.config.gamma ** batch["actual_steps"].float().unsqueeze(-1) * (
                 1 - batch["done"].unsqueeze(-1)) * next_q
-            if not torch.isfinite(target).all() or (target < 0).any() or (target > 1.00001).any():
+            if not torch.isfinite(target).all():
+                raise ValueError("non-finite TD target; check Critic output and replay")
+            if self.config.target_q_clipping and ((target < 0).any() or (target > 1.00001).any()):
                 raise ValueError("invalid terminal-success TD target; check reward/done in replay")
         q1, q2 = self.critic(x, action)
         c_loss = (q1 - target).square().mean() + (q2 - target).square().mean()
@@ -407,9 +412,13 @@ class Stage2Learner:
             "q_reference_max": reference_q.max().item(),
             "target_q_raw_mean": raw_next_q.mean().item(),
             "target_q_raw_max": raw_next_q.max().item(),
-            "target_q_clip_fraction": ((raw_next_q < 0) | (raw_next_q > 1)).float().mean().item(),
-            "target_q_clip_low_fraction": (raw_next_q < 0).float().mean().item(),
-            "target_q_clip_high_fraction": (raw_next_q > 1).float().mean().item(),
+            "target_q_clipping_enabled": self.config.target_q_clipping,
+            "target_q_clip_fraction": ((raw_next_q < 0) | (raw_next_q > 1)).float().mean().item()
+            if self.config.target_q_clipping else 0.0,
+            "target_q_clip_low_fraction": (raw_next_q < 0).float().mean().item()
+            if self.config.target_q_clipping else 0.0,
+            "target_q_clip_high_fraction": (raw_next_q > 1).float().mean().item()
+            if self.config.target_q_clipping else 0.0,
             "td_target_mean": target.mean().item(), "td_target_max": target.max().item(),
             "reward_mean": reward.mean().item(), "done_fraction": batch["done"].mean().item(),
             "td_error_abs_mean": (q1.detach() - target).abs().mean().item(),
