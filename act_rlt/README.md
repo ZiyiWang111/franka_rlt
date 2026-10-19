@@ -414,7 +414,9 @@ output only; inference does not append training metrics or save checkpoints.
 
 Run from the repository root in the installed Evo-RLT environment. Start the
 existing control server separately, as for collection, and stop collection
-before connecting. Use the 7D-state checkpoint including its saved processors.
+before connecting. Supported checkpoints include camera-only/action6, RGB + wrench6/action6,
+and joint-state7/action7, including their saved processors. Six-dimensional
+state is interpreted as raw base-frame wrench in fx/fy/fz/mx/my/mz order.
 
 ```bash
 python -m act_rlt.infer \

@@ -48,12 +48,13 @@ def test_frozen_runtime_uses_actor_mean_without_sampling() -> None:
     (["--observation-selection", "boundary"], True, "boundary"),
     (["--camera-boundary-mode", "legacy", "--observation-selection", "boundary"], False, "boundary"),
 ])
-def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, timestamped, selection):
+@pytest.mark.parametrize("act_action_dim", [6, 7])
+def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, timestamped, selection, act_action_dim):
     from evo_rlt.adapters.lerobot import franka_robot
     from lerobot.policies import factory
 
     events = []
-    policy = SimpleNamespace(stage1=SimpleNamespace(_act=SimpleNamespace(config=object())))
+    policy = SimpleNamespace(stage1=SimpleNamespace(_act=SimpleNamespace(config=object())), act_action_dim=act_action_dim)
     config = SimpleNamespace(act_checkpoint="/tmp/act", stage1_checkpoint="/tmp/stage1",
                              device="cpu", max_step_m=0.002, max_step_rad=0.02)
     monkeypatch.setattr(infer_stage2, "resolve_stage2_checkpoint", lambda path: path)
@@ -66,6 +67,7 @@ def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, time
     class Robot:
         def __init__(self, config):
             self.config = config
+            assert config.include_gripper_action == (act_action_dim == 7)
             self.is_connected = False
             self.robot = SimpleNamespace(stop_move=lambda: events.append("stop"))
 

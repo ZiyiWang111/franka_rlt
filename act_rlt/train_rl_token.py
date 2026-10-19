@@ -20,7 +20,7 @@ def main() -> None:
         "--root",
         type=Path,
         default=Path(__file__).resolve().parents[1] / "datasets/act_rlt_001_state7",
-        help="7D-state LeRobot dataset directory containing meta/info.json",
+        help="LeRobot dataset directory matching the frozen ACT inputs and actions",
     )
     parser.add_argument("--repo-id", help="Defaults to the dataset directory name")
     parser.add_argument(
@@ -81,16 +81,20 @@ def main() -> None:
     if not info_path.is_file():
         parser.error(f"Missing {info_path}; --root must be the dataset itself")
     info = json.loads(info_path.read_text())
-    state_feature = info["features"].get("observation.state", {})
-    if state_feature.get("shape") != [7]:
-        parser.error(
-            f"Stage 1 requires the 7D joint-state dataset, got {state_feature.get('shape')} at {root}"
-        )
-
     try:
         act_checkpoint = resolve_checkpoint(args.act_checkpoint)
     except FileNotFoundError as error:
         parser.error(str(error))
+
+    act_config = json.loads((act_checkpoint / "config.json").read_text())
+    input_features = act_config["input_features"]
+    for key, feature in {**input_features, **act_config["output_features"]}.items():
+        recorded = info["features"].get(key, {})
+        shape = list(feature["shape"])
+        if feature["type"] == "VISUAL":
+            shape = [shape[1], shape[2], shape[0]]
+        if recorded.get("shape") != shape:
+            parser.error(f"Dataset feature {key} must have shape {shape}, got {recorded.get('shape')}")
 
     if output.exists():
         parser.error(f"Output already exists: {output}; choose a new --output directory")
@@ -101,7 +105,9 @@ def main() -> None:
         "dataset.video_backend": "pyav",
         "dataset.image_transforms.enable": False,
         "policy.type": "act_rlt_token",
-        "policy.input_features": "null",
+        "policy.input_features": json.dumps(input_features),
+        "policy.chunk_size": act_config["chunk_size"],
+        "policy.rl_token_dim": act_config["dim_model"],
         "policy.act_pretrained_path": act_checkpoint,
         "policy.verify_encoder_equivalence": args.verify_extractor,
         "policy.device": args.device,

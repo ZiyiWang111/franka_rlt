@@ -1,4 +1,5 @@
 import gc
+import pytest
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -20,6 +21,8 @@ from act_rlt.infer import (
     bounded_action_with_triggers,
     build_parser,
     checkpoint_camera_shapes,
+    checkpoint_state_mode,
+    policy_observation,
     centered_bounds,
     adjust_reset_xy_range,
     validate_sample_bounds,
@@ -248,7 +251,7 @@ def test_invalid_action_is_rejected():
     with TestCase().assertRaises(ValueError):
         bounded_action([0, 0, float("nan"), 0, 0, 0, 0], 0.002, 0.02)
     with TestCase().assertRaises(ValueError):
-        bounded_action([0] * 6, 0.002, 0.02)
+        bounded_action([0] * 5, 0.002, 0.02)
 
 
 def test_workspace_sample_has_optional_xy_padding_and_fixed_orientation():
@@ -349,8 +352,10 @@ class _FakeRobot:
 
 
 class _FakePolicy:
-    def __init__(self, n_action_steps, slow_calls=None, chunk_size=None):
+    def __init__(self, n_action_steps, slow_calls=None, chunk_size=None, action_dim=7):
         self.config = SimpleNamespace(
+            input_features={"observation.state": SimpleNamespace(shape=(7,))},
+            output_features={"action": SimpleNamespace(shape=(action_dim,))},
             n_action_steps=n_action_steps,
             chunk_size=chunk_size or n_action_steps,
         )
@@ -363,14 +368,15 @@ class _FakePolicy:
     def select_action(self, batch):
         self.calls += 1
         time.sleep(self.slow_calls.get(self.calls, 0))
-        return _FakeTensor([0.001, 0, 0, 0, 0, 0, 0.04])
+        return _FakeTensor([0.001, 0, 0, 0, 0, 0, 0.04][:self.config.output_features["action"].shape[0]])
 
     def predict_action_chunk(self, batch):
         self.calls += 1
         time.sleep(self.slow_calls.get(self.calls, 0))
-        values = np.zeros((1, self.config.chunk_size, 7), dtype=float)
+        values = np.zeros((1, self.config.chunk_size, self.config.output_features["action"].shape[0]), dtype=float)
         values[..., 0] = 0.001
-        values[..., 6] = 0.04
+        if values.shape[-1] == 7:
+            values[..., 6] = 0.04
         return _FakeTensor(values)
 
 
@@ -541,7 +547,7 @@ def test_temporal_ensemble_pipeline_keeps_using_overlapping_chunks():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=4, chunk_size=4, slow_calls={2: 0.08})
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot,
             policy,
@@ -566,7 +572,7 @@ def test_full_trace_records_every_step_chunks_and_tcp_targets(tmp_path):
     args.log_dir = tmp_path
     args.checkpoint = Path("test-checkpoint")
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot, policy, lambda frame: frame, lambda action: action,
             args, _FakeTorch, episode_index=6,
@@ -616,7 +622,7 @@ def test_inference_stall_guard_clears_target_and_logs_latch(tmp_path):
     args = _threaded_args(duration=0.42, fps=30, residual_control=True)
     args.log_dir = tmp_path
     policy = DownPolicy(n_action_steps=4)
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot, policy, lambda frame: frame, lambda action: action,
             args, _FakeTorch,
@@ -638,7 +644,7 @@ def test_three_worker_pipeline_hides_chunk_inference_latency():
     policy = _FakePolicy(n_action_steps=4, slow_calls={1: 0.08, 5: 0.08})
     pre_calls = []
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot,
             policy,
@@ -660,7 +666,7 @@ def test_action_queue_underrun_stops_instead_of_repeating_delta():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=1, slow_calls={2: 0.15})
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         with TestCase().assertRaisesRegex(RuntimeError, "queue underrun"):
             run_inference_episode(
                 robot,
@@ -687,7 +693,7 @@ def test_profiled_dry_run_identifies_gc_and_slow_phase_without_motion(tmp_path):
         gc.collect(0)
         return frame
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(robot, policy, pre, lambda action: action, args, _FakeTorch)
 
     assert gc.callbacks == callbacks_before
@@ -743,7 +749,7 @@ def test_gc_runs_only_before_workers_and_after_servo_shutdown(tmp_path):
         return frame
 
     with patch("act_rlt.infer_gc.gc.collect", side_effect=collect):
-        with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+        with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
             run_inference_episode(robot, _FakePolicy(4), pre, lambda a: a, args, _FakeTorch)
 
     assert worker_states and not any(worker_states)
@@ -818,7 +824,7 @@ def test_30_hz_servo_timing_with_prepared_action_chunk():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=8)
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot, policy, lambda frame: frame, lambda action: action,
             _threaded_args(duration=0.14, fps=30), _FakeTorch,
@@ -834,7 +840,7 @@ def test_30_hz_servo_timing_with_temporal_ensemble():
     robot = _FakeRobot()
     policy = _FakePolicy(n_action_steps=4, chunk_size=16, slow_calls={2: 0.07})
 
-    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes: obs):
+    with patch("act_rlt.infer.observation_frame", side_effect=lambda obs, shapes, state_mode="joints": obs):
         run_inference_episode(
             robot, policy, lambda frame: frame, lambda action: action,
             _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=0.01),
@@ -895,3 +901,94 @@ def test_lift_outside_workspace_does_not_move():
 def test_reset_choice_non_tty_accepts_range_key():
     with patch("sys.stdin.isatty", return_value=False), patch("builtins.input", return_value="="):
         assert prompt_reset_choice("reset", {"=": "increase"}) == "increase"
+
+
+@pytest.mark.parametrize("state_dim", [None, 6, 7])
+def test_model_input_contract_selects_only_requested_state(state_dim):
+    config = SimpleNamespace(input_features={})
+    if state_dim:
+        config.input_features["observation.state"] = SimpleNamespace(shape=(state_dim,))
+    mode = checkpoint_state_mode(config)
+    wrench = np.array([1, 2, 3, 4, 5, 6], dtype=np.float32)
+    robot = SimpleNamespace(
+        get_observation=lambda: {"wrist": np.zeros((2, 3, 3), dtype=np.uint8),
+                                  **{f"joint_{i}": i for i in range(7)}},
+        get_external_wrench_base=lambda: wrench,
+    )
+    observation = policy_observation(robot, config)
+    frame = observation_frame(observation, {"wrist": (2, 3, 3)}, mode)
+    if state_dim is None:
+        assert set(frame) == {"observation.images.wrist"}
+        assert "external_wrench" not in observation
+    else:
+        expected = wrench if state_dim == 6 else np.arange(7)
+        np.testing.assert_array_equal(frame["observation.state"].numpy(), expected)
+    if state_dim == 6:
+        wrench[:] = 0
+        np.testing.assert_array_equal(frame["observation.state"].numpy(), [1, 2, 3, 4, 5, 6])
+
+
+@pytest.mark.parametrize("wrench", [[0] * 5, [0, 0, float("nan"), 0, 0, 0]])
+def test_invalid_wrench_is_rejected(wrench):
+    with pytest.raises(ValueError, match="Invalid wrench state"):
+        observation_frame({"external_wrench": wrench}, {}, "wrench")
+
+
+@pytest.mark.parametrize("coefficient", [None, 0.01])
+@pytest.mark.parametrize("mode", ["none", "wrench"])
+def test_action6_runs_threaded_inference_and_records_trace(tmp_path, coefficient, mode):
+    robot = _FakeRobot()
+    robot.get_external_wrench_base = lambda: np.arange(6, dtype=np.float32)
+    policy = _FakePolicy(n_action_steps=4, chunk_size=4, action_dim=6)
+    policy.config.input_features = (
+        {} if mode == "none" else {"observation.state": SimpleNamespace(shape=(6,))}
+    )
+    args = _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=coefficient)
+    args.log_dir = tmp_path
+    args.profile_timing = True
+
+    def frame(observation, shapes, state_mode):
+        assert state_mode == mode
+        if mode == "wrench":
+            np.testing.assert_array_equal(observation["external_wrench"], np.arange(6))
+        return observation
+
+    with patch("act_rlt.infer.observation_frame", side_effect=frame):
+        run_inference_episode(robot, policy, lambda x: x, lambda x: x, args, _FakeTorch)
+    events = [json.loads(line) for path in tmp_path.glob("*.jsonl") for line in path.read_text().splitlines()]
+    steps = [row for row in events if row["event"] == "control_step"]
+    assert steps and len(steps) == len(robot.sent_at)
+    assert all(len(row["action_unbounded"]) == 6 for row in steps)
+    assert all(row["gripper_prediction_m"] is None for row in steps)
+    assert events[-1]["error"] is None
+
+
+@pytest.mark.parametrize("run", ["act_dataset_928_camera_only_action6_act", "act_1010_rgb_wrench_action6_act"])
+def test_actual_action6_checkpoint_configuration_and_processors(run):
+    import torch
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import make_pre_post_processors
+
+    path = Path(__file__).resolve().parents[1] / "outputs" / run
+    if not path.exists():
+        pytest.skip("local trained checkpoint is unavailable")
+    path = resolve_checkpoint(path)
+    config = PreTrainedConfig.from_pretrained(str(path), local_files_only=True)
+    config.device = "cpu"
+    cameras = checkpoint_camera_shapes(config)
+    assert cameras == {"wrist": (720, 1280, 3)}
+    pre, post = make_pre_post_processors(
+        config, pretrained_path=str(path),
+        preprocessor_overrides={"device_processor": {"device": "cpu"}},
+    )
+    observation = {"wrist": np.zeros(cameras["wrist"], dtype=np.uint8),
+                   "external_wrench": np.arange(6, dtype=np.float32)}
+    mode = checkpoint_state_mode(config)
+    batch = pre(observation_frame(observation, cameras, mode))
+    assert batch["observation.images.wrist"].shape == (1, 3, 720, 1280)
+    if mode == "wrench":
+        assert batch["observation.state"].shape == (1, 6)
+        assert torch.isfinite(batch["observation.state"]).all()
+    else:
+        assert "observation.state" not in batch
+    assert post(torch.zeros(1, 16, 6)).shape == (1, 16, 6)

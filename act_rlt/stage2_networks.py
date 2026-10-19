@@ -14,11 +14,12 @@ class ChunkInputFusion(nn.Module):
     def __init__(self, state_dim: int, proprio_dim: int, chunk_dim: int, fusion_dim: int) -> None:
         super().__init__()
         token_dim = state_dim - proprio_dim
-        if token_dim <= 0 or proprio_dim <= 0 or chunk_dim <= 0 or fusion_dim <= 0:
+        if token_dim <= 0 or proprio_dim < 0 or chunk_dim <= 0 or fusion_dim <= 0:
             raise ValueError("fusion input and output dimensions must be positive")
         self.token_dim = token_dim
         self.token = self._branch(token_dim, fusion_dim)
-        self.proprio = self._branch(proprio_dim, fusion_dim)
+        self.proprio = self._branch(proprio_dim, fusion_dim) if proprio_dim else None
+        self.output_dim = (3 if proprio_dim else 2) * fusion_dim
         self.action = self._branch(chunk_dim, fusion_dim)
 
     @staticmethod
@@ -28,9 +29,11 @@ class ChunkInputFusion(nn.Module):
     def forward(self, state: Tensor, action: Tensor) -> Tensor:
         token = state[..., : self.token_dim]
         proprio = state[..., self.token_dim :]
-        return torch.cat(
-            (self.token(token), self.proprio(proprio), self.action(action)), dim=-1
-        )
+        branches = [self.token(token)]
+        if self.proprio is not None:
+            branches.append(self.proprio(proprio))
+        branches.append(self.action(action))
+        return torch.cat(branches, dim=-1)
 
 
 class Stage2ChunkActor(nn.Module):
@@ -48,7 +51,7 @@ class Stage2ChunkActor(nn.Module):
         super().__init__()
         self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim)
         self.net = build_mlp(
-            3 * fusion_dim, hidden_dim, chunk_dim, num_layers,
+            self.fusion.output_dim, hidden_dim, chunk_dim, num_layers,
             activation="gelu", layer_norm=True,
         )
         self.fixed_std = fixed_std
@@ -88,7 +91,7 @@ class Stage2ChunkCritic(nn.Module):
         super().__init__()
         self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim)
         self.net = build_mlp(
-            3 * fusion_dim, hidden_dim, 1, num_layers,
+            self.fusion.output_dim, hidden_dim, 1, num_layers,
             activation="gelu", layer_norm=True,
         )
 

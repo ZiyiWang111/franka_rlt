@@ -6,6 +6,7 @@ Uses the existing servo_tool API; no controller configuration is changed.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from datetime import datetime
 import json
 import math
@@ -15,6 +16,8 @@ import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+from act_rlt.approach_profile import FiniteStop, cruise_speed, rest_duration, stopping_distance
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,6 +97,20 @@ class OnlineApproach:
         self.rotation_progress = 0.0
         self.angular_velocity = 0.0
         self.angular_acceleration = 0.0
+        self.finite_approach = getattr(args, "finite_approach", False)
+        self.initial_distance = float(np.linalg.norm(self.target[:3] - self.command[:3]))
+        self.cruise_speed = cruise_speed(self.initial_distance, args.speed, args.acceleration, args.jerk) \
+            if self.finite_approach else args.speed
+        self.terminal_stop = None
+        if self.finite_approach and 0 < self.initial_distance <= min(0.008, args.slowdown_distance):
+            # Very short corrections have no useful cruise section. Use one
+            # bounded rest-to-rest segment instead of turning the velocity field
+            # through a tight curve and then clamping individual coordinates.
+            self.terminal_stop = FiniteStop.plan(
+                self.command[:3], self.velocity, self.acceleration, self.target[:3], args)
+        self.terminal_elapsed = 0.0
+        self.rotation_elapsed = 0.0
+        self.rotation_duration = rest_duration(self.rotation_total, args.max_angular_velocity, 0.8, 4.0)
 
     def step(self, measured, dt: float) -> dict:
         if not math.isfinite(dt) or not 0 < dt <= 0.15:
@@ -112,17 +129,35 @@ class OnlineApproach:
         tracking_scale = min(smooth_fraction(2 * (1 - lag / self.args.lag_limit)),
                              smooth_fraction(2 * (1 - angular_lag / 0.1)))
         desired = np.zeros(3)
-        if lateral_error > 1e-12:
-            desired[:2] = error[:2] / lateral_error * self.args.speed \
-                * min(1.0, lateral_error / self.args.slowdown_distance)
-        desired[2] = self.args.speed * vertical_gate \
-            * float(np.clip(error[2] / self.args.slowdown_distance, -1.0, 1.0))
+        if self.finite_approach:
+            # Preserve command-error XY/Z allocation, but normalize its direction
+            # so speed does not shrink proportionally to distance all the way in.
+            desired = error.copy()
+            desired[2] *= vertical_gate
+            desired *= self.cruise_speed / max(float(np.linalg.norm(desired)), 1e-12)
+            brake_distance = max(min(self.args.slowdown_distance, 0.3 * self.initial_distance),
+                                 1.4 * stopping_distance(np.linalg.norm(self.velocity),
+                                                         self.args.acceleration, self.args.jerk))
+            if self.terminal_stop is None and 0 < np.linalg.norm(error) <= brake_distance:
+                self.terminal_stop = FiniteStop.plan(
+                    self.command[:3], self.velocity, self.acceleration, self.target[:3], self.args)
+        else:
+            if lateral_error > 1e-12:
+                desired[:2] = error[:2] / lateral_error * self.args.speed \
+                    * min(1.0, lateral_error / self.args.slowdown_distance)
+            desired[2] = self.args.speed * vertical_gate \
+                * float(np.clip(error[2] / self.args.slowdown_distance, -1.0, 1.0))
         desired = limit_norm(desired, self.args.speed) * tracking_scale
-        desired_acceleration = limit_norm((desired - self.velocity) / 0.15, self.args.acceleration)
-        self.acceleration += limit_norm(desired_acceleration - self.acceleration, self.args.jerk * dt)
-        new_velocity = limit_norm(self.velocity + self.acceleration * dt, self.args.speed)
-        delta = (self.velocity + new_velocity) * (0.5 * dt)
-        candidate = self.command[:3] + delta
+        terminal_elapsed = self.terminal_elapsed + dt * tracking_scale
+        if self.terminal_stop is not None:
+            candidate, new_velocity, next_acceleration = self.terminal_stop.sample(terminal_elapsed)
+        else:
+            desired_acceleration = limit_norm((desired - self.velocity) / 0.15, self.args.acceleration)
+            next_acceleration = self.acceleration + limit_norm(
+                desired_acceleration - self.acceleration, self.args.jerk * dt)
+            new_velocity = limit_norm(self.velocity + next_acceleration * dt, self.args.speed)
+            delta = (self.velocity + new_velocity) * (0.5 * dt)
+            candidate = self.command[:3] + delta
         # Keep each reference coordinate inside the remaining interval, preventing
         # inertia in the smoother from overshooting the goal or moving backward.
         candidate = np.minimum(np.maximum(candidate, np.minimum(self.command[:3], self.target[:3])),
@@ -135,26 +170,40 @@ class OnlineApproach:
         else:
             self.command[:3] = candidate
             self.velocity = new_velocity
+            self.acceleration = next_acceleration
+            if self.terminal_stop is not None:
+                self.terminal_elapsed = terminal_elapsed
             blocked = np.abs(candidate - self.target[:3]) < 1e-12
             self.velocity[blocked] = 0.0
             self.acceleration[blocked] = 0.0
-            if np.linalg.norm(self.target[:3] - self.command[:3]) < 1e-4 \
+            if self.terminal_stop is None and np.linalg.norm(self.target[:3] - self.command[:3]) < 1e-4 \
                     and np.linalg.norm(self.velocity) < 5e-4:
                 self.command[:3] = self.target[:3]
                 self.velocity[:] = 0.0
                 self.acceleration[:] = 0.0
 
         remaining_angle = max(0.0, self.rotation_total - self.rotation_progress)
-        desired_angular_velocity = self.args.max_angular_velocity \
-            * min(1.0, remaining_angle / 0.35) * tracking_scale
-        desired_angular_acceleration = float(np.clip(
-            (desired_angular_velocity - self.angular_velocity) / 0.15, -0.8, 0.8))
-        self.angular_acceleration += float(np.clip(
-            desired_angular_acceleration - self.angular_acceleration, -4.0 * dt, 4.0 * dt))
-        angular_velocity = float(np.clip(
-            self.angular_velocity + self.angular_acceleration * dt, 0.0, self.args.max_angular_velocity))
-        progress = min(self.rotation_total, self.rotation_progress
-                       + (self.angular_velocity + angular_velocity) * 0.5 * dt)
+        rotation_elapsed = self.rotation_elapsed + dt * tracking_scale
+        if self.finite_approach:
+            fraction = min(1.0, rotation_elapsed / max(self.rotation_duration, 1e-12))
+            progress = self.rotation_total * (10 * fraction**3 - 15 * fraction**4 + 6 * fraction**5)
+            angular_velocity = self.rotation_total / max(self.rotation_duration, 1e-12) \
+                * 30 * fraction**2 * (1 - fraction)**2
+            angular_acceleration = self.rotation_total / max(self.rotation_duration**2, 1e-12) \
+                * 60 * fraction * (1 - fraction) * (1 - 2 * fraction)
+            if fraction == 1.0:
+                progress = self.rotation_total
+        else:
+            desired_angular_velocity = self.args.max_angular_velocity \
+                * min(1.0, remaining_angle / 0.35) * tracking_scale
+            desired_angular_acceleration = float(np.clip(
+                (desired_angular_velocity - self.angular_velocity) / 0.15, -0.8, 0.8))
+            angular_acceleration = self.angular_acceleration + float(np.clip(
+                desired_angular_acceleration - self.angular_acceleration, -4.0 * dt, 4.0 * dt))
+            angular_velocity = float(np.clip(
+                self.angular_velocity + angular_acceleration * dt, 0.0, self.args.max_angular_velocity))
+            progress = min(self.rotation_total, self.rotation_progress
+                           + (self.angular_velocity + angular_velocity) * 0.5 * dt)
         candidate_rotation = (self.rotation_start * Rotation.from_rotvec(self.rotation_axis * progress)).as_rotvec()
         candidate_angular_lag = float((Rotation.from_rotvec(measured[3:]).inv()
                                        * Rotation.from_rotvec(candidate_rotation)).magnitude())
@@ -164,7 +213,9 @@ class OnlineApproach:
         else:
             self.rotation_progress = progress
             self.angular_velocity = angular_velocity
-            if self.rotation_total - progress < 5e-4 and angular_velocity < 0.002:
+            self.angular_acceleration = angular_acceleration
+            self.rotation_elapsed = rotation_elapsed
+            if not self.finite_approach and self.rotation_total - progress < 5e-4 and angular_velocity < 0.002:
                 self.rotation_progress = self.rotation_total
                 self.angular_velocity = self.angular_acceleration = 0.0
             if self.rotation_progress == self.rotation_total:
@@ -176,6 +227,7 @@ class OnlineApproach:
                 "tracking_lag_m": lag, "angular_tracking_lag_rad": angular_lag,
                 "tracking_scale": tracking_scale, "position_paused": bool(position_paused),
                 "rotation_paused": bool(rotation_paused),
+                "finite_braking": self.terminal_stop is not None, "cruise_speed_m_s": self.cruise_speed,
                 "reference_velocity_m_s": self.velocity.tolist()}
 
     def at_goal(self) -> bool:
@@ -243,6 +295,53 @@ def format_pose(pose) -> str:
         + ", ".join(f"{v:+.4f}" for v in pose[3:])
 
 
+class _MotionWindow:
+    """Estimate settling from fresh measurements over 250 ms, not frame jitter."""
+
+    def __init__(self):
+        self.samples = deque()
+
+    def update(self, snap):
+        if self.samples and (snap["seq"] == self.samples[-1]["seq"]
+                             or snap["ts"] <= self.samples[-1]["ts"]):
+            return {"settling_window_ready": False}
+        self.samples.append(snap)
+        # Keep one sample on or before the window boundary for full coverage.
+        while len(self.samples) > 2 and self.samples[1]["ts"] <= snap["ts"] - 0.25:
+            self.samples.popleft()
+        elapsed = snap["ts"] - self.samples[0]["ts"]
+        if elapsed < 0.25:
+            return {"settling_window_ready": False}
+        poses = np.asarray([sample["pose"] for sample in self.samples], dtype=float)
+        offsets = poses[:, :3] - poses[0, :3]
+        rotations = (Rotation.from_rotvec(poses[0, 3:]).inv()
+                     * Rotation.from_rotvec(poses[:, 3:])).as_rotvec()
+        timestamps = np.asarray([sample["ts"] for sample in self.samples])
+        centered_time = timestamps - timestamps.mean()
+        denominator = float(centered_time @ centered_time)
+        speed = float(np.linalg.norm(centered_time @ offsets / denominator))
+        angular_speed = float(np.linalg.norm(centered_time @ rotations / denominator))
+        # A low net velocity alone could hide back-and-forth motion. Also check
+        # the full window's displacement span and per-joint RMS velocity.
+        position_span = float(np.max(np.linalg.norm(
+            offsets[:, None, :] - offsets[None, :, :], axis=2)))
+        angular_span = float(np.max(np.linalg.norm(
+            rotations[:, None, :] - rotations[None, :, :], axis=2)))
+        joint_samples = [np.asarray(sample.get("joint_speeds", []), dtype=float)
+                         for sample in self.samples]
+        joint_rms = float("inf")
+        if all(joints.shape == (7,) and np.all(np.isfinite(joints)) for joints in joint_samples):
+            joints = np.stack(joint_samples)
+            joint_rms = float(np.max(np.sqrt(np.mean(joints * joints, axis=0))))
+        return {"settling_window_ready": True, "settling_speed_m_s": speed,
+                "settling_angular_speed_rad_s": angular_speed,
+                "settling_position_span_m": position_span,
+                "settling_angular_span_rad": angular_span,
+                "settling_joint_rms_rad_s": joint_rms,
+                "settling_low_motion": speed < 0.002 and angular_speed < 0.02
+                and position_span < 0.0005 and angular_span < 0.005 and joint_rms < 0.01}
+
+
 def run_online_move(client, start: dict, target, args, emit) -> dict:
     planner = OnlineApproach(start["pose"], target, args)
     period = 1.0 / args.fps
@@ -255,6 +354,8 @@ def run_online_move(client, start: dict, target, args, emit) -> dict:
     previous_print = -float("inf")
     fault_baseline = int(start.get("servo_fault_seq", 0))
     servo_started = False
+    motion_window = _MotionWindow()
+    motion_window.update(start)
     while time.monotonic() < deadline:
         delay = next_tick - time.monotonic()
         if delay > 0:
@@ -279,29 +380,29 @@ def run_online_move(client, start: dict, target, args, emit) -> dict:
                                              - np.asarray(previous["pose"][:3])) / dt)
                 angular_speed = float((Rotation.from_rotvec(previous["pose"][3:]).inv()
                                        * Rotation.from_rotvec(snap["pose"][3:])).magnitude()) / dt
-        joint_speeds = np.asarray(snap.get("joint_speeds", []), dtype=float)
-        low_joint_speed = joint_speeds.shape == (7,) and np.all(np.isfinite(joint_speeds)) \
-            and float(np.max(np.abs(joint_speeds))) < 0.01
         inside_tolerance = error_mm <= args.position_tolerance * 1000 \
             and error_deg <= args.orientation_tolerance_deg
-        arrived = (planner.at_goal() or not servo_started) and inside_tolerance and low_joint_speed \
-            and speed is not None and speed < 0.002 \
-            and angular_speed is not None and angular_speed < 0.02
+        settling = motion_window.update(snap)
+        arrived = (planner.at_goal() or not servo_started) and inside_tolerance \
+            and settling.get("settling_low_motion", False)
         if arrived:
             if settled_since is None:
                 settled_since = now
             if now - settled_since >= args.settle_time:
                 if servo_started and not client.stop_servo():
                     raise RuntimeError("已到位，但 server 未确认结束 servo。")
-                emit("settled", state=snap, position_error_mm=error_mm, orientation_error_deg=error_deg)
+                emit("settled", state=snap, position_error_mm=error_mm,
+                     orientation_error_deg=error_deg, **settling)
                 return snap
         else:
             settled_since = None
-        if not servo_started and inside_tolerance and low_joint_speed:
+        if not servo_started and inside_tolerance:
             # No degenerate zero-distance JointMotion when the arm is already at
             # the goal: verify stability without opening a servo stream.
             emit("sample", state=snap, command_pose=planner.command.tolist(),
-                 initial_goal_wait=True, position_error_mm=error_mm, orientation_error_deg=error_deg)
+                 initial_goal_wait=True, position_error_mm=error_mm,
+                 orientation_error_deg=error_deg, tcp_speed_m_s=speed,
+                 tcp_angular_speed_rad_s=angular_speed, **settling)
             if snap["seq"] != previous["seq"]:
                 previous = snap
             previous_tick = now
@@ -311,10 +412,12 @@ def run_online_move(client, start: dict, target, args, emit) -> dict:
         client.servo_tool(planner.command.tolist())
         servo_started = True
         emit("sample", state=snap, command_pose=planner.command.tolist(),
-             tcp_speed_m_s=speed, position_error_mm=error_mm, orientation_error_deg=error_deg,
-             command_at_goal=planner.at_goal(), **diagnostics)
+             tcp_speed_m_s=speed, tcp_angular_speed_rad_s=angular_speed,
+             position_error_mm=error_mm, orientation_error_deg=error_deg,
+             command_at_goal=planner.at_goal(), **diagnostics, **settling)
         if now - previous_print >= 0.1:
-            speed_text = "--" if speed is None else f"{speed:.4f}"
+            displayed_speed = settling.get("settling_speed_m_s", speed)
+            speed_text = "--" if displayed_speed is None else f"{displayed_speed:.4f}"
             phase = "目标保持" if planner.at_goal() else "跟踪等待" \
                 if diagnostics["position_paused"] or diagnostics["rotation_paused"] else "接近"
             print(f"{phase} | TCP v≈{speed_text} m/s | 误差 {error_mm:.2f} mm / {error_deg:.2f}°"

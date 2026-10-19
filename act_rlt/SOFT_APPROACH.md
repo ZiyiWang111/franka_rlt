@@ -39,8 +39,10 @@ PYTHONPATH=src /home/embint/robolab-venv/bin/python -m act_rlt.soft_approach
 恢复时从原指令继续；不会把指令吸附到测量位置。硬滞后暂停和微小终点吸附优先于参考平滑。
 
 指令到达终点后仍维持目标发送，直到实测位置误差 <= 1 mm、朝向误差 <= 0.3°，
-TCP 速度 < 2 mm/s、角速度 < 0.02 rad/s、所有关节速度 < 0.01 rad/s，连续保持 0.4 s，
+在 250 ms 窗口拟合的 TCP 速度 < 2 mm/s、角速度 < 0.02 rad/s、各关节速度 RMS < 0.01 rad/s，
+且窗口内位置摆幅 < 0.5 mm、朝向摆幅 < 0.005 rad，连续保持 0.4 s，
 才确认完成并结束 servo。server 的 worker_status=idle 不作为到位条件。
+终端显示窗口速度；日志保留相邻帧差分速度 `tcp_speed_m_s`，并新增 `settling_*` 判定指标。
 如果本来就已经到位，则检查稳定性，不启动零距离 servo 运动。
 
 ## 参数

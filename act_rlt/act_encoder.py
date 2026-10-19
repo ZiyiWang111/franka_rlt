@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import inspect
+import textwrap
+import types
+
 import einops
 import torch
 from torch import Tensor
 
 from lerobot.policies.act.modeling_act import ACT, ACTPolicy
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+
+def enable_camera_only_act_forward(model: ACT) -> None:
+    """Fix older ACT's latent device lookup for a model without a state input.
+
+    Bind the corrected forward only to this instance; no dummy state is added
+    and installed LeRobot files and state-conditioned models remain unchanged.
+    """
+    if model.config.robot_state_feature or model.config.env_state_feature:
+        return
+    source = textwrap.dedent(inspect.getsource(type(model).forward))
+    lookup = "batch[OBS_STATE].device"
+    if lookup not in source:
+        return
+    source = source.replace(lookup, "batch[OBS_IMAGES][0].device")
+    namespace = dict(type(model).forward.__globals__)
+    exec(compile(source, "<camera_only_act_forward>", "exec"), namespace)
+    model.forward = types.MethodType(namespace["forward"], model)
 
 
 def prepare_act_batch(policy: ACTPolicy, batch: dict[str, Tensor]) -> dict[str, Tensor | list[Tensor]]:

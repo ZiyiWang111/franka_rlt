@@ -58,8 +58,6 @@ class ACTRLTokenConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features:
             raise ValueError("ACT RL-token training requires at least one image feature")
-        if self.robot_state_feature is None:
-            raise ValueError("ACT RL-token training requires observation.state")
         if self.action_feature is None:
             raise ValueError("ACT RL-token training requires the dataset action feature")
 

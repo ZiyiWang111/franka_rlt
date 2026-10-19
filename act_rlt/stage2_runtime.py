@@ -112,6 +112,9 @@ class FixedChunkRuntime:
                     fresh_after = started
                     diagnostics = {"camera_boundary_mode": "legacy",
                                    "camera_boundary_fallback_reason": "timed_observation_unavailable"}
+                capture_auxiliary = getattr(self.env, "_capture_auxiliary_state", None)
+                if capture_auxiliary is not None:
+                    observation = capture_auxiliary(observation)
                 completed = time.monotonic()
                 with self.observation_ready:
                     self.observation_seq += 1
@@ -178,7 +181,7 @@ class FixedChunkRuntime:
             timing.values["camera_capture_wall_ms"] = (observation_completed - observation_started) * 1000
         started = time.monotonic()
         camera_shapes = getattr(self.env, "camera_shapes", None)
-        frame = (
+        frame = self.env._observation_frame(observation) if hasattr(self.env, "_observation_frame") else (
             observation_frame(observation)
             if camera_shapes is None
             else observation_frame(observation, camera_shapes)
@@ -224,7 +227,7 @@ class FixedChunkRuntime:
             physical = self.env.post(normalized).detach().cpu().reshape(
                 self.env.config.chunk_length, -1
             )
-            if physical.shape[1] != self.env.config.action_dim + 1 or not torch.isfinite(physical).all():
+            if physical.shape[1] != full.shape[-1] or not torch.isfinite(physical).all():
                 raise RuntimeError("invalid Stage-2 physical action chunk")
             return physical
 
@@ -254,7 +257,8 @@ class FixedChunkRuntime:
             reference_commands.append(reference_command)
             mean_commands.append(mean_command)
             executed.append(self.env._normalize_executed_action(actual))
-            gripper_values.append(float(reference_row[self.env.config.action_dim]))
+            if reference_row.numel() > self.env.config.action_dim:
+                gripper_values.append(float(reference_row[self.env.config.action_dim]))
         timing.values["command_prepare_wall_ms"] = (time.monotonic() - commands_started) * 1000
         timing.values["prediction_wall_ms"] = (time.monotonic() - started) * 1000
         return Prediction(
@@ -426,9 +430,10 @@ class FixedChunkRuntime:
                     else:
                         info["human_idle_steps"] = info.get("human_idle_steps", 0) + 1
                     if self.human:
-                        full_action = torch.tensor([
-                            *command.values(), prediction.gripper_values[index]
-                        ], dtype=executed.dtype)
+                        values = list(command.values())
+                        if prediction.gripper_values:
+                            values.append(prediction.gripper_values[index])
+                        full_action = torch.tensor(values, dtype=executed.dtype)
                         executed[index] = self.env._normalize_executed_action(full_action)
                     else:
                         executed[index] = prediction.executed[index]

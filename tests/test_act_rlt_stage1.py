@@ -21,10 +21,84 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.utils.constants import OBS_STATE
 
 
+@pytest.mark.parametrize("state_dim", [None, 6])
+def test_action6_stage1_trains_only_rl_token(state_dim, monkeypatch):
+    from act_rlt.act_encoder import enable_camera_only_act_forward
+    from act_rlt.modeling_act_rlt_token import ACTRLTokenPolicy
+    from lerobot.policies.act.configuration_act import ACTConfig
+
+    inputs = {"observation.images.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64))}
+    if state_dim is not None:
+        inputs[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(state_dim,))
+    outputs = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(6,))}
+    act = ACTPolicy(ACTConfig(
+        input_features=inputs, output_features=outputs, device="cpu",
+        dim_model=32, n_heads=4, dim_feedforward=64, n_encoder_layers=1,
+        n_decoder_layers=1, chunk_size=4, n_action_steps=4,
+        use_vae=False, pretrained_backbone_weights=None,
+    ))
+    enable_camera_only_act_forward(act.model)
+    monkeypatch.setattr(ACTRLTokenPolicy, "_load_act_policy", lambda self: act)
+    policy = ACTRLTokenPolicy(ACTRLTokenConfig(
+        act_pretrained_path="/tmp/act", device="cpu", input_features=inputs,
+        output_features=outputs, chunk_size=4, rl_token_dim=32,
+        rl_token_nhead=4, rl_token_enc_layers=1, rl_token_dec_layers=1,
+        rl_token_ff_dim=64,
+    ))
+    batch = {key: torch.randn(2, *feature.shape) for key, feature in inputs.items()}
+    loss, _ = policy(batch)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert policy._encoder_equivalence_verified
+    assert any(p.grad is not None for p in policy.rl_token.parameters())
+    assert all(p.grad is None and not p.requires_grad for p in act.parameters())
+    assert not any(key.startswith("_act.") for key in policy.state_dict())
+
+
 ACT_CHECKPOINT = (
     Path(__file__).resolve().parents[1]
     / "outputs/act_rlt_001_state7_act/checkpoints/last/pretrained_model"
 )
+
+
+@pytest.mark.parametrize("state_dim", [None, 6])
+def test_launcher_uses_only_checkpoint_inputs(tmp_path, monkeypatch, state_dim):
+    import json
+    import sys
+    from act_rlt import train_rl_token
+
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    inputs = {"observation.images.wrist": {"type": "VISUAL", "shape": [3, 64, 64]}}
+    features = {
+        "observation.images.wrist": {"shape": [64, 64, 3]},
+        "observation.external_wrench": {"shape": [6]},
+        "action": {"shape": [6]},
+    }
+    if state_dim is not None:
+        inputs[OBS_STATE] = {"type": "STATE", "shape": [state_dim]}
+        features[OBS_STATE] = {"shape": [state_dim]}
+    (root / "meta/info.json").write_text(json.dumps(dict(
+        features=features, total_episodes=1, total_frames=20,
+    )))
+    checkpoint = tmp_path / "act"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(dict(
+        input_features=inputs, output_features={"action": {"type": "ACTION", "shape": [6]}},
+        chunk_size=16, dim_model=768,
+    )))
+    monkeypatch.setattr(train_rl_token, "resolve_checkpoint", lambda _: checkpoint)
+    commands = []
+    monkeypatch.setattr(train_rl_token, "_run", commands.append)
+    monkeypatch.setattr(sys, "argv", ["train_rl_token", "--root", str(root),
+        "--act-checkpoint", str(checkpoint), "--output", str(tmp_path / "output")])
+    train_rl_token.main()
+    encoded = next(arg.split("=", 1)[1] for arg in commands[0] if arg.startswith("--policy.input_features="))
+    assert json.loads(encoded) == inputs
+    features["action"]["shape"] = [7]
+    (root / "meta/info.json").write_text(json.dumps(dict(features=features)))
+    with pytest.raises(SystemExit):
+        train_rl_token.main()
 
 
 def test_policy_registers_with_lerobot_dynamic_factory() -> None:

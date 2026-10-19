@@ -111,11 +111,14 @@ class TemporalActionEnsembler:
     ``log_w_i = -m*i`` and ``w_i = exp(log_w_i - logsumexp(log_w))``.
     """
 
-    def __init__(self, chunk_size, coefficient):
+    def __init__(self, chunk_size, coefficient, action_dim=7):
         if chunk_size <= 0:
             raise ValueError("temporal ensemble chunk_size must be positive")
         if not np.isfinite(coefficient) or coefficient < 0:
             raise ValueError("temporal ensemble coefficient must be finite and non-negative")
+        if action_dim not in (6, 7):
+            raise ValueError("ACT action dimension must be 6 or 7")
+        self.action_dim = int(action_dim)
         self.chunk_size = int(chunk_size)
         self.coefficient = float(coefficient)
         self._chunks = []
@@ -123,9 +126,9 @@ class TemporalActionEnsembler:
 
     def add_chunk(self, start_step, values):
         values = np.asarray(values, dtype=float)
-        if values.shape != (self.chunk_size, 7) or not np.isfinite(values).all():
+        if values.shape != (self.chunk_size, self.action_dim) or not np.isfinite(values).all():
             raise ValueError(
-                f"expected temporal ensemble chunk ({self.chunk_size}, 7), got {values.shape}"
+                f"expected temporal ensemble chunk ({self.chunk_size}, {self.action_dim}), got {values.shape}"
             )
         with self._lock:
             self._chunks.append((int(start_step), values.copy()))
@@ -166,10 +169,9 @@ def checkpoint_camera_shapes(config):
     features = config.input_features
     if set(features) - {"observation.state", "observation.images.wrist", "observation.images.front"}:
         raise ValueError(f"Unsupported ACT input features: {sorted(features)}")
-    if "observation.state" not in features or tuple(features["observation.state"].shape) != (7,):
-        raise ValueError("Checkpoint must use a 7D joint state")
-    if "action" not in config.output_features or tuple(config.output_features["action"].shape) != (7,):
-        raise ValueError("Checkpoint must output a 7D action")
+    checkpoint_state_mode(config)
+    if "action" not in config.output_features or tuple(config.output_features["action"].shape) not in {(6,), (7,)}:
+        raise ValueError("Checkpoint must output a 6D or 7D action")
 
     cameras = {}
     for name in ("wrist", "front"):
@@ -204,15 +206,46 @@ def robot_camera_kwargs(cameras, args):
     }
 
 
-def observation_frame(observation, camera_shapes=None):
+def checkpoint_state_mode(config):
+    """The supported state contracts are joints7, external wrench6, or RGB only."""
+    feature = config.input_features.get("observation.state")
+    if feature is None:
+        return "none"
+    shape = tuple(feature.shape)
+    if shape == (7,):
+        return "joints"
+    if shape == (6,):
+        return "wrench"
+    raise ValueError("Checkpoint state must be absent, 7D joints, or 6D external wrench")
+
+
+def policy_observation(robot, config):
+    observation = robot.get_observation()
+    if checkpoint_state_mode(config) == "wrench":
+        # Same raw base-frame wrench used for the training dataset; normalization
+        # is applied later by the checkpoint's saved preprocessor.
+        observation["external_wrench"] = robot.get_external_wrench_base().copy()
+    return observation
+
+
+def observation_frame(observation, camera_shapes=None, state_mode="joints"):
     import torch
 
     if camera_shapes is None:
         camera_shapes = DEFAULT_CAMERA_SHAPES
-    state = np.array([observation[f"joint_{i}"] for i in range(7)], dtype=np.float32)
-    if not np.isfinite(state).all():
-        raise ValueError("Non-finite joint state")
-    frame = {"observation.state": torch.from_numpy(state)}
+    frame = {}
+    if state_mode != "none":
+        if state_mode == "joints":
+            state = np.array([observation[f"joint_{i}"] for i in range(7)], dtype=np.float32)
+            expected = (7,)
+        elif state_mode == "wrench":
+            state = np.asarray(observation["external_wrench"], dtype=np.float32)
+            expected = (6,)
+        else:
+            raise ValueError(f"Unsupported state mode: {state_mode}")
+        if state.shape != expected or not np.isfinite(state).all():
+            raise ValueError(f"Invalid {state_mode} state: expected finite {expected}, got {state}")
+        frame["observation.state"] = torch.from_numpy(state.copy())
     for camera, shape in camera_shapes.items():
         pixels = np.asarray(observation[camera])
         if pixels.shape != shape or pixels.dtype != np.uint8:
@@ -242,8 +275,8 @@ def resolve_checkpoint(path):
 
 def bounded_action_with_triggers(values, max_translation, max_rotation):
     values = np.asarray(values, dtype=float).reshape(-1).copy()
-    if values.shape != (7,) or not np.isfinite(values).all():
-        raise ValueError("Expected a finite 7D action")
+    if values.shape not in {(6,), (7,)} or not np.isfinite(values).all():
+        raise ValueError("Expected a finite 6D or 7D action")
     triggered = []
     for start, limit in ((0, max_translation), (3, max_rotation)):
         norm = np.linalg.norm(values[start:start + 3])
@@ -502,9 +535,9 @@ def _predict_action_chunk(policy, pre, post, observation, args, camera_shapes=No
     recapturing, converting, and uploading images that the policy will ignore.
     """
     if timing is None:
-        batch = pre(observation_frame(observation, camera_shapes))
+        batch = pre(observation_frame(observation, camera_shapes, checkpoint_state_mode(policy.config)))
     else:
-        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes)
+        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes, checkpoint_state_mode(policy.config))
         batch = timing.call("preprocess", pre, frame)
     n_action_steps = int(policy.config.n_action_steps)
     prepared = []
@@ -537,18 +570,20 @@ def _predict_full_action_chunk(policy, pre, post, observation, camera_shapes=Non
                                timing=None) -> np.ndarray:
     """Predict and unnormalize the full ACT chunk for temporal ensembling."""
     if timing is None:
-        batch = pre(observation_frame(observation, camera_shapes))
+        batch = pre(observation_frame(observation, camera_shapes, checkpoint_state_mode(policy.config)))
         values = post(policy.predict_action_chunk(batch)).detach().cpu().numpy()
     else:
-        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes)
+        frame = timing.call("image_conversion", observation_frame, observation, camera_shapes, checkpoint_state_mode(policy.config))
         batch = timing.call("preprocess", pre, frame)
         raw = timing.call("policy_first", policy.predict_action_chunk, batch)
         processed = timing.call("postprocess", post, raw)
         values = timing.call("cpu_copy", lambda: processed.detach().cpu().numpy())
-    values = np.asarray(values, dtype=float).reshape(-1, 7)
-    expected = int(policy.config.chunk_size)
-    if values.shape != (expected, 7) or not np.isfinite(values).all():
-        raise ValueError(f"expected ACT chunk ({expected}, 7), got {values.shape}")
+    values = np.asarray(values, dtype=float)
+    expected = (int(policy.config.chunk_size), int(policy.config.output_features["action"].shape[0]))
+    if values.shape == (1, *expected):
+        values = values[0]
+    if values.shape != expected or not np.isfinite(values).all():
+        raise ValueError(f"expected ACT chunk {expected}, got {values.shape}")
     return values
 
 
@@ -603,7 +638,8 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
     temporal_ensembler = None
     if temporal_coefficient is not None:
         temporal_ensembler = TemporalActionEnsembler(
-            policy.config.chunk_size, temporal_coefficient
+            policy.config.chunk_size, temporal_coefficient,
+            action_dim=policy.config.output_features["action"].shape[0],
         )
     residual_control = bool(getattr(args, "residual_control", False))
     residual_controller = ResidualMotionAccumulator() if residual_control else None
@@ -685,7 +721,7 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
         try:
             while not stop_event.is_set():
                 capture_started = time.monotonic() if profile_timing else None
-                observation = robot.get_observation()
+                observation = policy_observation(robot, policy.config)
                 with observation_ready:
                     latest_observation["seq"] += 1
                     latest_observation["value"] = observation
@@ -917,7 +953,7 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                     deadline_lateness_ms=1000 * lateness,
                     action_unbounded=prepared.values.tolist(),
                     action_sent=[float(prepared.action[key]) for key in ACTION_KEYS],
-                    gripper_prediction_m=float(prepared.values[6]),
+                    gripper_prediction_m=float(prepared.values[6]) if len(prepared.values) == 7 else None,
                     translation_limited=prepared.translation_triggered,
                     rotation_limited=prepared.rotation_triggered,
                     ensemble_votes=vote_count if temporal_ensembler is not None else None,
@@ -938,8 +974,9 @@ def _run_inference_episode(robot, policy, pre, post, args, torch, camera_shapes=
                     log_queue.put(
                         f"t={time.monotonic()-start:.1f}s "
                         f"delta={list(prepared.action.values())} "
-                        f"gripper_prediction={prepared.values[6]:.4f}m (held) "
-                        f"{queue_status}"
+                        + (f"gripper_prediction={prepared.values[6]:.4f}m (held) "
+                           if len(prepared.values) == 7 else "")
+                        + queue_status
                     )
                 if temporal_ensembler is not None:
                     latest_temporal_request["start_step"] = control_step + 1
@@ -1126,6 +1163,7 @@ def main():
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.act.modeling_act import ACTPolicy
     from lerobot.policies.factory import make_pre_post_processors
+    from act_rlt.act_encoder import enable_camera_only_act_forward
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
 
     checkpoint = str(resolve_checkpoint(args.checkpoint))
@@ -1145,6 +1183,7 @@ def main():
     policy = ACTPolicy.from_pretrained(
         checkpoint, config=config, local_files_only=True
     ).to(args.device).eval()
+    enable_camera_only_act_forward(policy.model)
     pre, post = make_pre_post_processors(
         config, pretrained_path=checkpoint,
         preprocessor_overrides={"device_processor": {"device": args.device}},
@@ -1169,7 +1208,7 @@ def main():
         robot.connect()
         # Warm up kernels using real observations before allowing motion.
         with torch.inference_mode():
-            post(policy.select_action(pre(observation_frame(robot.get_observation(), camera_shapes))))
+            post(policy.select_action(pre(observation_frame(policy_observation(robot, config), camera_shapes, checkpoint_state_mode(config)))))
         policy.reset()
         if args.dry_run:
             episode_index = 0

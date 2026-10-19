@@ -72,7 +72,7 @@ FORCE_FEEDBACK_NAMES = {
 }
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, include_insertion_speed: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, help="LeRobot dataset repo/name")
     parser.add_argument("--root", type=Path, required=True, help="Local dataset directory")
@@ -102,12 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Record only front at 640x480; do not open the wrist camera.",
     )
     parser.add_argument("--move-speed", type=float, default=0.02, help="TCP speed in m/s")
-    parser.add_argument(
-        "--insertion-speed",
-        type=float,
-        default=0.01,
-        help="Reference-to-final TCP speed in m/s",
-    )
+    if include_insertion_speed:
+        parser.add_argument(
+            "--insertion-speed",
+            type=float,
+            default=0.01,
+            help="Reference-to-final TCP speed in m/s",
+        )
     parser.add_argument(
         "--pre-episode-sleep",
         type=float,
@@ -139,11 +140,12 @@ def validate_args(args: argparse.Namespace) -> None:
         "episodes": args.episodes,
         "episode-time": args.episode_time,
         "move-speed": args.move_speed,
-        "insertion-speed": args.insertion_speed,
         "pre-episode-sleep": args.pre_episode_sleep,
         "post-episode-sleep": args.post_episode_sleep,
         "insert-minus-z": args.insert_minus_z,
     }
+    if hasattr(args, "insertion_speed"):
+        positive["insertion-speed"] = args.insertion_speed
     invalid = [
         name
         for name, value in positive.items()
@@ -586,7 +588,7 @@ def run_recorded_move(
             robot._start_keepalive()
 
 
-def build_dataset_and_robot(args: argparse.Namespace):
+def build_dataset_and_robot(args: argparse.Namespace, *, robot_factory=None):
     config = FrankaRobotConfig(
         robot_ip=args.robot_ip,
         camera_serial=args.wrist_camera,
@@ -599,7 +601,7 @@ def build_dataset_and_robot(args: argparse.Namespace):
         enable_front_camera=not args.wrist_only,
         include_gripper_action=True,
     )
-    robot = FrankaRobot(config)
+    robot = (robot_factory or FrankaRobot)(config)
     teleop_processor, _, observation_processor = make_default_processors()
     features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(

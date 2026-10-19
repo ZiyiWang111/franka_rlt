@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
 
     robot = FrankaRobot(FrankaRobotConfig(
         robot_ip=args.robot_ip, **robot_camera_kwargs(camera_shapes, args),
-        include_gripper_action=True, enable_fci_keepalive=False,
+        include_gripper_action=policy.act_action_dim == 7, enable_fci_keepalive=False,
         workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
         workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
     ))

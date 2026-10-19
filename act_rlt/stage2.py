@@ -106,7 +106,6 @@ class ACTStage2Config:
         positive_ints = {
             "chunk_length": self.chunk_length,
             "action_dim": self.action_dim,
-            "proprio_dim": self.proprio_dim,
             "actor_hidden_dim": self.actor_hidden_dim,
             "actor_num_layers": self.actor_num_layers,
             "fusion_dim": self.fusion_dim,
@@ -122,6 +121,8 @@ class ACTStage2Config:
         invalid = [name for name, value in positive_ints.items() if value <= 0]
         if invalid:
             raise ValueError(f"Stage-2 integer settings must be positive: {invalid}")
+        if self.proprio_dim not in (0, 6, 7):
+            raise ValueError("proprio_dim must be 0 (RGB only), 6 (wrench), or 7 (joints)")
         for name, value in {
             "actor_fixed_std": self.actor_fixed_std,
             "actor_lr": self.actor_lr,
@@ -215,16 +216,14 @@ class ACTStage2Policy(nn.Module):
                 f"chunk_length={self.config.chunk_length} exceeds ACT horizon={act_cfg.chunk_size}"
             )
         act_action_dim = int(act_cfg.action_feature.shape[0])
-        expected_act_action_dim = self.config.action_dim + 1
-        if act_action_dim != expected_act_action_dim:
+        if act_action_dim not in (self.config.action_dim, self.config.action_dim + 1):
             raise ValueError(
-                "FR3 Stage-2 expects ACT's six arm deltas plus one gripper "
-                f"dimension ({expected_act_action_dim}), got {act_action_dim}"
+                f"FR3 Stage-2 expects six arm deltas with an optional gripper, got {act_action_dim}"
             )
-        act_state_dim = int(act_cfg.robot_state_feature.shape[0])
+        act_state_dim = int(act_cfg.robot_state_feature.shape[0]) if act_cfg.robot_state_feature else 0
         if act_state_dim != self.config.proprio_dim:
             raise ValueError(
-                f"Stage-2 expects {self.config.proprio_dim}D joint state, got {act_state_dim}"
+                f"Stage-2 expects {self.config.proprio_dim}D auxiliary state, got {act_state_dim}"
             )
 
     @property
@@ -245,12 +244,15 @@ class ACTStage2Policy(nn.Module):
         preprocessor. ACT and the RL Token encoder stay frozen and in eval mode.
         """
         self._stage1.eval()
-        with timing.measure("act", batch[OBS_STATE].device) if timing else nullcontext():
+        device = next(value.device for value in batch.values() if isinstance(value, Tensor))
+        with timing.measure("act", device) if timing else nullcontext():
             full_ref, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(self._stage1._act, batch)
         with timing.measure("rl_token", hidden.device) if timing else nullcontext():
             z_rl = self._stage1.rl_token.encode(hidden.float() + pos.float())
-        proprio = batch[OBS_STATE][:, : self.config.proprio_dim].float()
-        state_vec = torch.cat([z_rl, proprio], dim=-1)
+        state_vec = z_rl
+        if self.config.proprio_dim:
+            proprio = batch[OBS_STATE].float()
+            state_vec = torch.cat([z_rl, proprio], dim=-1)
         ref = full_ref[:, : self.config.chunk_length, : self.config.action_dim].float()
         if state_vec.shape[-1] != self.config.state_dim:
             raise RuntimeError(f"unexpected Stage-2 state shape: {tuple(state_vec.shape)}")
@@ -333,7 +335,8 @@ class Stage2Learner:
         saved processor; reject non-affine processors rather than guessing.
         """
         with torch.no_grad():
-            probe = torch.stack([torch.zeros(7), torch.ones(7), torch.full((7,), 2.)]).to(self.config.device)
+            action_dim = self.policy.act_action_dim
+            probe = torch.stack([torch.zeros(action_dim), torch.ones(action_dim), torch.full((action_dim,), 2.)]).to(self.config.device)
             physical = postprocessor(probe).to(self.config.device)
             offset, scale = physical[0, :6], physical[1, :6] - physical[0, :6]
             if not torch.isfinite(physical).all() or (scale <= 0).any() or not torch.allclose(

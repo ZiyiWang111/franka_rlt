@@ -58,6 +58,20 @@ python -m act_rlt.data_collection.record_sample_space \
 
 入口：[infer.py](infer.py)。
 
+### 支持的模型输入与输出
+
+infer 根据 checkpoint 配置选择输入：无 `observation.state` 时仅输入相机；6 维 state 表示原始基座坐标系 wrench `[fx, fy, fz, mx, my, mz]`（N / Nm）；7 维 state 表示关节位置。wrench 与图像在同一观测采集线程读取，使用 checkpoint 保存的 preprocessor 归一化，不额外清零或变换坐标系。相机与 wrench 是顺序读取，并非严格时间同步。
+
+动作支持 6 维 TCP 增量，以及附带夹爪宽度预测的 7 维动作。两者均支持默认 temporal ensemble 和 `--no-temporal-ensemble`；7 维动作的夹爪预测仍只记录、不执行。纯相机模型自动应用项目已有的 LeRobot latent device 兼容修复。
+
+```bash
+# 纯相机；--dry-run 仍会连接机器人与相机，但不发送运动指令
+python -m act_rlt.infer --checkpoint outputs/act_dataset_928_camera_only_action6_act --dry-run --dry-run-episodes 1
+
+# 相机 + 六维 wrench
+python -m act_rlt.infer --checkpoint outputs/act_1010_rgb_wrench_action6_act --dry-run --dry-run-episodes 1
+```
+
 ### 起点与重置
 
 启动后加载 ACT checkpoint 和保存的 pre/postprocessor，连接机器人，用真实观测预热模型。运动模式下，按 Enter 采集当前完整 TCP 参考位姿，workspace 设为参考位置 XYZ 各 ±5 cm；起点 Z 和姿态使用上述固定采样常量。
@@ -217,7 +231,7 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 
 1. 加载已初始化的 v3 Stage 2 checkpoint，从保存的配置解析配套 ACT 和 Stage 1 checkpoint，加载 Actor 权重及 ACT processor。
 2. 连接机器人、确定 workspace 和起点，移动到选定点，Enter 开始 episode。
-3. 完整 ACT 生成参考 chunk，同时提取 encoder hidden 和 position；RL Token 编码后拼接归一化关节状态。
+3. 完整 ACT 生成参考 chunk，同时提取 encoder hidden 和 position；RL Token 编码后，根据 ACT 输入契约拼接归一化关节状态或 wrench；纯相机模型只使用 RL Token。
 4. Actor 输入状态与参考 chunk，执行**确定性均值动作**，不添加训练时的探索噪声。
 5. postprocessor 还原动作、进行物理限幅，按固定 chunk 执行；更新观测并生成下一 chunk。
 6. 成功/失败、超时或退出时停止当前 episode、回退；有下一 episode 时重新进入起点选择流程。
@@ -234,6 +248,36 @@ python -m act_rlt.infer_stage2 \
 `--checkpoint` 可指向 run 目录或具体 `.pt` 文件；run 目录解析为 `checkpoints/latest.pt`。配套模型路径变化时可传入 `--act-checkpoint` 和 `--stage1-checkpoint`。`--dry-run` 只加载检查模型，不连接机器人。
 
 ## 6. 图像与对比实验
+
+### 新的六维 action 模型进行 Stage 2 训练
+
+Stage 2 根据 ACT checkpoint 自动选择输入：纯相机为 768 维 RL Token；相机＋wrench 为 768＋6 维；旧 joint-state 模型为 768＋7 维。wrench 使用与 ACT 训练一致的基坐标系原始六维外力/力矩，再通过 ACT 保存的 processor 归一化。纯相机模型的 Actor/Critic 不加入关节状态或 wrench 分支。支持 ACT 的六维 delta 或旧七维 delta＋gripper 输出；机械臂执行六维 delta。
+
+纯相机：
+
+```bash
+python -m act_rlt.train_stage2 \
+  --stage1-checkpoint outputs/act_dataset_928_camera_only_action6_stage1_pos \
+  --act-checkpoint outputs/act_dataset_928_camera_only_action6_act \
+  --output outputs/rlt_camera_only_action6 \
+  --z-insertion-mode --allow-motion \
+  --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
+```
+
+相机＋六维 wrench：
+
+```bash
+python -m act_rlt.train_stage2 \
+  --stage1-checkpoint outputs/act_1010_rgb_wrench_action6_stage1_pos \
+  --act-checkpoint outputs/act_1010_rgb_wrench_action6_act \
+  --output outputs/rlt_rgb_wrench_action6 \
+  --z-insertion-mode --allow-motion \
+  --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
+```
+
+两者均需新建 Stage 2 run，不能复用旧 joint-state Stage 2 的 Actor/Critic 或 replay。默认四步 chunk、sigma 探索和起点 XY 随机逻辑沿用现有设置。加 `--dry-run --device cpu` 可仅检查模型加载，不连接机械臂。
+
+### 图像预处理
 
 ACT 和 Stage 2 均按 ACT checkpoint 的相机键与图像尺寸处理输入。腕部相机保持配置的采集尺寸；前置相机输出统一为 640×480。图像转为 CHW、像素除以 255，再通过 checkpoint 的 processor 标准化。当前 ACT 路径不自动缩小为 224×224。
 

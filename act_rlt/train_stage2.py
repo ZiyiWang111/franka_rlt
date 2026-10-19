@@ -32,6 +32,7 @@ from act_rlt.data_collection.sampling import (
 from act_rlt.infer import (
     bounded_action,
     checkpoint_camera_shapes,
+    checkpoint_state_mode,
     observation_frame,
     robot_camera_kwargs,
 )
@@ -392,7 +393,19 @@ class FrankaInsertionStage2Env:
         self._episode_human_steps = 0
 
     def _processed_observation(self) -> dict[str, torch.Tensor]:
-        return self.pre(observation_frame(self.robot.get_observation(), self.camera_shapes))
+        observation = self._capture_auxiliary_state(self.robot.get_observation())
+        return self.pre(self._observation_frame(observation))
+
+    def _capture_auxiliary_state(self, observation):
+        if getattr(getattr(self, "config", None), "proprio_dim", 7) == 6:
+            observation = dict(observation)
+            observation["external_wrench"] = self.robot.get_external_wrench_base().copy()
+        return observation
+
+    def _observation_frame(self, observation):
+        dim = getattr(getattr(self, "config", None), "proprio_dim", 7)
+        mode = {0: "none", 6: "wrench", 7: "joints"}[dim]
+        return observation_frame(observation, self.camera_shapes, state_mode=mode)
 
     def _close_monitor(self) -> None:
         if self._monitor is not None:
@@ -737,7 +750,7 @@ class FrankaInsertionStage2Env:
         return result
 
     def _normalize_executed_action(self, physical_full: torch.Tensor) -> torch.Tensor:
-        """Map one safety-bounded physical 7D action back to ACT model space."""
+        """Map one bounded physical ACT action back to its saved model space."""
         transition = create_transition(
             action=physical_full.detach().reshape(1, -1).to(self.config.device)
         )
@@ -753,7 +766,7 @@ class FrankaInsertionStage2Env:
             full_reference.ndim != 3
             or full_reference.shape[0] != 1
             or full_reference.shape[1] < self.config.chunk_length
-            or full_reference.shape[2] != self.config.action_dim + 1
+            or full_reference.shape[2] not in (self.config.action_dim, self.config.action_dim + 1)
         ):
             raise RuntimeError(f"unexpected ACT reference shape: {tuple(full_reference.shape)}")
 
@@ -773,7 +786,7 @@ class FrankaInsertionStage2Env:
             normalized_full = full_reference[:, index, :].clone()
             normalized_full[:, : self.config.action_dim] = action_chunk[:, index, :]
             physical_full = self.post(normalized_full).detach().cpu().reshape(-1)
-            if physical_full.numel() != self.config.action_dim + 1:
+            if physical_full.numel() != full_reference.shape[2]:
                 raise RuntimeError(
                     f"unexpected Stage-2 physical action shape: {tuple(physical_full.shape)}"
                 )
@@ -1271,9 +1284,14 @@ def main() -> int:
     if args.resume and not (output / "checkpoints/latest.pt").is_file():
         parser.error(f"resume checkpoint is missing: {output / 'checkpoints/latest.pt'}")
 
+    from lerobot.configs.policies import PreTrainedConfig
+
+    act_config = PreTrainedConfig.from_pretrained(act_path, local_files_only=True)
+    state_mode = checkpoint_state_mode(act_config)
     config = ACTStage2Config(
         stage1_checkpoint=str(stage1_path),
         act_checkpoint=str(act_path),
+        proprio_dim={"none": 0, "wrench": 6, "joints": 7}[state_mode],
         device=args.device,
         warmup_steps=args.warmup_steps,
         total_env_steps=args.total_env_steps,
@@ -1345,7 +1363,7 @@ def main() -> int:
         FrankaRobotConfig(
             robot_ip=args.robot_ip,
             **robot_camera_kwargs(camera_shapes, args),
-            include_gripper_action=True,
+            include_gripper_action=policy.act_action_dim == 7,
             enable_fci_keepalive=False,
             workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
             workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),

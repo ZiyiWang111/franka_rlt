@@ -258,6 +258,43 @@ class VirtualClock:
     def sleep(self, seconds): self.now += seconds
 
 
+class SettlingWindowTests(unittest.TestCase):
+    def measure(self, pose_for_time, joint_speed=0.0):
+        window = experiment._MotionWindow()
+        result = None
+        for index in range(21):
+            elapsed = index / 30
+            result = window.update({"seq": index, "ts": 100 + elapsed,
+                                    "pose": pose_for_time(elapsed),
+                                    "joint_speeds": [joint_speed] * 7})
+        return window, result
+
+    def test_stationary_micro_jitter_is_accepted(self):
+        _, result = self.measure(
+            lambda t: [0.00006 * (-1 if round(t * 30) % 2 else 1), 0, 0, 0, 0, 0])
+        self.assertTrue(result["settling_low_motion"])
+        self.assertLess(result["settling_speed_m_s"], 0.002)
+
+    def test_real_drift_and_joint_motion_are_rejected(self):
+        _, result = self.measure(lambda t: [0.003 * t, 0, 0, 0, 0, 0])
+        self.assertFalse(result["settling_low_motion"])
+        _, result = self.measure(lambda t: [0] * 6, joint_speed=0.03)
+        self.assertFalse(result["settling_low_motion"])
+
+    def test_back_and_forth_motion_is_rejected_even_with_low_net_speed(self):
+        _, result = self.measure(lambda t: [0.0004 * np.cos(2 * np.pi * 6 * t), 0, 0, 0, 0, 0])
+        self.assertGreater(result["settling_position_span_m"], 0.0005)
+        self.assertFalse(result["settling_low_motion"])
+
+    def test_duplicate_or_nonadvancing_measurement_cannot_confirm_stability(self):
+        window, result = self.measure(lambda t: [0] * 6)
+        self.assertTrue(result["settling_low_motion"])
+        last = window.samples[-1]
+        self.assertFalse(window.update(last)["settling_window_ready"])
+        repeated = dict(last, seq=last["seq"] + 1)
+        self.assertFalse(window.update(repeated)["settling_window_ready"])
+
+
 class ExperimentTests(unittest.TestCase):
     def stream(self, client, target, args):
         clock = VirtualClock()
@@ -340,6 +377,25 @@ class ExperimentTests(unittest.TestCase):
         target = list(client.pose)
         self.stream(client, target, experiment.build_parser().parse_args([]))
         self.assertEqual(client.servo_commands, [])
+
+    def test_goal_jitter_does_not_block_completion(self):
+        class NoisyClient(FakeClient):
+            def _send(self, command):
+                response = super()._send(command)
+                if command == "get_state":
+                    sign = 1 if self.seq % 2 else -1
+                    response["state"]["pose"][0] += sign * 0.00006
+                    response["state"]["joint_speeds"][0] = 0.012 if self.seq % 8 == 0 else 0.002
+                return response
+        client = NoisyClient()
+        client.pose[0] = 0.5
+        target = [0.4, 0, 0.4, 0, 0, 0]
+        result = self.stream(client, target, experiment.build_parser().parse_args(["--timeout", "12"]))
+        self.assertIn("stop_servo", client.events)
+        self.assertLess(experiment.pose_error(result["pose"], target)[0], 0.1)
+        stationary = NoisyClient()
+        self.stream(stationary, target, experiment.build_parser().parse_args([]))
+        self.assertEqual(stationary.servo_commands, [])
 
     def test_new_servo_fault_is_not_reported_as_success(self):
         class FaultClient(FakeClient):

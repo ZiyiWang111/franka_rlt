@@ -15,6 +15,7 @@ from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
 
 from act_rlt.act_encoder import (
     capture_act_forward_encoder_hidden,
+    enable_camera_only_act_forward,
     extract_act_encoder_hidden_and_pos,
     prepare_act_batch,
 )
@@ -70,12 +71,14 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
         if not isinstance(act_config, ACTConfig):
             raise TypeError(f"expected ACT checkpoint at {path}, got {act_config.type!r}")
         act_config.device = self.config.device
-        return ACTPolicy.from_pretrained(
+        act = ACTPolicy.from_pretrained(
             path,
             config=act_config,
             local_files_only=True,
             strict=True,
         )
+        enable_camera_only_act_forward(act.model)
+        return act
 
     def _validate_act_compatibility(self, act_config: ACTConfig) -> None:
         if act_config.use_vae:
