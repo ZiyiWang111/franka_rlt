@@ -611,7 +611,10 @@ and `0.01 m/s` for the final `-Z` segment. Adjust them independently with
 with `--pre-episode-sleep` and `--post-episode-sleep`.
 Recording frequency is selected with `--fps`; supported values are `15` and
 `30` Hz, with `15` Hz as the default. The Z insertion depth defaults to 1 cm
-and can be set with `--insert-minus-z`.
+and can be set in centimetres with `--insertion-cm` (original two-stage collector only),
+or in metres with `--insert-minus-z`. These options are mutually exclusive.
+For example, `--insertion-cm 1.5` makes the second stage descend 1.5 cm from p0;
+the non-recorded retreat then returns to p0.
 
 Use a one-episode low-speed dry run before a larger collection:
 

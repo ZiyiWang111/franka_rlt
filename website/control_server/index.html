@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teleop</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fafafa; color: #222; font: 15px system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 48px auto; padding: 0 24px; }
+  h1 { font-size: 22px; font-weight: 500; margin: 0 0 24px; }
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+  button { padding: 11px 18px; border: 1px solid #ccc; border-radius: 5px; background: white; color: #222; font: inherit; cursor: pointer; }
+  button:first-child { background: #222; color: white; border-color: #222; }
+  button:disabled { opacity: .45; cursor: wait; }
+  h2 { font-size: 13px; font-weight: 500; color: #666; margin: 0 0 10px; }
+  pre { margin: 0; padding: 20px; height: 65vh; min-height: 240px; overflow: auto; background: #171717; color: #e4e4e4; border-radius: 5px; font: 13px/1.6 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+<main>
+  <h1>Teleop</h1>
+  <section class="controls" aria-label="交互">
+    <button data-action="teleop/start">启动 teleop</button>
+    <button data-action="teleop/stop">退出 teleop</button>
+  </section>
+  <section aria-label="terminal 输出">
+    <h2>Terminal</h2>
+    <pre id="terminal" role="log" aria-label="终端输出"></pre>
+  </section>
+</main>
+<script>
+  const terminal = document.querySelector('#terminal');
+  const buttons = document.querySelectorAll('button');
+  let error = '';
+  async function refresh() {
+    try {
+      const response = await fetch('/api/output');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      const follow = terminal.scrollTop + terminal.clientHeight >= terminal.scrollHeight - 24;
+      terminal.textContent = data.output + (error ? '\n' + error : '');
+      if (follow) terminal.scrollTop = terminal.scrollHeight;
+    } catch (e) {
+      terminal.textContent = `无法读取输出：${e.message}`;
+    }
+  }
+  buttons.forEach(button => button.addEventListener('click', async () => {
+    buttons.forEach(item => item.disabled = true);
+    error = '';
+    try {
+      const response = await fetch(`/api/${button.dataset.action}`, {method: 'POST'});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    } catch (e) {
+      error = e.message;
+    } finally {
+      buttons.forEach(item => item.disabled = false);
+      await refresh();
+    }
+  }));
+  async function poll() {
+    await refresh();
+    setTimeout(poll, 1000);
+  }
+  poll();
+</script>
+</html>

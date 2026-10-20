@@ -903,7 +903,7 @@ def test_reset_choice_non_tty_accepts_range_key():
         assert prompt_reset_choice("reset", {"=": "increase"}) == "increase"
 
 
-@pytest.mark.parametrize("state_dim", [None, 6, 7])
+@pytest.mark.parametrize("state_dim", [None, 1, 6, 7])
 def test_model_input_contract_selects_only_requested_state(state_dim):
     config = SimpleNamespace(input_features={})
     if state_dim:
@@ -912,6 +912,7 @@ def test_model_input_contract_selects_only_requested_state(state_dim):
     wrench = np.array([1, 2, 3, 4, 5, 6], dtype=np.float32)
     robot = SimpleNamespace(
         get_observation=lambda: {"wrist": np.zeros((2, 3, 3), dtype=np.uint8),
+                                  "ee_z": np.float32(.381),
                                   **{f"joint_{i}": i for i in range(7)}},
         get_external_wrench_base=lambda: wrench,
     )
@@ -921,11 +922,22 @@ def test_model_input_contract_selects_only_requested_state(state_dim):
         assert set(frame) == {"observation.images.wrist"}
         assert "external_wrench" not in observation
     else:
-        expected = wrench if state_dim == 6 else np.arange(7)
+        expected = np.array([.381], dtype=np.float32) if state_dim == 1 else wrench if state_dim == 6 else np.arange(7)
         np.testing.assert_array_equal(frame["observation.state"].numpy(), expected)
     if state_dim == 6:
         wrench[:] = 0
         np.testing.assert_array_equal(frame["observation.state"].numpy(), [1, 2, 3, 4, 5, 6])
+
+
+@pytest.mark.parametrize('z', [float('nan'), float('inf'), float('-inf'), [.38], None])
+def test_invalid_tcp_z_is_rejected(z):
+    with pytest.raises(ValueError, match='Invalid tcp_z state'):
+        observation_frame({'ee_z': z}, {}, 'tcp_z')
+
+
+def test_missing_tcp_z_does_not_fall_back_to_fixed_sampling_height():
+    with pytest.raises(ValueError, match='measured ee_z'):
+        observation_frame({}, {}, 'tcp_z')
 
 
 @pytest.mark.parametrize("wrench", [[0] * 5, [0, 0, float("nan"), 0, 0, 0]])
@@ -935,13 +947,15 @@ def test_invalid_wrench_is_rejected(wrench):
 
 
 @pytest.mark.parametrize("coefficient", [None, 0.01])
-@pytest.mark.parametrize("mode", ["none", "wrench"])
+@pytest.mark.parametrize("mode", ["none", "wrench", "tcp_z"])
 def test_action6_runs_threaded_inference_and_records_trace(tmp_path, coefficient, mode):
     robot = _FakeRobot()
     robot.get_external_wrench_base = lambda: np.arange(6, dtype=np.float32)
+    original_observation = robot.get_observation
+    robot.get_observation = lambda: {**original_observation(), 'ee_z': .381}
     policy = _FakePolicy(n_action_steps=4, chunk_size=4, action_dim=6)
     policy.config.input_features = (
-        {} if mode == "none" else {"observation.state": SimpleNamespace(shape=(6,))}
+        {} if mode == "none" else {"observation.state": SimpleNamespace(shape=(1 if mode == 'tcp_z' else 6,))}
     )
     args = _threaded_args(duration=0.14, fps=30, temporal_ensemble_coeff=coefficient)
     args.log_dir = tmp_path
@@ -951,6 +965,8 @@ def test_action6_runs_threaded_inference_and_records_trace(tmp_path, coefficient
         assert state_mode == mode
         if mode == "wrench":
             np.testing.assert_array_equal(observation["external_wrench"], np.arange(6))
+        if mode == 'tcp_z':
+            assert observation_frame(observation, {}, mode)['observation.state'].shape == (1,)
         return observation
 
     with patch("act_rlt.infer.observation_frame", side_effect=frame):
@@ -963,7 +979,7 @@ def test_action6_runs_threaded_inference_and_records_trace(tmp_path, coefficient
     assert events[-1]["error"] is None
 
 
-@pytest.mark.parametrize("run", ["act_dataset_928_camera_only_action6_act", "act_1010_rgb_wrench_action6_act"])
+@pytest.mark.parametrize("run", ["act_dataset_928_camera_only_action6_act", "act_1010_rgb_wrench_action6_act", "act_dataset_928_addon_rgb_z_action6_act"])
 def test_actual_action6_checkpoint_configuration_and_processors(run):
     import torch
     from lerobot.configs.policies import PreTrainedConfig
@@ -982,6 +998,7 @@ def test_actual_action6_checkpoint_configuration_and_processors(run):
         preprocessor_overrides={"device_processor": {"device": "cpu"}},
     )
     observation = {"wrist": np.zeros(cameras["wrist"], dtype=np.uint8),
+                   "ee_z": .381,
                    "external_wrench": np.arange(6, dtype=np.float32)}
     mode = checkpoint_state_mode(config)
     batch = pre(observation_frame(observation, cameras, mode))
@@ -989,6 +1006,13 @@ def test_actual_action6_checkpoint_configuration_and_processors(run):
     if mode == "wrench":
         assert batch["observation.state"].shape == (1, 6)
         assert torch.isfinite(batch["observation.state"]).all()
+    elif mode == 'tcp_z':
+        from safetensors.torch import load_file
+        assert batch['observation.state'].shape == (1, 1)
+        saved = load_file(str(path / 'policy_preprocessor_step_3_normalizer_processor.safetensors'))
+        mean = saved['observation.state.mean']
+        std = saved['observation.state.std']
+        torch.testing.assert_close(batch['observation.state'], (torch.tensor([[.381]]) - mean) / (std + 1e-8))
     else:
         assert "observation.state" not in batch
     assert post(torch.zeros(1, 16, 6)).shape == (1, 16, 6)

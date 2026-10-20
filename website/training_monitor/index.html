@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ACT · Training Observatory</title><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header><a class="brand" href="/" aria-label="训练监控首页"><span class="brand-mark">A<span>↗</span></span><span>ACT<span class="brand-sub">OBSERVATORY</span></span></a><div class="header-right"><span id="connection" class="connection">正在连接</span><span class="host">10.0.40.163</span></div></header>
+  <main>
+    <div class="intro"><div><div class="eyebrow">EXPERIMENT / 928 + ADDON</div><h1>每一步，都看得见<span>.</span></h1><p>同一份数据，两种输入。实时观察 ACT 的学习过程。</p></div><div class="intro-right"><div id="updated">等待首批数据…</div><a class="export" href="/api/history.csv" download>↓ 导出曲线 CSV</a></div></div>
+    <div id="notice" role="status" hidden></div>
+    <section class="summary" aria-label="实验设置"><div><span class="summary-label">合并数据</span><strong>745 <small>episodes</small></strong></div><div><span class="summary-label">样本帧数</span><strong>71,746 <small>frames</small></strong></div><div><span class="summary-label">训练目标</span><strong><span id="target-steps">30,000</span> <small>steps / run</small></strong></div><div><span class="summary-label">每步动作</span><strong>6 <small>TCP deltas</small></strong></div></section>
+    <section id="runs" class="runs" aria-label="训练任务"><div class="loading">正在读取训练任务…</div></section>
+    <section class="panel chart-panel">
+      <div class="panel-heading"><div><div class="eyebrow">LEARNING DYNAMICS</div><h2 id="chart-title">Loss 对比</h2><p id="chart-description">按真实训练 step 对齐 · 训练 loss，不是验证集指标</p></div><div class="metric-tabs" role="group" aria-label="选择曲线"><button class="active" data-metric="loss">Loss</button><button data-metric="grdn">梯度范数</button><button data-metric="updt_s">更新时间</button><button data-metric="data_s">数据等待</button></div></div>
+      <div class="chart-toolbar"><div class="legend" id="legend"></div><div class="chart-options"><label>显示范围 <select id="range"><option value="all">全部记录</option><option value="2000">最近 2,000 steps</option><option value="5000">最近 5,000 steps</option></select></label><label>平滑 <input id="smooth" type="range" min="0" max="95" value="70" step="5"><output id="smooth-value">0.70</output></label><label class="check"><input id="log-scale" type="checkbox"> 对数 Y 轴</label></div></div>
+      <div class="chart-wrap"><svg id="main-chart" role="img" aria-label="训练指标曲线" viewBox="0 0 1100 340"></svg><div id="tooltip" class="tooltip" hidden></div></div>
+      <div class="chart-foot"><span>浅色为原始记录，实线为 EMA 平滑曲线。悬停查看具体数值。</span><span id="point-count">0 records</span></div>
+    </section>
+    <div class="bottom-grid"><section class="panel"><div class="panel-heading"><div><div class="eyebrow">OPTIMIZATION</div><h2>学习率</h2></div><span class="chip">Warmup → Cosine</span></div><svg id="lr-chart" role="img" aria-label="学习率曲线" viewBox="0 0 700 235"></svg><div class="chart-foot">1,000 步预热 · 峰值 3e-5 · 最终 3e-6</div></section><section class="panel hardware"><div class="panel-heading"><div><div class="eyebrow">COMPUTE</div><h2>训练 GPU</h2></div><span class="chip">A100 · 80 GB</span></div><div id="gpus" class="gpu-list">等待 GPU 数据…</div><div class="chart-foot">利用率与显存为实时读数</div></section></div>
+    <details class="panel details"><summary>查看训练配置与输出路径 <span>＋</span></summary><div id="details-content"></div></details>
+    <footer><span><span class="footer-dot"></span> 训练日志只读监控</span><span id="refresh-note">每 10 秒同步服务器 · 浏览器自动刷新</span></footer>
+  </main><script src="/app.js"></script>
+</body></html>

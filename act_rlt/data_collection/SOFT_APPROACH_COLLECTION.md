@@ -19,7 +19,7 @@ bash act_rlt/data_collection/collect_soft_approach.sh \
 4. 确认最终目标实际到位并稳定后自动保存。途中不在 p0 停车，没有独立的固定下插阶段。
 5. 等待 1 秒，停止录制状态下退回 p0，再采样下一轮。
 
-起点采样仍是：X 为 p0 ±2 cm，Y 为 p0+[1.5,2.5] cm，绝对 Z=0.402 m，
+起点采样为：X 为 p0 ±2.5 cm，Y 为 p0+[1,3] cm，绝对 Z=0.402 m，
 固定 XYZ Euler `[179.7,1.4,90.6]` 度；最终目标使用手动示教的朝向。
 录制中按 `x` 停止并丢弃当前轮，之后 Enter 恢复；非录制窗口支持 `1` 返回 p0、`2` 返回
 当前采样点，数字键操作后 Enter 恢复自动流程，`q` 退出。Ctrl+C 停止。
@@ -47,7 +47,7 @@ bash act_rlt/data_collection/collect_soft_approach.sh \
 | `--episode-time` | 60 s | 每轮总超时 |
 | `--stage-timeout` | 40 s | 这一段 approach 的超时，同时受本轮剩余时间限制 |
 
-采集起点的 XY 距离通常只有 15–32 mm，不能直接套用独立脚本的 60→10 mm 放行区间，
+采集起点的 XY 距离约为 10–39 mm，不能直接套用独立脚本的 60→10 mm 放行区间，
 否则一开始就几乎完全放行 Z，路径接近直线。现在每轮 approach 开始时确定一次区间：
 放行起点为 `min(--lateral-gate-distance, 初始 XY 距离)`，完全放行阈值为
 `min(--lateral-tolerance, 放行起点 × 15%)`。例如初始 XY 距离 20 mm 时，

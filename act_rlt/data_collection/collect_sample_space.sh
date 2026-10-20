@@ -26,6 +26,8 @@ INSERTION_SPEED="${INSERTION_SPEED:-0.01}"
 PRE_EPISODE_SLEEP="${PRE_EPISODE_SLEEP:-1.0}"
 POST_EPISODE_SLEEP="${POST_EPISODE_SLEEP:-1.0}"
 INSERT_MINUS_Z="${INSERT_MINUS_Z:-0.01}"
+INSERTION_CM=""
+DEPTH_OPTION_SET=false
 ABORT_KEY="${ABORT_KEY:-x}"
 SEED="${SEED:-}"
 RESUME="${RESUME:-false}"
@@ -55,6 +57,7 @@ Trajectory (metres, robot-base frame):
   --pre-episode-sleep SEC Delay after reaching sample (default: 1.0)
   --post-episode-sleep SEC Delay after saving episode (default: 1.0)
   --insert-minus-z M      Recorded -Z advance from p0 (default: 0.01)
+  --insertion-cm CM       Second-stage -Z depth in cm (default: 1); excludes --insert-minus-z
   --abort-key KEY         Stop and discard active episode (default: x)
   --seed N                Optional reproducible sample sequence
 
@@ -72,10 +75,10 @@ Hardware/runtime:
 Workflow:
   1. Hand-guide to reference p0 and press ENTER once.
   2. The recorder samples and moves to a start pose outside the episode.
-  3. After 1.0 s it records sample -> p0 -> p0-1cm(Z) and saves automatically.
+  3. After 1.0 s it records sample -> p0 -> p0-depth(Z) and saves automatically.
   4. After another 1.0 s it retreats to p0, moves to the next sample, and repeats.
 
-Samples use x0 +/-2cm, y0+[1.5,2.5]cm, absolute z=402mm, and a fixed
+Samples use x0 +/-2.5cm, y0+[1,3]cm, absolute z=402mm, and a fixed
 TCP XYZ Euler angle of [179.7, 1.4, 90.6] degrees.
 Reference p0, insertion, and retreat preserve the hand-taught TCP orientation.
 Moving to a sample changes to the fixed orientation; returning to p0 restores
@@ -105,7 +108,12 @@ while (($#)); do
         --insertion-speed) INSERTION_SPEED="${2:?--insertion-speed requires a value}"; shift 2 ;;
         --pre-episode-sleep) PRE_EPISODE_SLEEP="${2:?--pre-episode-sleep requires a value}"; shift 2 ;;
         --post-episode-sleep) POST_EPISODE_SLEEP="${2:?--post-episode-sleep requires a value}"; shift 2 ;;
-        --insert-minus-z) INSERT_MINUS_Z="${2:?--insert-minus-z requires a value}"; shift 2 ;;
+        --insert-minus-z)
+            [[ "$DEPTH_OPTION_SET" == false ]] || die "specify only one insertion-depth option"
+            INSERT_MINUS_Z="${2:?--insert-minus-z requires a value}"; DEPTH_OPTION_SET=true; shift 2 ;;
+        --insertion-cm)
+            [[ "$DEPTH_OPTION_SET" == false ]] || die "specify only one insertion-depth option"
+            INSERTION_CM="${2:?--insertion-cm requires a value}"; DEPTH_OPTION_SET=true; shift 2 ;;
         --abort-key) ABORT_KEY="${2:?--abort-key requires a value}"; shift 2 ;;
         --seed) SEED="${2:?--seed requires a value}"; shift 2 ;;
         --resume) RESUME=true; shift ;;
@@ -147,6 +155,7 @@ for pair in \
     value="${pair#*:}"
     is_positive_number "$value" || die "--${name} must be positive"
 done
+[[ -z "$INSERTION_CM" ]] || is_positive_number "$INSERTION_CM" || die "--insertion-cm must be positive"
 [[ ${#ABORT_KEY} -eq 1 ]] || die "--abort-key must be exactly one character"
 [[ -z "$SEED" || "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 [[ "$RESUME" == true || "$RESUME" == false ]] || die "RESUME must be true or false"
@@ -204,9 +213,13 @@ case "$CAMERA_MODE" in
     front) echo "  cameras=front only (640x480@30Hz)" ;;
     both) echo "  cameras=wrist + front (each 640x480@30Hz)" ;;
 esac
-echo "  sample x=+/-0.020m, y=[+0.015,+0.025]m from p0, z=0.402m"
+echo "  sample x=+/-0.025m, y=[+0.010,+0.030]m from p0, z=0.402m"
 echo "  sampled TCP orientation=XYZ Euler (179.7, 1.4, 90.6) deg"
-echo "  final=-Z ${INSERT_MINUS_Z}m; non-recorded retreat=+Z ${INSERT_MINUS_Z}m"
+if [[ -n "$INSERTION_CM" ]]; then
+    echo "  final=-Z ${INSERTION_CM}cm; non-recorded retreat=+Z ${INSERTION_CM}cm"
+else
+    echo "  final=-Z ${INSERT_MINUS_Z}m; non-recorded retreat=+Z ${INSERT_MINUS_Z}m"
+fi
 echo "  move_speed=${MOVE_SPEED}m/s, insertion_speed=${INSERTION_SPEED}m/s"
 echo "  pre_episode_sleep=${PRE_EPISODE_SLEEP}s, post_episode_sleep=${POST_EPISODE_SLEEP}s"
 echo "  abort_key=${ABORT_KEY}"
@@ -250,9 +263,13 @@ RECORDER_ARGS=(
     --insertion-speed "$INSERTION_SPEED"
     --pre-episode-sleep "$PRE_EPISODE_SLEEP"
     --post-episode-sleep "$POST_EPISODE_SLEEP"
-    --insert-minus-z "$INSERT_MINUS_Z"
     --abort-key "$ABORT_KEY"
 )
+if [[ -n "$INSERTION_CM" ]]; then
+    RECORDER_ARGS+=(--insertion-cm "$INSERTION_CM")
+else
+    RECORDER_ARGS+=(--insert-minus-z "$INSERT_MINUS_Z")
+fi
 if [[ "$CAMERA_MODE" == wrist ]]; then
     RECORDER_ARGS+=(--wrist_only)
 elif [[ "$CAMERA_MODE" == front ]]; then

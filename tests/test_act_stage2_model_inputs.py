@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 import numpy as np
 import pytest
@@ -28,7 +29,7 @@ class FrozenStage1(nn.Module):
         )
 
 
-@pytest.mark.parametrize('state_dim,action_dim', [(0, 6), (6, 6), (7, 7)])
+@pytest.mark.parametrize('state_dim,action_dim', [(0, 6), (1, 6), (6, 6), (7, 7)])
 def test_model_contract_encoding_learning_and_roundtrip(state_dim, action_dim, monkeypatch, tmp_path):
     config = ACTStage2Config(
         stage1_checkpoint='/tmp/stage1', act_checkpoint='/tmp/act', device='cpu',
@@ -69,12 +70,12 @@ def test_model_contract_encoding_learning_and_roundtrip(state_dim, action_dim, m
         torch.testing.assert_close(value, restored.policy.actor.state_dict()[key])
 
 
-@pytest.mark.parametrize('state_dim,action_dim', [(0, 6), (6, 6), (7, 7)])
+@pytest.mark.parametrize('state_dim,action_dim', [(0, 6), (1, 6), (6, 6), (7, 7)])
 def test_observation_and_runtime_action_roundtrip(state_dim, action_dim):
     env = object.__new__(FrankaInsertionStage2Env)
     env.config = SimpleNamespace(proprio_dim=state_dim, action_dim=6, chunk_length=4, device='cpu')
     env.camera_shapes = {'wrist': (8, 8, 3)}
-    raw = {'wrist': np.zeros((8, 8, 3), dtype=np.uint8),
+    raw = {'wrist': np.zeros((8, 8, 3), dtype=np.uint8), 'ee_z': .402,
            **{f'joint_{i}': float(i) for i in range(7)}}
     calls = []
     def wrench():
@@ -86,7 +87,12 @@ def test_observation_and_runtime_action_roundtrip(state_dim, action_dim):
     assert ('observation.state' in frame) == bool(state_dim)
     assert len(calls) == (1 if state_dim == 6 else 0)
     if state_dim:
-        torch.testing.assert_close(frame['observation.state'], torch.arange(state_dim, dtype=torch.float32))
+        expected = torch.tensor([.402]) if state_dim == 1 else torch.arange(state_dim, dtype=torch.float32)
+        torch.testing.assert_close(frame['observation.state'], expected)
+    if state_dim == 1:
+        # Every new observation uses measured absolute Z, not the reset height.
+        raw['ee_z'] = .391
+        torch.testing.assert_close(env._processed_observation()['observation.state'], torch.tensor([.391]))
     env.post = lambda x: x * .02
     env.max_step_m, env.max_step_rad = .002, .02
     env.action_normalizer = lambda t: {TransitionKey.ACTION: t[TransitionKey.ACTION] / .02}
@@ -99,4 +105,34 @@ def test_observation_and_runtime_action_roundtrip(state_dim, action_dim):
     assert len(prediction.gripper_values) == (4 if action_dim == 7 else 0)
     assert all(prediction.clipped)
     torch.testing.assert_close(prediction.executed[:, :3].norm(dim=-1), torch.full((4,), .1))
-    assert raw.keys() == {'wrist', *[f'joint_{i}' for i in range(7)]}
+    assert raw.keys() == {'wrist', 'ee_z', *[f'joint_{i}' for i in range(7)]}
+
+
+@pytest.mark.parametrize('selection', ['latest', 'boundary'])
+def test_tcp_z_cached_observation_uses_same_frame_state(selection):
+    from collections import deque
+
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.config = SimpleNamespace(proprio_dim=1)
+    env.camera_shapes = {'wrist': (8, 8, 3)}
+    env.pre = lambda frame: frame
+    runtime = object.__new__(FixedChunkRuntime)
+    runtime.env = env
+    runtime.observation_selection = selection
+    runtime.observation_seq, runtime.last_observation_seq = 1, 0
+    runtime.observation_ready = threading.Condition()
+    runtime.stop = threading.Event()
+    raw = {'ee_z': .391, 'wrist': np.zeros((8, 8, 3), dtype=np.uint8)}
+    runtime.observation_history = deque([(1., 2., 1., raw, {'observation_seq': 1})])
+    frame = runtime._boundary_batch(0.)
+    torch.testing.assert_close(frame['observation.state'], torch.tensor([.391]))
+
+
+@pytest.mark.parametrize('z', [None, float('nan'), float('inf')])
+def test_tcp_z_rejects_missing_or_nonfinite_measurement(z):
+    env = object.__new__(FrankaInsertionStage2Env)
+    env.config = SimpleNamespace(proprio_dim=1)
+    env.camera_shapes = {}
+    raw = {} if z is None else {'ee_z': z}
+    with pytest.raises(ValueError, match='TCP Z|tcp_z'):
+        env._observation_frame(raw)

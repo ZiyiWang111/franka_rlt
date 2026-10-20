@@ -72,6 +72,10 @@ FORCE_FEEDBACK_NAMES = {
 }
 
 
+def _centimeters_to_meters(value: str) -> float:
+    return float(value) / 100.0
+
+
 def build_parser(*, include_insertion_speed: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, help="LeRobot dataset repo/name")
@@ -121,12 +125,19 @@ def build_parser(*, include_insertion_speed: bool = True) -> argparse.ArgumentPa
         default=1.0,
         help="Pause after saving an episode and before retreating",
     )
-    parser.add_argument(
+    depth_options = parser.add_mutually_exclusive_group() if include_insertion_speed else parser
+    depth_options.add_argument(
         "--insert-minus-z",
         type=float,
         default=DEFAULT_INSERT_MINUS_Z_M,
         help="Recorded -Z advance from the reference pose (default: 0.01 m).",
     )
+    if include_insertion_speed:
+        depth_options.add_argument(
+            "--insertion-cm", dest="insert_minus_z", type=_centimeters_to_meters,
+            default=argparse.SUPPRESS,
+            help="Second-stage insertion depth in centimetres along base -Z (default: 1 cm).",
+        )
     parser.add_argument("--abort-key", default="x", help="Single-key active-episode abort")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic sampler seed")
     parser.add_argument("--resume", action="store_true")
@@ -700,7 +711,7 @@ def main() -> int:
         print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm): {format_pose(final_pose)}")
         print(
             "Sample bounds (robot base frame): "
-            "x=x0+/-0.0200 m, y=[y0+0.0150, y0+0.0250] m, z=0.4020 m. "
+            "x=x0+/-0.0250 m, y=[y0+0.0100, y0+0.0300] m, z=0.4020 m. "
             f"Sample orientation is fixed XYZ Euler {SAMPLE_EULER_XYZ_DEG} deg. "
             "Reference and insertion retain the taught orientation."
         )

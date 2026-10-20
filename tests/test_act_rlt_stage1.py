@@ -21,7 +21,7 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.utils.constants import OBS_STATE
 
 
-@pytest.mark.parametrize("state_dim", [None, 6])
+@pytest.mark.parametrize("state_dim", [None, 1, 6])
 def test_action6_stage1_trains_only_rl_token(state_dim, monkeypatch):
     from act_rlt.act_encoder import enable_camera_only_act_forward
     from act_rlt.modeling_act_rlt_token import ACTRLTokenPolicy
@@ -61,7 +61,7 @@ ACT_CHECKPOINT = (
 )
 
 
-@pytest.mark.parametrize("state_dim", [None, 6])
+@pytest.mark.parametrize("state_dim", [None, 1, 6])
 def test_launcher_uses_only_checkpoint_inputs(tmp_path, monkeypatch, state_dim):
     import json
     import sys
@@ -93,12 +93,30 @@ def test_launcher_uses_only_checkpoint_inputs(tmp_path, monkeypatch, state_dim):
     monkeypatch.setattr(sys, "argv", ["train_rl_token", "--root", str(root),
         "--act-checkpoint", str(checkpoint), "--output", str(tmp_path / "output")])
     train_rl_token.main()
+    assert 'install_scalar_state_dataset_support()' in commands[0][3]
     encoded = next(arg.split("=", 1)[1] for arg in commands[0] if arg.startswith("--policy.input_features="))
     assert json.loads(encoded) == inputs
     features["action"]["shape"] = [7]
     (root / "meta/info.json").write_text(json.dumps(dict(features=features)))
     with pytest.raises(SystemExit):
         train_rl_token.main()
+
+
+def test_resume_launcher_installs_same_scalar_state_compatibility(tmp_path, monkeypatch):
+    import sys
+    from act_rlt import train_rl_token
+
+    output = tmp_path / 'run'
+    saved = output / 'checkpoints/last/pretrained_model/train_config.json'
+    saved.parent.mkdir(parents=True)
+    saved.write_text('{}')
+    commands = []
+    monkeypatch.setattr(train_rl_token, '_run', commands.append)
+    monkeypatch.setattr(sys, 'argv', ['train_rl_token', '--output', str(output), '--resume'])
+    train_rl_token.main()
+    assert commands[0][3] == train_rl_token.TRAIN_ENTRYPOINT
+    assert 'install_scalar_state_dataset_support()' in commands[0][3]
+    assert '--resume=true' in commands[0]
 
 
 def test_policy_registers_with_lerobot_dynamic_factory() -> None:

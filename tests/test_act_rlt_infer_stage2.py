@@ -124,8 +124,8 @@ def test_run_reference_uses_saved_training_point(monkeypatch, choice):
         terminal=InferenceTerminal(1, 10, stream=io.StringIO()),
     )
     np.testing.assert_allclose(reference, [0.4, -0.2, 0.4, 1, 2, 3])
-    np.testing.assert_allclose(lower, [0.35, -0.25, 0.35])
-    np.testing.assert_allclose(upper, [0.45, -0.15, 0.45])
+    np.testing.assert_allclose(lower, [0.35, -0.30, 0.35])
+    np.testing.assert_allclose(upper, [0.45, -0.10, 0.45])
     np.testing.assert_array_equal(initial, reference)
     assert initial is not reference
 
@@ -147,8 +147,8 @@ def test_run_reference_captures_current_tcp_and_new_workspace(monkeypatch, saved
         terminal=InferenceTerminal(1, 10, stream=io.StringIO()),
     )
     np.testing.assert_array_equal(reference, current)
-    np.testing.assert_allclose(lower, [0.55, 0.05, 0.36])
-    np.testing.assert_allclose(upper, [0.65, 0.15, 0.46])
+    np.testing.assert_allclose(lower, [0.55, 0.00, 0.36])
+    np.testing.assert_allclose(upper, [0.65, 0.20, 0.46])
     assert initial is None  # No training-pose shortcut in the newly captured workspace.
 
 

@@ -207,16 +207,18 @@ def robot_camera_kwargs(cameras, args):
 
 
 def checkpoint_state_mode(config):
-    """The supported state contracts are joints7, external wrench6, or RGB only."""
+    """Select RGB-only, absolute TCP Z, external wrench6, or joint-state7."""
     feature = config.input_features.get("observation.state")
     if feature is None:
         return "none"
     shape = tuple(feature.shape)
+    if shape == (1,):
+        return "tcp_z"
     if shape == (7,):
         return "joints"
     if shape == (6,):
         return "wrench"
-    raise ValueError("Checkpoint state must be absent, 7D joints, or 6D external wrench")
+    raise ValueError("Checkpoint state must be absent, 1D absolute TCP Z, 6D external wrench, or 7D joints")
 
 
 def policy_observation(robot, config):
@@ -241,6 +243,14 @@ def observation_frame(observation, camera_shapes=None, state_mode="joints"):
         elif state_mode == "wrench":
             state = np.asarray(observation["external_wrench"], dtype=np.float32)
             expected = (6,)
+        elif state_mode == "tcp_z":
+            if "ee_z" not in observation:
+                raise ValueError("TCP Z input requires measured ee_z in metres from the robot observation")
+            # The recorder used the same measured base-frame pose[2]. Keep it
+            # absolute, not a reset offset or dz action; saved processors apply
+            # the training dataset's normalization exactly once afterwards.
+            state = np.asarray([observation["ee_z"]], dtype=np.float32)
+            expected = (1,)
         else:
             raise ValueError(f"Unsupported state mode: {state_mode}")
         if state.shape != expected or not np.isfinite(state).all():

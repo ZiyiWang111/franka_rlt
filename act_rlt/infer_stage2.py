@@ -21,6 +21,8 @@ from act_rlt.train_stage2 import (
     restore_training_reference,
 )
 
+INFERENCE_WORKSPACE_Y_HALF_RANGE_M = 0.10
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -177,7 +179,9 @@ def select_run_reference(robot, saved_reference, *, randomize_xy, terminal):
             )).strip().lower()
             if choice == "t":
                 reference, lower, upper = restore_training_reference(saved_reference)
-                terminal.write("[REFERENCE] Using saved training reference and workspace for this run.")
+                lower[1] = reference[1] - INFERENCE_WORKSPACE_Y_HALF_RANGE_M
+                upper[1] = reference[1] + INFERENCE_WORKSPACE_Y_HALF_RANGE_M
+                terminal.write("[REFERENCE] Using saved training reference; workspace Y is +/-10 cm.")
                 terminal.workspace(reference, lower, upper, None)
                 terminal.write("[REFERENCE] Before each episode, press 4 to move to the full first training pose.")
                 return reference, lower, upper, reference.copy()
@@ -191,8 +195,9 @@ def select_run_reference(robot, saved_reference, *, randomize_xy, terminal):
         terminal.write("[REFERENCE] No saved training point; capture current TCP. Key 4 is unavailable.")
     reference, lower, upper = capture_centered_workspace(
         robot, randomize_xy=randomize_xy, terminal=terminal,
+        workspace_y_half_range_m=INFERENCE_WORKSPACE_Y_HALF_RANGE_M,
     )
-    terminal.write("[REFERENCE] Using captured TCP reference and XYZ +/-5 cm workspace for this run.")
+    terminal.write("[REFERENCE] Using captured TCP reference; workspace X/Z +/-5 cm, Y +/-10 cm.")
     return reference, lower, upper, None
 
 

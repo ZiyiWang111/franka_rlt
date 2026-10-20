@@ -14,6 +14,14 @@ from pathlib import Path
 from act_rlt.infer import resolve_checkpoint
 
 
+TRAIN_ENTRYPOINT = (
+    "from act_rlt.dataset_compat import install_scalar_state_dataset_support; "
+    "install_scalar_state_dataset_support(); "
+    "from act_rlt import register; register(); "
+    "from lerobot.scripts.lerobot_train import main; main()"
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -64,8 +72,7 @@ def main() -> None:
             sys.executable,
             "-u",
             "-c",
-            "from act_rlt import register; register(); "
-            "from lerobot.scripts.lerobot_train import main; main()",
+            TRAIN_ENTRYPOINT,
             f"--config_path={train_config}",
             "--resume=true",
         ]
@@ -127,8 +134,7 @@ def main() -> None:
         sys.executable,
         "-u",
         "-c",
-        "from act_rlt import register; register(); "
-        "from lerobot.scripts.lerobot_train import main; main()",
+        TRAIN_ENTRYPOINT,
     ]
     command += [
         f"--{key}={str(value).lower() if isinstance(value, bool) else value}"

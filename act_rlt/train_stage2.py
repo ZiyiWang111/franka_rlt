@@ -155,12 +155,15 @@ def read_reset_point_choice(prompt: str) -> str:
 
 def capture_centered_workspace(
     robot, *, randomize_xy: bool = True, terminal=None,
+    workspace_y_half_range_m: float = STARTUP_WORKSPACE_HALF_RANGE_M,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Capture the current TCP pose on Enter, then bound XYZ to ±5 cm."""
+    """Capture TCP on Enter; bound X/Z to ±5 cm and Y to the requested range."""
+    if not np.isfinite(workspace_y_half_range_m) or workspace_y_half_range_m <= 0:
+        raise ValueError("workspace Y half range must be finite and positive")
     while True:
         prompt = (
             "Place TCP at Z insertion p1; press Enter to capture its pose "
-            "and set XYZ workspace to +/-5 cm (q to stop): "
+            f"and set workspace X/Z +/-5 cm, Y +/-{workspace_y_half_range_m * 100:g} cm (q to stop): "
         )
         if terminal is not None:
             prompt = terminal.prompt("Place TCP at p1. Enter: capture reference and workspace | q: exit")
@@ -175,6 +178,8 @@ def capture_centered_workspace(
         raise RuntimeError(f"invalid TCP pose at workspace capture: {pose}")
     lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
     upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
+    lower[1] = pose[1] - workspace_y_half_range_m
+    upper[1] = pose[1] + workspace_y_half_range_m
     if terminal is not None:
         terminal.workspace(pose, lower, upper, None)
         return pose, lower, upper
@@ -404,7 +409,7 @@ class FrankaInsertionStage2Env:
 
     def _observation_frame(self, observation):
         dim = getattr(getattr(self, "config", None), "proprio_dim", 7)
-        mode = {0: "none", 6: "wrench", 7: "joints"}[dim]
+        mode = {0: "none", 1: "tcp_z", 6: "wrench", 7: "joints"}[dim]
         return observation_frame(observation, self.camera_shapes, state_mode=mode)
 
     def _close_monitor(self) -> None:
@@ -1291,7 +1296,7 @@ def main() -> int:
     config = ACTStage2Config(
         stage1_checkpoint=str(stage1_path),
         act_checkpoint=str(act_path),
-        proprio_dim={"none": 0, "wrench": 6, "joints": 7}[state_mode],
+        proprio_dim={"none": 0, "tcp_z": 1, "wrench": 6, "joints": 7}[state_mode],
         device=args.device,
         warmup_steps=args.warmup_steps,
         total_env_steps=args.total_env_steps,

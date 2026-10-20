@@ -62,6 +62,8 @@ python -m act_rlt.data_collection.record_sample_space \
 
 infer 根据 checkpoint 配置选择输入：无 `observation.state` 时仅输入相机；6 维 state 表示原始基座坐标系 wrench `[fx, fy, fz, mx, my, mz]`（N / Nm）；7 维 state 表示关节位置。wrench 与图像在同一观测采集线程读取，使用 checkpoint 保存的 preprocessor 归一化，不额外清零或变换坐标系。相机与 wrench 是顺序读取，并非严格时间同步。
 
+1 维 state 对应当前 TCP 的绝对 Z 高度：直接取机器人观测中的 `ee_z`（基座坐标系，米），由 checkpoint 保存的 processor 做均值/标准差归一化。该输入与数采、RGB＋Z ACT 训练一致；不是固定采样高度、相对起点高度或动作 `dz`。缺失、非标量或非有限 Z 会拒绝推理。
+
 动作支持 6 维 TCP 增量，以及附带夹爪宽度预测的 7 维动作。两者均支持默认 temporal ensemble 和 `--no-temporal-ensemble`；7 维动作的夹爪预测仍只记录、不执行。纯相机模型自动应用项目已有的 LeRobot latent device 兼容修复。
 
 ```bash
@@ -70,6 +72,11 @@ python -m act_rlt.infer --checkpoint outputs/act_dataset_928_camera_only_action6
 
 # 相机 + 六维 wrench
 python -m act_rlt.infer --checkpoint outputs/act_1010_rgb_wrench_action6_act --dry-run --dry-run-episodes 1
+
+# 相机 + 当前 TCP 绝对 Z；自动加载本机 last 指向的 20k 模型
+python -m act_rlt.infer \
+  --checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
+  --no-temporal-ensemble --n-action-steps 4 --fps 30 --duration 10
 ```
 
 ### 起点与重置
@@ -129,6 +136,19 @@ infer 过程中按 **`x` 或 `Esc`** 可停止本轮并标记 fail，无需按 E
 每轮还输出本次 run 的 `success/total episodes` 和 `fail` 数量。按指定规则，正常达到时长或按 `s` 提前结束计为 success；`x`、`Esc`、`Ctrl+C` 停止及异常结束计为 fail。所有这些轮次都计入 total，包括不计入平均耗时的手动停止轮次。JSONL 的 `episode_end` 记录 `episode_success`、`run_success_episodes`、`run_total_episodes` 和 `run_fail_episodes`。重启进程后计数归零；此 success 来自结束规则或人工标记。
 
 计时从启动本轮相机/推理/控制线程到停止伺服并同步 TCP 目标之后，包含首个预测等待与停止确认，不包含起点移动、人工交互、启动预热以及后续线程回收/GC。默认 JSONL 日志的 `episode_end` 保存 `inference_duration_s`、`control_duration_s`、`run_average_inference_s`、`run_episode_count` 和 `end_reason`；按 `s` 时还记录 `operator_success` 事件。重启进程后平均值重新计算。
+
+### 相机 + Z 的 RL Token 训练（Stage 1）
+
+训练入口自动读取 ACT 的输入配置，支持一维 TCP 绝对 Z（米）；使用配套的相机 + Z 数据集。ACT 编码器冻结，只训练 RL Token 重建模块。
+
+```bash
+python -m act_rlt.train_rl_token \
+  --root datasets/act_dataset_928_addon_rgb_z_action6 \
+  --act-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
+  --output outputs/act_dataset_928_addon_rgb_z_action6_stage1_pos
+```
+
+默认训练 10,000 步，batch size 8，每 2,000 步保存。断点续训使用 `--output <原输出目录> --resume`，恢复保存的训练配置、优化器和调度器状态。新训练和续训都会启用一维 Z 的数据读取兼容。
 
 ## 4. train Stage 2
 
@@ -221,7 +241,7 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 
 ### 起点是否与训练相同
 
-开启 `--z-insertion-mode` 后，infer 在连接机器人后选择本次 run 的参考点：`t` 使用 checkpoint 保存的首次训练 reference 和 workspace；`c` 则按 Enter 采集当前 TCP，workspace 设为采集位置 XYZ 各 ±5 cm。整次 run 的采样中心固定为选定参考点。两种选择均沿用 checkpoint 保存的 reset 半范围（旧 checkpoint 默认 1 cm）。每轮开始前用 `=` / `-` 以 0.5 cm 步长调整下一次 reset 半范围（0–5 cm），按 `r` 可立即重新采样，按 Enter 开始本轮。与 train 共用同一套范围调整逻辑，采样中心始终不变。
+开启 `--z-insertion-mode` 后，infer 在连接机器人后选择本次 run 的参考点：`t` 使用 checkpoint 保存的首次训练 reference 和 X/Z workspace 边界，并将 Y workspace 设为该 reference 的 ±10 cm；`c` 则按 Enter 采集当前 TCP，workspace 设为 X/Z 各 ±5 cm、Y ±10 cm。整次 run 的采样中心固定为选定参考点。两种选择均沿用 checkpoint 保存的 reset 半范围（旧 checkpoint 默认 1 cm）。每轮开始前用 `=` / `-` 以 0.5 cm 步长调整下一次 reset 半范围（0–5 cm），按 `r` 可立即重新采样，按 Enter 开始本轮。与 train 共用同一套范围调整逻辑，采样中心始终不变。
 
 选择训练参考点时，每轮 infer 开始前还可按 **`4`** 立即移动到训练首次采集的完整 reference pose，含当时的 Z 和姿态。首次移动确认界面也支持 `4`；抵达后按 Enter 才开始 infer。按 `4` 不改变采样中心或范围，之后按 `r` 会继续围绕首次 reference 随机采样。
 
@@ -231,7 +251,7 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 
 1. 加载已初始化的 v3 Stage 2 checkpoint，从保存的配置解析配套 ACT 和 Stage 1 checkpoint，加载 Actor 权重及 ACT processor。
 2. 连接机器人、确定 workspace 和起点，移动到选定点，Enter 开始 episode。
-3. 完整 ACT 生成参考 chunk，同时提取 encoder hidden 和 position；RL Token 编码后，根据 ACT 输入契约拼接归一化关节状态或 wrench；纯相机模型只使用 RL Token。
+3. 完整 ACT 生成参考 chunk，同时提取 encoder hidden 和 position；RL Token 编码后，根据 ACT 输入契约拼接归一化 TCP Z、关节状态或 wrench；纯相机模型只使用 RL Token。
 4. Actor 输入状态与参考 chunk，执行**确定性均值动作**，不添加训练时的探索噪声。
 5. postprocessor 还原动作、进行物理限幅，按固定 chunk 执行；更新观测并生成下一 chunk。
 6. 成功/失败、超时或退出时停止当前 episode、回退；有下一 episode 时重新进入起点选择流程。
@@ -251,7 +271,20 @@ python -m act_rlt.infer_stage2 \
 
 ### 新的六维 action 模型进行 Stage 2 训练
 
-Stage 2 根据 ACT checkpoint 自动选择输入：纯相机为 768 维 RL Token；相机＋wrench 为 768＋6 维；旧 joint-state 模型为 768＋7 维。wrench 使用与 ACT 训练一致的基坐标系原始六维外力/力矩，再通过 ACT 保存的 processor 归一化。纯相机模型的 Actor/Critic 不加入关节状态或 wrench 分支。支持 ACT 的六维 delta 或旧七维 delta＋gripper 输出；机械臂执行六维 delta。
+Stage 2 根据 ACT checkpoint 自动选择输入：纯相机为 768 维 RL Token；相机＋TCP Z 为 768＋1 维；相机＋wrench 为 768＋6 维；旧 joint-state 模型为 768＋7 维。TCP Z 使用当前观测中的基坐标系实测绝对高度（米），通过 ACT 保存的 processor 归一化后同时输入 ACT 和 Actor/Critic，不使用固定重置高度或相对位移。wrench 使用与 ACT 训练一致的基坐标系原始六维外力/力矩，再通过 ACT 保存的 processor 归一化。纯相机模型的 Actor/Critic 不加入关节状态或 wrench 分支。支持 ACT 的六维 delta 或旧七维 delta＋gripper 输出；机械臂执行六维 delta。上述输入在 Stage 2 train 和 infer 中共用；不同状态维度的 Stage 2 checkpoint 不能互相续训。
+
+相机＋TCP Z（合并数据集，ACT 20k / RL Token 10k）：
+
+```bash
+python -m act_rlt.train_stage2 \
+  --stage1-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_stage1_pos \
+  --act-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
+  --output outputs/rlt_928_addon_rgb_z_action6 \
+  --z-insertion-mode --randomize-reset-xy --allow-motion \
+  --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
+```
+
+仅加载验证可去掉 `--allow-motion`，加 `--dry-run`（无 GPU 时加 `--device cpu`），不连接机器人或创建训练结果。
 
 纯相机：
 

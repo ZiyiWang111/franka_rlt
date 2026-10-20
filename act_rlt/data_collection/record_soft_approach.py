@@ -295,7 +295,7 @@ def main() -> int:
         print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm): {format_pose(final_pose)}")
         print(
             "Sample bounds (robot base frame): "
-            "x=x0+/-0.0200 m, y=[y0+0.0150, y0+0.0250] m, z=0.4020 m. "
+            "x=x0+/-0.0250 m, y=[y0+0.0100, y0+0.0300] m, z=0.4020 m. "
             f"Sample orientation is fixed XYZ Euler {SAMPLE_EULER_XYZ_DEG} deg. "
             "The final goal retains the taught orientation."
         )

@@ -88,6 +88,37 @@ def test_legacy_collection_mode_options_are_rejected(removed_option):
         ])
 
 
+@pytest.mark.parametrize("depth_cm", [0.5, 1, 1.5, 2])
+def test_original_collector_accepts_insertion_depth_in_centimeters(depth_cm):
+    args = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
+        "--insertion-cm", str(depth_cm),
+    ])
+    validate_args(args)
+    assert args.insert_minus_z == pytest.approx(depth_cm / 100)
+    reference = [0.4, 0.1, 0.39, 0.1, 0.2, 0.3]
+    goal = insertion_pose_minus_z(reference, args.insert_minus_z)
+    assert goal[2] == pytest.approx(reference[2] - depth_cm / 100)
+    assert goal[:2] == reference[:2] and goal[3:] == reference[3:]
+
+
+def test_depth_units_are_exclusive_and_cm_option_is_original_only():
+    common = ["--dataset", "test/act_rlt", "--root", "/tmp/act-rlt"]
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([*common, "--insertion-cm", "2", "--insert-minus-z", "0.01"])
+    with pytest.raises(SystemExit):
+        build_parser(include_insertion_speed=False).parse_args([*common, "--insertion-cm", "2"])
+
+
+@pytest.mark.parametrize("depth_cm", ["0", "-1", "nan", "inf"])
+def test_invalid_insertion_centimeters_are_rejected(depth_cm):
+    args = build_parser().parse_args([
+        "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt", "--insertion-cm", depth_cm,
+    ])
+    with pytest.raises(ValueError):
+        validate_args(args)
+
+
 def test_collection_returns_to_taught_orientation_before_insertion(monkeypatch):
     taught = [0.561755, -0.225792, 0.387321, 0.1, 0.2, 0.3]
     reference = taught.copy()

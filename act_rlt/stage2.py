@@ -121,8 +121,8 @@ class ACTStage2Config:
         invalid = [name for name, value in positive_ints.items() if value <= 0]
         if invalid:
             raise ValueError(f"Stage-2 integer settings must be positive: {invalid}")
-        if self.proprio_dim not in (0, 6, 7):
-            raise ValueError("proprio_dim must be 0 (RGB only), 6 (wrench), or 7 (joints)")
+        if self.proprio_dim not in (0, 1, 6, 7):
+            raise ValueError("proprio_dim must be 0 (RGB only), 1 (TCP Z), 6 (wrench), or 7 (joints)")
         for name, value in {
             "actor_fixed_std": self.actor_fixed_std,
             "actor_lr": self.actor_lr,
