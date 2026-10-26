@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transition-cache-dir", default=None, help="Directory containing chunk-transition cache files.")
     parser.add_argument("--demo-dataset-path", default=None, help="Raw demo dataset path. Required when no transition cache is provided.")
     parser.add_argument("--config", default=None, help="Path to an RLT YAML config")
-    parser.add_argument("--output-dir", default="outputs/rlt_actor_critic")
+    parser.add_argument("--output-dir", default="outputs/ethernet_rlt/rlt_actor_critic")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rl-token-checkpoint", default=None, help="RL token checkpoint to initialize the policy encoder.")
     parser.add_argument("--gradient-steps", type=int, default=None)

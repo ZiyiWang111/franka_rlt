@@ -24,8 +24,8 @@ loss。因此，从执行启动命令到看到第一条 loss，通常需要约 4
 对应日志：
 
 ```text
-outputs/fr3_pi05_sft_60ep_state15_bs4_30k.log
-outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k.log
+outputs/ethernet_act/fr3_pi05_sft_60ep_state15_bs4_30k.log
+outputs/ethernet_act/fr3_pi05_sft_60ep_state15_action7_bs4_30k.log
 ```
 
 ## 启动阶段实际做了什么
@@ -122,7 +122,7 @@ Start offline training...
 检查命令：
 
 ```bash
-tail -f outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k.log
+tail -f outputs/ethernet_act/fr3_pi05_sft_60ep_state15_action7_bs4_30k.log
 tmux attach -t fr3_pi05_state15_action7_30k
 nvidia-smi
 ```

@@ -70,7 +70,7 @@ def test_z_insertion_is_the_default_collection_mode():
     args = build_parser().parse_args(["--dataset", "test/act_rlt", "--root", "/tmp/act-rlt"])
     validate_args(args)
     assert args.task is None
-    assert args.insert_minus_z == pytest.approx(0.01)
+    assert args.insert_minus_z == pytest.approx(0.004)
 
     custom_depth = build_parser().parse_args([
         "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
@@ -99,7 +99,9 @@ def test_original_collector_accepts_insertion_depth_in_centimeters(depth_cm):
     reference = [0.4, 0.1, 0.39, 0.1, 0.2, 0.3]
     goal = insertion_pose_minus_z(reference, args.insert_minus_z)
     assert goal[2] == pytest.approx(reference[2] - depth_cm / 100)
-    assert goal[:2] == reference[:2] and goal[3:] == reference[3:]
+    assert goal[0] == reference[0]
+    assert goal[1] == pytest.approx(reference[1] - 0.001)
+    assert goal[3:] == reference[3:]
 
 
 def test_depth_units_are_exclusive_and_cm_option_is_original_only():
@@ -166,7 +168,7 @@ def test_collection_returns_to_taught_orientation_before_insertion(monkeypatch):
     assert moves == [
         ("outside", sample_z_insertion_pose(taught, np.random.default_rng(42))),
         ("recorded", taught),
-        ("recorded", insertion_pose_minus_z(taught, 0.01)),
+        ("recorded", insertion_pose_minus_z(taught, 0.004)),
         ("outside", taught),
     ]
     assert moves[0][1][3:] != taught[3:]

@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="lerobot/pi05_base")
     parser.add_argument("--demo-dataset-path", default=None)
     parser.add_argument("--config", default=None, help="Path to an RLT YAML config.")
-    parser.add_argument("--output-dir", default="outputs/rl_token")
+    parser.add_argument("--output-dir", default="outputs/ethernet_token/rl_token")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)

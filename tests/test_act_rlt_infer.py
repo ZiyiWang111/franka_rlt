@@ -985,7 +985,7 @@ def test_actual_action6_checkpoint_configuration_and_processors(run):
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import make_pre_post_processors
 
-    path = Path(__file__).resolve().parents[1] / "outputs" / run
+    path = Path(__file__).resolve().parents[1] / "outputs" / "ethernet_act" / run
     if not path.exists():
         pytest.skip("local trained checkpoint is unavailable")
     path = resolve_checkpoint(path)

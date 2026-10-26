@@ -1,0 +1,42 @@
+{
+  "status": "APPROVED",
+  "source": "/home/embint/wzy/Evo-RLT/datasets/ethernet_coarse/act_coarse_1020",
+  "episodes": 266,
+  "frames": 14899,
+  "fps": 15,
+  "gpus": {
+    "rgb_z_delta_tcp": 1,
+    "rgb_joint_abs_joint": 0
+  },
+  "state_fields": {
+    "rgb_z_delta_tcp": [
+      "ee_z"
+    ],
+    "rgb_joint_abs_joint": [
+      "joint_0",
+      "joint_1",
+      "joint_2",
+      "joint_3",
+      "joint_4",
+      "joint_5",
+      "joint_6"
+    ]
+  },
+  "labels": {
+    "rgb_z_delta_tcp": "Original action[:6], translation in base frame metres, rotation body-frame rotvec radians; adjacent-frame increments.",
+    "rgb_joint_abs_joint": "Next-frame measured joint_0..joint_6 within the same episode, absolute joint angles in radians. Final frame holds current joint positions."
+  },
+  "gripper": "excluded",
+  "split": "all 266 episodes for training, no validation split",
+  "initialization": "fresh ACT transformer, ImageNet pretrained ResNet18 backbone",
+  "cameras": [
+    "observation.images.wrist"
+  ],
+  "verified_video_resolution": {
+    "width": 640,
+    "height": 480,
+    "files_checked": 14,
+    "all_match": true
+  },
+  "chunk_size": 10
+}

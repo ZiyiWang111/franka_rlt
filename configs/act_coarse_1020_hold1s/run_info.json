@@ -1,0 +1,41 @@
+{
+  "host": "wangziyi@10.0.40.163",
+  "project": "/workspace/wangziyi/projects/franka_rlt",
+  "started_at": "2026-10-21T11:24:04.262593+08:00",
+  "status": "COMPLETE_DOWNLOADED",
+  "steps": 30000,
+  "checkpoint_policy": "final only",
+  "models": {
+    "coarse_z_hold1s": {
+      "gpu": 1,
+      "gpu_uuid": "GPU-32ebd8f8-32c3-602f-c048-238e1d27cde0",
+      "pid": 600228,
+      "config": "configs/act_coarse_1020_hold1s/coarse_z_hold1s.json",
+      "log": "logs/ethernet_coarse/coarse_z_hold1s_20261021_112404.log",
+      "output": "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_coarse/coarse_z_hold1s",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/ethernet_coarse/coarse_z_hold1s"
+    },
+    "coarse_pose_joint_hold1s": {
+      "gpu": 2,
+      "gpu_uuid": "GPU-17881b37-6a1f-755b-98a5-afc9f543d387",
+      "pid": 600229,
+      "config": "configs/act_coarse_1020_hold1s/coarse_pose_joint_hold1s.json",
+      "log": "logs/ethernet_coarse/coarse_pose_joint_hold1s_20261021_112404.log",
+      "output": "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_coarse/coarse_pose_joint_hold1s",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/ethernet_coarse/coarse_pose_joint_hold1s"
+    }
+  },
+  "verified_step": 30000,
+  "loss_at_step_250": {
+    "coarse_z_hold1s": 0.339,
+    "coarse_pose_joint_hold1s": 0.349
+  },
+  "final_loss": {
+    "coarse_z_hold1s": 0.097,
+    "coarse_pose_joint_hold1s": 0.101
+  },
+  "completed_at": {
+    "coarse_z_hold1s": "2026-10-21T12:16:53+08:00",
+    "coarse_pose_joint_hold1s": "2026-10-21T12:17:10+08:00"
+  }
+}

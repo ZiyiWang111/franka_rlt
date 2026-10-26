@@ -15,10 +15,10 @@ def test_z_insertion_sample_uses_the_fixed_collection_box_and_orientation():
 
     samples = np.asarray([sample_z_insertion_pose(reference, rng) for _ in range(10_000)])
 
-    assert np.all(samples[:, 0] >= reference[0] - 0.02)
-    assert np.all(samples[:, 0] <= reference[0] + 0.02)
-    assert np.all(samples[:, 1] >= reference[1] + 0.015)
-    assert np.all(samples[:, 1] <= reference[1] + 0.025)
+    assert np.all(samples[:, 0] >= reference[0] - 0.025)
+    assert np.all(samples[:, 0] <= reference[0] + 0.025)
+    assert np.all(samples[:, 1] >= reference[1] + 0.003)
+    assert np.all(samples[:, 1] <= reference[1] + 0.02)
     np.testing.assert_array_equal(samples[:, 2], 0.402)
     expected = Rotation.from_euler("XYZ", SAMPLE_EULER_XYZ_DEG, degrees=True).as_rotvec()
     np.testing.assert_allclose(samples[:, 3:], np.tile(expected, (len(samples), 1)))
@@ -47,5 +47,5 @@ def test_z_insertion_final_retreat_geometry():
     reference = [0.5, -0.2, 0.3, 1.0, 2.0, 3.0]
 
     final = insertion_pose_minus_z(reference, 0.01)
-    assert final == pytest.approx([0.5, -0.2, 0.29, 1.0, 2.0, 3.0])
+    assert final == pytest.approx([0.5, -0.201, 0.29, 1.0, 2.0, 3.0])
     assert reference == [0.5, -0.2, 0.3, 1.0, 2.0, 3.0]

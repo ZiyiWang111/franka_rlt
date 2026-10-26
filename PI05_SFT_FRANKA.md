@@ -2,7 +2,7 @@
 
 本文记录当前工作区已经实际跑通的 FR3 π0.5 监督微调（SFT）。结论以
 `/workspace/wangziyi/SFT_HANDOFF.md`、本地 LeRobot 数据集元信息，以及
-`outputs/vla_ft_smoke/checkpoints/000200/pretrained_model/train_config.json` 为准。
+`outputs/ethernet_act/vla_ft_smoke/checkpoints/000200/pretrained_model/train_config.json` 为准。
 
 ## 1. 实际使用的数据
 
@@ -10,7 +10,7 @@
 
 ```text
 repo_id: franka_m1_manual_demo
-root:    /workspace/wangziyi/projects/franka_rlt/datasets/franka_m1_manual_demo
+root:    /workspace/wangziyi/projects/franka_rlt/datasets/ethernet_fine/franka_m1_manual_demo
 ```
 
 保存的训练配置中 `episodes=null`，因此数据集内全部 5 个 episode 均参与训练。
@@ -35,7 +35,7 @@ root:    /workspace/wangziyi/projects/franka_rlt/datasets/franka_m1_manual_demo
 数据采用 LeRobot v3 布局：
 
 ```text
-datasets/franka_m1_manual_demo/
+datasets/ethernet_fine/franka_m1_manual_demo/
 ├── data/
 │   └── chunk-000/file-000.parquet
 ├── videos/
@@ -139,7 +139,7 @@ eval frequency:  0
 tolerance:       0.04 s
 optimizer:       AdamW
 learning rate:   2.5e-5
-output:          outputs/vla_ft_smoke
+output:          outputs/ethernet_act/vla_ft_smoke
 ```
 
 这次配置是全参数微调：`use_peft=false`、`freeze_vision_encoder=false`、
@@ -176,7 +176,7 @@ run 是在同一 LeRobot π0.5 训练入口上，换成了本地 FR3 数据和�
 | batch size | 16 | 2 |
 | steps | 30,000 | 200（smoke 验证） |
 | 保存间隔 | 5,000 | 100 |
-| 输出目录 | `outputs/vla_ft` | `outputs/vla_ft_smoke` |
+| 输出目录 | `outputs/ethernet_act/vla_ft` | `outputs/ethernet_act/vla_ft_smoke` |
 | 图像增强 | README 未说明 | 关闭 |
 | 参数更新范围 | README 未显式说明，默认由 checkpoint/config 决定 | 全参数更新，无 PEFT，不冻结视觉编码器 |
 | 共同设置 | `bfloat16`、`eval_freq=0`、`tolerance_s=0.04`、自动推断输入特征、不上传 Hub | 相同 |
@@ -194,9 +194,9 @@ run 是在同一 LeRobot π0.5 训练入口上，换成了本地 FR3 数据和�
 ## 6. 证据位置
 
 - 实际操作交接：`/workspace/wangziyi/SFT_HANDOFF.md`
-- 数据集 schema：`datasets/franka_m1_manual_demo/meta/info.json`
-- 归一化统计：`datasets/franka_m1_manual_demo/meta/stats.json`
-- 任务表：`datasets/franka_m1_manual_demo/meta/tasks.parquet`
-- episode 索引：`datasets/franka_m1_manual_demo/meta/episodes/chunk-000/file-000.parquet`
-- 实际训练配置：`outputs/vla_ft_smoke/checkpoints/000200/pretrained_model/train_config.json`
+- 数据集 schema：`datasets/ethernet_fine/franka_m1_manual_demo/meta/info.json`
+- 归一化统计：`datasets/ethernet_fine/franka_m1_manual_demo/meta/stats.json`
+- 任务表：`datasets/ethernet_fine/franka_m1_manual_demo/meta/tasks.parquet`
+- episode 索引：`datasets/ethernet_fine/franka_m1_manual_demo/meta/episodes/chunk-000/file-000.parquet`
+- 实际训练配置：`outputs/ethernet_act/vla_ft_smoke/checkpoints/000200/pretrained_model/train_config.json`
 - 原 README 微调示例：`README.md` 的 `Finetune VLA` 与 `Model & Dataset` 两节

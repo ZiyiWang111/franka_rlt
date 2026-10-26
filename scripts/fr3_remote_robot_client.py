@@ -28,7 +28,7 @@ from evo_rlt.adapters.lerobot.franka_remote.state import observation_image, obse
 
 DEFAULT_TASK = "pick up the vga and insert into the motherboard"
 DEFAULT_EXPECTED_CHECKPOINT = (
-    "/workspace/wangziyi/projects/franka_rlt/outputs/"
+    "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_act/"
     "fr3_pi05_sft_60ep_state15_action7_bs4_30k/checkpoints/030000/pretrained_model"
 )
 

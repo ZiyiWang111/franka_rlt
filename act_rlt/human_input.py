@@ -1,7 +1,7 @@
 """Keyboard events for in-process FR3 Stage-2 takeover.
 
-Only the Stage-2 servo worker sends robot commands. This module owns keyboard
-events and intentionally has no robot connection.
+The episode servo worker or the idle teleop controller sends robot commands.
+This module owns keyboard events and intentionally has no robot connection.
 """
 
 from __future__ import annotations
@@ -24,19 +24,29 @@ STAGE2_DIRECTIONS["KEY_X"] = KEY_DIRECTIONS["KEY_S"]
 
 
 class HumanInputMonitor:
-    """Thread-safe evdev or X11 keyboard state for one active episode."""
+    """Thread-safe evdev or X11 keyboard state for an episode or idle menu."""
 
     _OUTCOMES = {
         "KEY_S": "s", "KEY_F": "f", "KEY_F8": "s", "KEY_F9": "f", "KEY_ESC": "q",
     }
     _RELEASE_DEBOUNCE_S = 0.06
+    _directions = STAGE2_DIRECTIONS
+    _key_outcomes = _OUTCOMES
+    _allow_toggle = True
 
-    def __init__(self, backend: str, keyboard_path: str | None = None):
+    def __init__(self, backend: str, keyboard_path: str | None = None, *, idle_xy: bool = False):
         if backend not in {"evdev", "pynput"}:
             raise ValueError(f"unsupported keyboard backend: {backend}")
         if backend == "pynput" and keyboard_path is not None:
             raise ValueError("--teleop-keyboard applies only to evdev")
         self.backend = backend
+        if idle_xy:
+            self._allow_toggle = False
+            self._directions = {key: KEY_DIRECTIONS[key] for key in ("KEY_W", "KEY_A", "KEY_S", "KEY_D")}
+            self._key_outcomes = {
+                "KEY_ENTER": "", "KEY_Y": "y", "KEY_Q": "q", "KEY_ESC": "q",
+                "KEY_R": "r", "KEY_P": "p", "KEY_4": "4", "KEY_EQUAL": "=", "KEY_MINUS": "-",
+            }
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._pressed: set[str] = set()
@@ -76,12 +86,14 @@ class HumanInputMonitor:
                     keyboard.Key.f8: "KEY_F8",
                     keyboard.Key.f9: "KEY_F9",
                     keyboard.Key.esc: "KEY_ESC",
+                    keyboard.Key.enter: "KEY_ENTER",
                 }
                 if key in special:
                     return special[key]
                 char = getattr(key, "char", None)
                 name = f"KEY_{char.upper()}" if isinstance(char, str) else ""
-                return name if name in STAGE2_DIRECTIONS or name in self._OUTCOMES else None
+                name = {"KEY_=": "KEY_EQUAL", "KEY_-": "KEY_MINUS"}.get(name, name)
+                return name if name in self._directions or name in self._key_outcomes else None
 
             self._listener = keyboard.Listener(
                 on_press=lambda key: self._event(name_for(key), True),
@@ -98,9 +110,8 @@ class HumanInputMonitor:
             from evdev import ecodes
 
             names = {
-                **{getattr(ecodes, key): key for key in STAGE2_DIRECTIONS},
-                ecodes.KEY_S: "KEY_S",
-                ecodes.KEY_F: "KEY_F",
+                **{getattr(ecodes, key): key for key in self._directions},
+                **{getattr(ecodes, key): key for key in self._key_outcomes},
                 ecodes.KEY_SPACE: "KEY_SPACE",
                 ecodes.KEY_F8: "KEY_F8",
                 ecodes.KEY_F9: "KEY_F9",
@@ -123,7 +134,7 @@ class HumanInputMonitor:
             return
         with self._lock:
             self._expire_releases()
-            if key in STAGE2_DIRECTIONS:
+            if key in self._directions:
                 if down:
                     self._pending_release.pop(key, None)
                     self._pressed.add(key)
@@ -131,7 +142,7 @@ class HumanInputMonitor:
                     self._pending_release[key] = time.monotonic() + self._RELEASE_DEBOUNCE_S
                 else:
                     self._pressed.discard(key)
-            elif key == "KEY_SPACE":
+            elif key == "KEY_SPACE" and self._allow_toggle:
                 if down:
                     self._toggle_release_deadline = None
                     if not self._toggle_down:
@@ -143,8 +154,8 @@ class HumanInputMonitor:
                     self._toggle_release_deadline = time.monotonic() + self._RELEASE_DEBOUNCE_S
                 else:
                     self._toggle_down = False
-            elif key in self._OUTCOMES and down:
-                self._outcomes.append(self._OUTCOMES[key])
+            elif key in self._key_outcomes and down:
+                self._outcomes.append(self._key_outcomes[key])
 
     def _check(self):
         if self._failure is not None:
@@ -171,9 +182,15 @@ class HumanInputMonitor:
         with self._lock:
             self._check()
             self._expire_releases()
-            direction = sum((STAGE2_DIRECTIONS[key] for key in self._pressed), start=np.zeros(3))
+            direction = sum((self._directions[key] for key in self._pressed), start=np.zeros(3))
         norm = float(np.linalg.norm(direction))
         return direction if norm == 0 else direction / norm
+
+    def pressed_keys(self) -> set[str]:
+        with self._lock:
+            self._check()
+            self._expire_releases()
+            return self._pressed.copy()
 
     def consume_toggle(self, *, human: bool) -> bool:
         with self._lock:

@@ -1,0 +1,31 @@
+{
+  "host": "wangziyi@10.0.40.163",
+  "project": "/workspace/wangziyi/projects/franka_rlt",
+  "started_at": "2026-10-20 16:51:39 +0800",
+  "models": {
+    "A": {
+      "gpu": 0,
+      "pid": 760289,
+      "config": "configs/act_coarse_1020/rgb_joint_abs_joint.json",
+      "log": "logs/ethernet_act/act_coarse_1020_rgb_joint_abs_joint_20261020_165139.log",
+      "output": "outputs/ethernet_act/act_coarse_1020_rgb_joint_abs_joint",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/ethernet_coarse/act_coarse_1020_rgb_joint_abs_joint"
+    },
+    "B": {
+      "gpu": 1,
+      "pid": 760290,
+      "config": "configs/act_coarse_1020/rgb_z_delta_tcp.json",
+      "log": "logs/ethernet_act/act_coarse_1020_rgb_z_delta_tcp_20261020_165139.log",
+      "output": "outputs/ethernet_act/act_coarse_1020_rgb_z_delta_tcp",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/ethernet_coarse/act_coarse_1020_rgb_z_delta_tcp"
+    }
+  },
+  "verified_step": 30000,
+  "loss_at_step_250": {
+    "A": 0.311,
+    "B": 0.387
+  },
+  "chunk_size": 10,
+  "steps": 30000,
+  "status": "COMPLETE_DOWNLOADED"
+}

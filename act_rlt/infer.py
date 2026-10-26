@@ -24,6 +24,7 @@ from act_rlt.data_collection.sampling import (
     SAMPLE_Z_M,
 )
 from act_rlt.infer_gc import EpisodeGarbageCollection
+from evo_rlt.artifact_paths import resolve_artifact_path
 
 
 ACTION_KEYS = ("dx", "dy", "dz", "drx", "dry", "drz")
@@ -207,7 +208,7 @@ def robot_camera_kwargs(cameras, args):
 
 
 def checkpoint_state_mode(config):
-    """Select RGB-only, absolute TCP Z, external wrench6, or joint-state7."""
+    """Select RGB-only, TCP Z, wrench6, joints7, or measured joints+TCP pose13."""
     feature = config.input_features.get("observation.state")
     if feature is None:
         return "none"
@@ -216,9 +217,11 @@ def checkpoint_state_mode(config):
         return "tcp_z"
     if shape == (7,):
         return "joints"
+    if shape == (13,):
+        return "joints_pose"
     if shape == (6,):
         return "wrench"
-    raise ValueError("Checkpoint state must be absent, 1D absolute TCP Z, 6D external wrench, or 7D joints")
+    raise ValueError("Checkpoint state must be absent, 1D absolute TCP Z, 6D external wrench, 7D joints, or 13D joints+TCP pose")
 
 
 def policy_observation(robot, config):
@@ -240,6 +243,17 @@ def observation_frame(observation, camera_shapes=None, state_mode="joints"):
         if state_mode == "joints":
             state = np.array([observation[f"joint_{i}"] for i in range(7)], dtype=np.float32)
             expected = (7,)
+        elif state_mode == "joints_pose":
+            # Exact training order from coarse_pose_joint_hold1s/dataset_info.json.
+            # EE orientation is a measured rotvec in radians, not Euler angles.
+            names = [f"joint_{i}" for i in range(7)] + [
+                f"ee_{axis}" for axis in ("x", "y", "z", "rx", "ry", "rz")
+            ]
+            missing = [name for name in names if name not in observation]
+            if missing:
+                raise ValueError(f"Joint+TCP pose input requires measured fields: {missing}")
+            state = np.asarray([observation[name] for name in names], dtype=np.float32)
+            expected = (13,)
         elif state_mode == "wrench":
             state = np.asarray(observation["external_wrench"], dtype=np.float32)
             expected = (6,)
@@ -268,7 +282,7 @@ def observation_frame(observation, camera_shapes=None, state_mode="joints"):
 
 def resolve_checkpoint(path):
     """Accept pretrained_model itself, a checkpoint directory, or a run directory."""
-    path = Path(path).expanduser().resolve()
+    path = resolve_artifact_path(path)
     candidates = (path, path / "pretrained_model", path / "checkpoints/last/pretrained_model")
     for candidate in candidates:
         required = (

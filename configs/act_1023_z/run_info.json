@@ -1,0 +1,59 @@
+{
+  "host": "wangziyi@10.0.40.163",
+  "batch_size": 16,
+  "chunk_size": 4,
+  "steps": 40000,
+  "validation": false,
+  "training_episodes": 450,
+  "training_frames": 35244,
+  "checkpoint_policy": "final only",
+  "runs": [
+    {
+      "status": "COMPLETE",
+      "name": "act_1023_z",
+      "pid": 2646550,
+      "gpu": 0,
+      "started_at": "2026-10-23T17:44:46.705233",
+      "log": "logs/vga_act/act_1023_z_20261023_174446.log",
+      "config": "configs/act_1023_z/train_config.json",
+      "output_dir": "/workspace/wangziyi/projects/franka_rlt/outputs/vga_act/act_1023_z",
+      "command": [
+        "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+        "-u",
+        "scripts/train_act_1023.py",
+        "--config",
+        "configs/act_1023_z/train_config.json"
+      ],
+      "last_verified_step": 40000,
+      "final_training_loss": 0.141,
+      "finished_at": "2026-10-23T21:57:29+08:00",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/vga_act/act_1023_z",
+      "download_status": "SHA256_VERIFIED",
+      "verified_files": 12
+    },
+    {
+      "status": "COMPLETE",
+      "name": "act_1023_z_cvae",
+      "pid": 2646551,
+      "gpu": 2,
+      "started_at": "2026-10-23T17:44:46.706675",
+      "log": "logs/vga_act/act_1023_z_cvae_20261023_174446.log",
+      "config": "configs/act_1023_z/train_config_cvae.json",
+      "output_dir": "/workspace/wangziyi/projects/franka_rlt/outputs/vga_act/act_1023_z_cvae",
+      "command": [
+        "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+        "-u",
+        "scripts/train_act_1023.py",
+        "--config",
+        "configs/act_1023_z/train_config_cvae.json"
+      ],
+      "last_verified_step": 40000,
+      "final_training_loss": 0.138,
+      "finished_at": "2026-10-23T21:52:06+08:00",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/vga_act/act_1023_z_cvae",
+      "download_status": "SHA256_VERIFIED",
+      "verified_files": 12
+    }
+  ],
+  "download_sha256": "56b57d200a06005101385764cd11b71a1643d89eb805688ad5a7e585d2595d09"
+}

@@ -1,0 +1,34 @@
+{
+  "status": "COMPLETE",
+  "job_name": "fine_mix4_z_token",
+  "pid": 2745350,
+  "gpus": [
+    0
+  ],
+  "started_at": "2026-10-23T10:45:30.634977",
+  "log": "logs/ethernet_act/fine_mix4_z_token_20261023_104530.log",
+  "output_dir": "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_token/fine_mix4_z_token",
+  "steps": 10000,
+  "batch_size": 8,
+  "config": "configs/fine_mix4_z/train_config_token.json",
+  "command": [
+    "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+    "-u",
+    "-c",
+    "from act_rlt.dataset_compat import install_scalar_state_dataset_support; install_scalar_state_dataset_support(); from act_rlt import register; register(); from lerobot.scripts.lerobot_train import main; main()",
+    "--config_path=configs/fine_mix4_z/train_config_token.json"
+  ],
+  "encoder_equivalence_verified": true,
+  "act_hidden_shape": [
+    8,
+    922,
+    768
+  ],
+  "last_verified_step": 10000,
+  "host": "wangziyi@10.0.40.163",
+  "training_finished_at": "2026-10-23T11:09:38+08:00",
+  "final_training_loss": 0.026,
+  "download_status": "VERIFIED",
+  "local_output": "/home/embint/wzy/Evo-RLT/outputs/ethernet_token/fine_mix4_z_token",
+  "download_sha256": "31f1bacb36322d6f8c7e5fe1a34fb17ce7fa8b6653bb87b23b6e08e25aaee4c4"
+}

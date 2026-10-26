@@ -453,6 +453,12 @@ class FrankaInsertionStage2Env:
             label = "+Y 1 cm retreat"
         self._move_reset_pose(retreat, label=label)
 
+    def _read_idle_reset_choice(self, prompt: str) -> str:
+        """Allow held-key XY servo motion while waiting for a reset choice."""
+        from act_rlt.idle_xy import read_idle_xy_choice
+
+        return read_idle_xy_choice(self, prompt)
+
     def _move_to_accepted_workspace_sample(self) -> None:
         terminal = getattr(self, "inference_terminal", None)
         if self.z_insertion_mode and self._reference_pose is None:
@@ -518,11 +524,7 @@ class FrankaInsertionStage2Env:
                     prompt += " | 4: first training reference"
                 if self.save_snapshot is not None:
                     prompt += " | p: save episode snapshot"
-                if self.z_insertion_mode or self._initial_reference_pose is not None or self.save_snapshot is not None:
-                    prompt += ": "
-                    choice = read_reset_point_choice(prompt)
-                else:
-                    choice = input(prompt).strip().lower()
+                choice = self._read_idle_reset_choice(prompt)
                 if choice == "p" and self.save_snapshot is not None:
                     self.save_snapshot()
                     continue
@@ -554,9 +556,7 @@ class FrankaInsertionStage2Env:
                     prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range: "
                 if self.save_snapshot is not None:
                     prompt += " p: save episode snapshot: "
-                choice = (read_reset_point_choice(prompt)
-                          if self.z_insertion_mode or self._initial_reference_pose is not None or self.save_snapshot is not None
-                          else input(prompt).strip().lower())
+                choice = self._read_idle_reset_choice(prompt)
                 if choice == "p" and self.save_snapshot is not None:
                     self.save_snapshot()
                     continue
@@ -704,9 +704,9 @@ class FrankaInsertionStage2Env:
 
     def execute_policy_chunk(
         self, policy: ACTStage2Policy, initial_batch: dict[str, torch.Tensor],
-        *, warmup: bool, remaining_steps: int, deterministic: bool = False,
+        *, warmup: bool, remaining_steps: int | None, deterministic: bool = False,
     ) -> ChunkExecution:
-        """Consume one result from the persistent fixed-chunk collector."""
+        """Consume one result; a None budget collects until the episode ends."""
         from act_rlt.stage2_runtime import FixedChunkRuntime
 
         if self._runtime is None:
@@ -897,7 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage1-checkpoint", type=Path, required=True)
     parser.add_argument("--act-checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("outputs/act_rlt_001_stage2"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/ethernet_rlt/act_rlt_001_stage2"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--replay-from", type=Path, help="reuse compatible replay with fresh Actor/Critic; new output required")
@@ -963,7 +963,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="M",
         help="legacy checkpoint setting; Stage-2 always executes fixed chunks without temporal ensemble",
     )
-    parser.add_argument("--warmup-steps", type=int, default=4_000)
+    parser.add_argument(
+        "--warmup-steps", type=int, default=4_000,
+        help="minimum ACT collection steps; finish the current episode before initialization",
+    )
     parser.add_argument(
         "--total-env-steps",
         type=int,
@@ -1104,8 +1107,14 @@ def load_checkpoint(
             "old Stage-2 network cannot resume with balanced input fusion; "
             "use --replay-from with a new output directory"
         )
-    saved_config = saved["config"]
+    saved_config = dict(saved["config"])
     current_config = config.to_dict()
+    # Compare model identities after relocation, rather than saved path spelling.
+    from evo_rlt.artifact_paths import resolve_artifact_path
+
+    for key in ("stage1_checkpoint", "act_checkpoint"):
+        saved_config[key] = str(resolve_artifact_path(saved_config[key]))
+        current_config[key] = str(resolve_artifact_path(current_config[key]))
     # Checkpoints created before the real-time temporal collector existed have
     # no value for this inference-only setting. Adopt the requested runtime
     # value without invalidating their learner/replay state.
@@ -1357,10 +1366,9 @@ def main() -> int:
         print(f"Prepared v3 checkpoint: {output / 'checkpoints/latest.pt'}", flush=True)
         return 0
 
-    if args.enable_human_intervention:
-        from act_rlt.human_input import validate_human_input
+    from act_rlt.human_input import validate_human_input
 
-        validate_human_input(args.teleop_input_backend, args.teleop_keyboard)
+    validate_human_input(args.teleop_input_backend, args.teleop_keyboard)
 
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
 

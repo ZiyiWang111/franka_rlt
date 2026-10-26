@@ -36,9 +36,9 @@ def validate_dataset(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=PROJECT_ROOT / "datasets/pi05_dataset_928_state7_action6")
+    parser.add_argument("--root", type=Path, default=PROJECT_ROOT / "datasets/ethernet_fine/pi05_dataset_928_state7_action6")
     parser.add_argument("--base-model", type=Path, required=True, help="Local PI05 base checkpoint directory")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs/pi05_dataset_928_state7_action6")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs/ethernet_act/pi05_dataset_928_state7_action6")
     parser.add_argument("--gpu", type=int, default=2)
     parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs for DDP; batch-size is the global batch")
     parser.add_argument("--steps", type=int, default=30000)

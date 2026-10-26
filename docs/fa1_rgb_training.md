@@ -1,6 +1,6 @@
 # Franka RGB-only PI05 experiment
 
-`bash scripts/train_fa1_rgb.sh` trains `outputs/fa1_rgb` on `datasets/fa1_s15`.
+`bash scripts/train_fa1_rgb.sh` trains `outputs/ethernet_act/fa1_rgb` on `datasets/ethernet_fine/fa1_s15`.
 GPU defaults to 2; override with `GPU_INDEX`. Paths can be overridden with
 `PYTHON_BIN` and `BASE_MODEL`. Run the launcher under tmux to survive SSH exit.
 

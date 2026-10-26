@@ -3,7 +3,8 @@
 
 The operator teaches a TCP reference position and orientation. Each saved
 episode starts at a uniformly sampled pose with a fixed orientation, returns
-to the full taught reference pose, and then moves along the robot-base -Z axis
+to the full taught reference pose, and then moves along robot-base -Z with
+a simultaneous 1 mm offset along robot-base -Y,
 while keeping the taught orientation. Repositioning is deliberately performed
 outside the episode, so the dataset contains only the task trajectory.
 """
@@ -130,13 +131,13 @@ def build_parser(*, include_insertion_speed: bool = True) -> argparse.ArgumentPa
         "--insert-minus-z",
         type=float,
         default=DEFAULT_INSERT_MINUS_Z_M,
-        help="Recorded -Z advance from the reference pose (default: 0.01 m).",
+        help="Recorded -Z advance from the reference pose (default: 0.004 m).",
     )
     if include_insertion_speed:
         depth_options.add_argument(
             "--insertion-cm", dest="insert_minus_z", type=_centimeters_to_meters,
             default=argparse.SUPPRESS,
-            help="Second-stage insertion depth in centimetres along base -Z (default: 1 cm).",
+            help="Second-stage insertion depth in centimetres along base -Z (default: 0.4 cm).",
         )
     parser.add_argument("--abort-key", default="x", help="Single-key active-episode abort")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic sampler seed")
@@ -409,6 +410,7 @@ class EpisodeRecorder:
         task: str,
         fps: int,
         episode_time: float,
+        record_force_feedback: bool = True,
     ) -> None:
         self.robot = robot
         self.dataset = dataset
@@ -417,6 +419,7 @@ class EpisodeRecorder:
         self.task = task
         self.fps = fps
         self.episode_time = episode_time
+        self.force_feedback_names = FORCE_FEEDBACK_NAMES if record_force_feedback else {}
         self.health = new_health_state()
         self.pending: tuple[dict[str, Any], list[float], float, dict[str, float]] | None = None
         self.command_action = {name: 0.0 for name in COMMAND_ACTION_NAMES}
@@ -463,7 +466,7 @@ class EpisodeRecorder:
             )
         observation_started = time.perf_counter()
         self.last_sample_started_at = observation_started
-        force_feedback = self.robot.robot.get_force_feedback()
+        force_feedback = self.robot.robot.get_force_feedback() if self.force_feedback_names else {}
         observation = self.robot.get_observation()
         self.check_deadline()
         self.health["last_obs_ms"] = (time.perf_counter() - observation_started) * 1000.0
@@ -485,7 +488,7 @@ class EpisodeRecorder:
         ]
         gripper_width = float(observation["gripper_width"])
         processed_observation = self.observation_processor(observation)
-        for name, names in FORCE_FEEDBACK_NAMES.items():
+        for name, names in self.force_feedback_names.items():
             value = np.asarray(force_feedback[name], dtype=np.float32)
             if value.shape != (len(names),) or not np.isfinite(value).all():
                 raise RuntimeError(f"invalid {name} feedback: {value}")
@@ -599,7 +602,9 @@ def run_recorded_move(
             robot._start_keepalive()
 
 
-def build_dataset_and_robot(args: argparse.Namespace, *, robot_factory=None):
+def build_dataset_and_robot(
+    args: argparse.Namespace, *, robot_factory=None, record_force_feedback: bool = True,
+):
     config = FrankaRobotConfig(
         robot_ip=args.robot_ip,
         camera_serial=args.wrist_camera,
@@ -634,7 +639,8 @@ def build_dataset_and_robot(args: argparse.Namespace, *, robot_factory=None):
         "shape": (len(COMMAND_ACTION_NAMES),),
         "names": COMMAND_ACTION_NAMES,
     }
-    for name, names in FORCE_FEEDBACK_NAMES.items():
+    force_feedback_names = FORCE_FEEDBACK_NAMES if record_force_feedback else {}
+    for name, names in force_feedback_names.items():
         features[f"observation.{name}"] = {
             "dtype": "float32", "shape": (len(names),), "names": names,
         }
@@ -674,7 +680,11 @@ def build_dataset_and_robot(args: argparse.Namespace, *, robot_factory=None):
             f"dataset is missing {COMMAND_ACTION_KEY}; create a new ACT-RLT dataset instead of "
             "resuming a dataset recorded with the old schema"
         )
-    for name, names in FORCE_FEEDBACK_NAMES.items():
+    if not record_force_feedback and any(
+        f"observation.{name}" in dataset.features for name in FORCE_FEEDBACK_NAMES
+    ):
+        raise ValueError("coarse datasets must not contain force/torque feedback features")
+    for name, names in force_feedback_names.items():
         key = f"observation.{name}"
         actual = dataset.features.get(key, {})
         if (actual.get("dtype") != "float32"
@@ -708,10 +718,10 @@ def main() -> int:
         insertion_distance = args.insert_minus_z
         final_pose = insertion_pose_minus_z(reference, insertion_distance)
         print(f"REFERENCE p0: {format_pose(reference)}")
-        print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm): {format_pose(final_pose)}")
+        print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm, -Y 1.0 mm): {format_pose(final_pose)}")
         print(
             "Sample bounds (robot base frame): "
-            "x=x0+/-0.0250 m, y=[y0+0.0100, y0+0.0300] m, z=0.4020 m. "
+            "x=x0+/-0.0250 m, y=[y0+0.0030, y0+0.0200] m, z=0.4020 m. "
             f"Sample orientation is fixed XYZ Euler {SAMPLE_EULER_XYZ_DEG} deg. "
             "Reference and insertion retain the taught orientation."
         )
@@ -778,7 +788,7 @@ def main() -> int:
                     reference = teach_reference(robot)
                     final_pose = insertion_pose_minus_z(reference, insertion_distance)
                     print(f"REFERENCE p0: {format_pose(reference)}")
-                    print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm): {format_pose(final_pose)}")
+                    print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm, -Y 1.0 mm): {format_pose(final_pose)}")
                     continue
                 if stop_requested:
                     break
@@ -842,14 +852,13 @@ def main() -> int:
                 ):
                     stop_requested = True
 
-                # The final recorded pose is one centimetre along the negative
-                # insertion axis. Returning to p0 is the matching +axis retreat
-                # and is not recorded.
+                # Return to p0, reversing both the -Z depth and -Y offset
+                # outside the recorded episode.
                 if not nonrecorded_arm_move(
                     robot,
                     reference,
                     speed=args.move_speed,
-                    label="REFERENCE p0 (retreat +Z)",
+                    label="REFERENCE p0 (retreat +Z/+Y)",
                 ):
                     print("Retreat failed; automatic collection is paused.")
                     if not stop_requested and not wait_for_resume(

@@ -27,17 +27,17 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "datasets/act_rlt_001_state7",
+        default=Path(__file__).resolve().parents[1] / "datasets/ethernet_fine/act_rlt_001_state7",
         help="LeRobot dataset directory matching the frozen ACT inputs and actions",
     )
     parser.add_argument("--repo-id", help="Defaults to the dataset directory name")
     parser.add_argument(
         "--act-checkpoint",
         type=Path,
-        default=Path("outputs/act_rlt_001_state7_act"),
+        default=Path("outputs/ethernet_act/act_rlt_001_state7_act"),
         help="ACT run, checkpoint, or pretrained_model directory",
     )
-    parser.add_argument("--output", type=Path, default=Path("outputs/act_rlt_001_stage1_pos"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/ethernet_token/act_rlt_001_stage1_pos"))
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)

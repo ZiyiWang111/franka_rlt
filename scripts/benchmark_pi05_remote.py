@@ -26,11 +26,11 @@ def summarize(values):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--server", required=True)
-    p.add_argument("--root", type=Path, default=Path("datasets/pi05_dataset_928_state7_action6"))
+    p.add_argument("--root", type=Path, default=Path("datasets/ethernet_fine/pi05_dataset_928_state7_action6"))
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--requests", type=int, default=20)
     p.add_argument("--wait-ready-s", type=float, default=300)
-    p.add_argument("--output", type=Path, default=Path("outputs/pi05_remote_latency_multi.json"))
+    p.add_argument("--output", type=Path, default=Path("outputs/ethernet_act/pi05_remote_latency_multi.json"))
     args = p.parse_args()
     if args.warmup < 0 or args.requests < 1:
         p.error("warmup must be nonnegative and requests positive")

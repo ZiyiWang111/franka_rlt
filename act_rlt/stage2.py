@@ -18,7 +18,7 @@ from typing import Callable, Protocol
 import torch
 from torch import Tensor, nn
 
-from act_rlt.act_encoder import predict_act_chunk_with_encoder_hidden_and_pos
+from act_rlt.act_encoder import predict_act_chunk_with_encoder_hidden
 from act_rlt.configuration_act_rlt_token import ACTRLTokenConfig
 from act_rlt.modeling_act_rlt_token import ACTRLTokenPolicy
 from act_rlt.stage2_networks import Stage2ChunkActor, Stage2TwinCritic
@@ -40,7 +40,9 @@ log = logging.getLogger(__name__)
 
 def resolve_pretrained_model(path: str | Path) -> Path:
     """Resolve a LeRobot run, checkpoint, or pretrained-model directory."""
-    path = Path(path).expanduser().resolve()
+    from evo_rlt.artifact_paths import resolve_artifact_path
+
+    path = resolve_artifact_path(path)
     candidates = (path, path / "pretrained_model", path / "checkpoints/last/pretrained_model")
     for candidate in candidates:
         if (candidate / "config.json").is_file() and (candidate / "model.safetensors").is_file():
@@ -246,9 +248,9 @@ class ACTStage2Policy(nn.Module):
         self._stage1.eval()
         device = next(value.device for value in batch.values() if isinstance(value, Tensor))
         with timing.measure("act", device) if timing else nullcontext():
-            full_ref, hidden, pos = predict_act_chunk_with_encoder_hidden_and_pos(self._stage1._act, batch)
+            full_ref, hidden = predict_act_chunk_with_encoder_hidden(self._stage1._act, batch)
         with timing.measure("rl_token", hidden.device) if timing else nullcontext():
-            z_rl = self._stage1.rl_token.encode(hidden.float() + pos.float())
+            z_rl = self._stage1.rl_token.encode(hidden.float())
         state_vec = z_rl
         if self.config.proprio_dim:
             proprio = batch[OBS_STATE].float()
@@ -587,6 +589,7 @@ def run_online_stage2(
 ) -> OnlineStage2Metrics:
     """Run warmup then online Stage 2 with chunk-level UTD semantics.
 
+    Warmup ends at the first episode boundary at or above warmup_steps.
     Warmup transitions never trigger updates. After warmup, each collected
     chunk triggers exactly ``utd_ratio`` critic updates, independent of C.
     """
@@ -599,16 +602,16 @@ def run_online_stage2(
     episode_id = metrics.episodes
     if replay.buffer:
         episode_id = max(int(transition.episode_id) for transition in replay.buffer) + 1
+    warmup = metrics.warmup_env_steps < config.warmup_steps
     batch = env.reset(
         episode_id=episode_id,
-        warmup=metrics.warmup_env_steps < config.warmup_steps,
+        warmup=warmup,
     )
 
     # Match Evo-RLT's two-loop semantics: total_env_steps is the online budget
     # after warmup, not a combined warmup + online limit.
     while metrics.online_env_steps < config.total_env_steps:
         metrics.last_learner = None
-        warmup = metrics.warmup_env_steps < config.warmup_steps
         if not warmup and not learner.initialized:
             initialization_start = time.monotonic()
             learner.initialize(replay)
@@ -618,8 +621,10 @@ def run_online_stage2(
         policy.eval()
         execute_policy_chunk = getattr(env, "execute_policy_chunk", None)
         if callable(execute_policy_chunk):
+            # Warmup has a minimum length, but must collect the terminal
+            # transition before initializing or handing control to the Actor.
             remaining_steps = (
-                config.warmup_steps - metrics.warmup_env_steps if warmup
+                None if warmup
                 else config.total_env_steps - metrics.online_env_steps
             )
             execution = execute_policy_chunk(
@@ -671,9 +676,10 @@ def run_online_stage2(
             if execution.stop_requested:
                 break
             episode_id += 1
+            warmup = metrics.warmup_env_steps < config.warmup_steps
             batch = env.reset(
                 episode_id=episode_id,
-                warmup=metrics.warmup_env_steps < config.warmup_steps,
+                warmup=warmup,
             )
             continue
 
@@ -744,9 +750,10 @@ def run_online_stage2(
             break
         if execution.done:
             episode_id += 1
+            warmup = metrics.warmup_env_steps < config.warmup_steps
             batch = env.reset(
                 episode_id=episode_id,
-                warmup=metrics.warmup_env_steps < config.warmup_steps,
+                warmup=warmup,
             )
         else:
             batch = execution.next_batch

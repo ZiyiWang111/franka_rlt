@@ -43,7 +43,7 @@ class FixedChunkRuntime:
     Worker queues never repeat an action or silently discard a transition.
     """
 
-    def __init__(self, env, policy, initial_batch, *, warmup: bool, step_budget: int,
+    def __init__(self, env, policy, initial_batch, *, warmup: bool, step_budget: int | None,
                  deterministic: bool = False):
         self.env = env
         self.policy = policy
@@ -480,7 +480,7 @@ class FixedChunkRuntime:
                     rewards[actual - 1] = float(pending_outcome == "s")
                     info["success"] = pending_outcome == "s"
                     terminated = done = True
-                last = done or collected >= self.step_budget
+                last = done or (self.step_budget is not None and collected >= self.step_budget)
                 info["collector_paused"] = last
                 monitor = self.env._monitor
                 handoff = (

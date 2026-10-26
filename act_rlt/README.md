@@ -3,6 +3,9 @@
 起点、重置方式以及数采 / ACT infer / Stage 2 训练与推理流程的中文说明见
 [ACT 数采、推理与 Stage 2：起点和执行流程](README_START_AND_INFERENCE.md)。
 
+Coarse 两种 ACT 模型（绝对关节位置 / TCP 增量）的完整 10 步 chunk 推理见
+[Coarse ACT 推理](COARSE_INFERENCE.md)，入口为 `python -m act_rlt.infer_coarse`。
+
 This directory is isolated from the original `src/evo_rlt` implementation. It
 holds ACT-RLT, in which ACT replaces the original VLA reference policy. The
 first component is the FR3 sample-space data collector.
@@ -13,16 +16,16 @@ For joint-angle-only state (7D), first create a separate dataset. This keeps
 the original dataset and videos intact and slices state statistics as well:
 
 ```bash
-python act_rlt/prepare_joint_state.py --root datasets/act_rlt_001 \
-  --output datasets/act_rlt_001_state7
-python act_rlt/train.py --root datasets/act_rlt_001_state7 --output runs/act_state7
+python act_rlt/prepare_joint_state.py --root datasets/ethernet_fine/act_rlt_001 \
+  --output datasets/ethernet_fine/act_rlt_001_state7
+python act_rlt/train.py --root datasets/ethernet_fine/act_rlt_001_state7 --output outputs/ethernet_act/act_state7
 ```
 
 The resulting policy takes `joint_0` through `joint_6`, in that order, together
 with both cameras. Deployment must supply the same 7D state. Actions remain
 7D TCP deltas plus gripper width; with VAE disabled they are training targets only.
 
-Copy the finished `datasets/act_rlt_001` directory (including data, meta and
+Copy the finished `datasets/ethernet_fine/act_rlt_001` directory (including data, meta and
 videos) and `act_rlt/train.py` to the server. Activate a Python environment
 with LeRobot and its ACT dependencies installed (the local environment uses
 LeRobot 0.5.1). This script needs no robot drivers or RoboLab installation.
@@ -92,9 +95,9 @@ First inspect the generated LeRobot command:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --root datasets/act_rlt_001_state7 \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1_pos \
+  --root datasets/ethernet_fine/act_rlt_001_state7 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos \
   --dry-run
 ```
 
@@ -102,18 +105,18 @@ Then train:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --root datasets/act_rlt_001_state7 \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1_pos
+  --root datasets/ethernet_fine/act_rlt_001_state7 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos
 ```
 
 Defaults are batch size 8, 10,000 steps, AdamW at `2e-4`, cosine decay with
 200 warmup steps, gradient clipping at 1.0, FP32, and checkpoints every 2,000
 steps. Image augmentation is disabled. The ACT checkpoint and its saved
 normalization processors are the source of truth; ACT parameters are frozen
-and excluded from the Stage-1 checkpoint. Train into a new output directory;
-the prior unpositioned RL Token checkpoint must not be resumed or used with
-the position-aware input.
+and excluded from the Stage-1 checkpoint. RL Token receives the ACT encoder output directly, without adding positional
+embeddings. Its reconstruction target is the same encoder output. Use a new
+output directory when switching from a checkpoint trained with added positions.
 
 On the first batch, training compares the encoder-only helper with an
 `ACT.forward()` hook and requires exact equality. This one-time check can be
@@ -125,7 +128,7 @@ step, and RNG) from the `last` checkpoint with:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --output outputs/act_rlt_001_stage1_pos \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos \
   --resume
 ```
 
@@ -147,17 +150,17 @@ connecting to the robot:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage2 \
+  --stage1-checkpoint outputs/ethernet_token/act_rlt_001_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_rlt/act_rlt_001_stage2 \
   --dry-run
 ```
 
 The confirmed scheduling semantics are:
 
 ```text
-first 4,000 low-level steps: frozen ACT actions, replay collection, no updates
-warmup boundary: 1,000 BC-only Actor updates, then 1,000 Critic-only updates
+warmup: frozen ACT actions, replay collection, no updates; at least 4,000 low-level steps
+warmup boundary: finish the current episode, then 1,000 BC-only Actor updates and 1,000 Critic-only updates
 next 10,000 online steps: one collected chunk -> one transition -> five critic updates
 actor update: every second critic update
 target critics: updated after every critic optimizer step
@@ -253,9 +256,9 @@ bounds:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage2 \
+  --stage1-checkpoint outputs/ethernet_token/act_rlt_001_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_rlt/act_rlt_001_stage2 \
   --allow-motion \
   --workspace-min X_MIN Y_MIN Z_MIN \
   --workspace-max X_MAX Y_MAX Z_MAX \
@@ -273,7 +276,7 @@ The workspace remains the hard safety boundary for every commanded TCP target.
 After each episode, the arm automatically retreats 1 cm along base-frame +Y and
 samples the next reset pose, then asks whether to accept it or sample again.
 For the wrist-only `act_rlt_z_350` insertion policy, pass
-`--act-checkpoint outputs/act_rlt_z_350` with its matching RL Token checkpoint
+`--act-checkpoint outputs/ethernet_act/act_rlt_z_350` with its matching RL Token checkpoint
 and add `--z-insertion-mode`. Stage 2 opens only the checkpoint's 1280x720 wrist
 camera. At startup it asks the operator to place the TCP at p1 and press Enter
 before moving. The TCP pose read at Enter becomes the p1 reference;
@@ -300,6 +303,15 @@ before the robot stops; its final executed step receives the terminal label.
 that limit, if no outcome was entered, the robot stops and asks for `s`, `f`,
 or `q` before reset.
 Without human intervention, `q` also stops training during rollout.
+
+At the reset confirmation prompts before an episode, hold WASD to continuously
+move TCP XY: W=-X, S=+X, A=-Y, D=+Y. This reuses the keyboard teleop servo
+controller at 15 Hz and 3 cm/s; release the keys to stop. It uses
+`--teleop-input-backend` / `--teleop-keyboard` for real key press/release events,
+including X11/ToDesk release debounce. Z and orientation stay fixed; workspace
+violations stop the servo and report an error. At the
+sample-ready prompt, press Enter/y to start from the adjusted pose, or r to
+sample again. These setup movements are not added to replay or training steps.
 
 Add `--enable-human-intervention` to allow keyboard takeover during rollout.
 The keyboard is read by the Stage-2 process through pynput in an X11/ToDesk
@@ -370,7 +382,7 @@ Check all three models without connecting to the robot:
 
 ```bash
 python -m act_rlt.infer_stage2 \
-  --checkpoint outputs/act_rlt_stage2_0921 \
+  --checkpoint outputs/ethernet_rlt/act_rlt_stage2_0921 \
   --dry-run
 ```
 
@@ -378,7 +390,7 @@ For the original workspace mode, use the same safe bounds as training:
 
 ```bash
 python -m act_rlt.infer_stage2 \
-  --checkpoint outputs/act_rlt_stage2_0921 \
+  --checkpoint outputs/ethernet_rlt/act_rlt_stage2_0921 \
   --allow-motion --episodes 1 \
   --workspace-min X_MIN Y_MIN Z_MIN \
   --workspace-max X_MAX Y_MAX Z_MAX \
@@ -420,7 +432,7 @@ state is interpreted as raw base-frame wrench in fx/fy/fz/mx/my/mz order.
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_rlt_001_state7_act \
+  --checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
   --dry-run --duration 10
 ```
 
@@ -485,7 +497,7 @@ the same process (omit `--dry-run-episodes` to keep the interactive prompts):
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_dataset_928_state7_act \
+  --checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
   --fps 30 --no-temporal-ensemble --duration 6 \
   --dry-run --dry-run-episodes 8 --profile-timing \
   --log-dir logs/act_rlt_infer/timing_dry_run
@@ -533,8 +545,8 @@ Its XY position defines the sample box. Samples use a fixed absolute Z and TCP
 orientation, and are drawn uniformly in the robot base frame:
 
 ```text
-x in [x0 - 0.02, x0 + 0.02] m
-y in [y0 + 0.015, y0 + 0.025] m
+x in [x0 - 0.025, x0 + 0.025] m
+y in [y0 + 0.003, y0 + 0.02] m
 z = 0.402 m
 TCP XYZ Euler angle = [179.7, 1.4, 90.6] degrees
 ```
@@ -549,11 +561,11 @@ For each episode, the robot is positioned at the sampled pose outside
 recording. After a 1.0-second settling delay, recording starts automatically:
 
 ```text
-sample -> reference p0 -> p0 + [0, 0, -0.01]
+sample -> reference p0 -> p0 + [0, -0.001, -0.004]
 ```
 
 The episode is saved automatically, followed by a 1.0-second delay. The robot
-then returns `+1 cm` along Z to `p0`, samples the next pose, moves there outside
+then returns `+0.4 cm` along Z and `+0.1 cm` along Y to `p0`, samples the next pose, moves there outside
 recording, waits 1.0 seconds, and starts the next episode without confirmation.
 
 During either 1.0-second non-episode window:
@@ -610,9 +622,10 @@ and `0.01 m/s` for the final `-Z` segment. Adjust them independently with
 `--move-speed` and `--insertion-speed`. The transition delays can be changed
 with `--pre-episode-sleep` and `--post-episode-sleep`.
 Recording frequency is selected with `--fps`; supported values are `15` and
-`30` Hz, with `15` Hz as the default. The Z insertion depth defaults to 1 cm
+`30` Hz, with `15` Hz as the default. The Z insertion depth defaults to 0.4 cm
 and can be set in centimetres with `--insertion-cm` (original two-stage collector only),
 or in metres with `--insert-minus-z`. These options are mutually exclusive.
+Insertion also offsets the endpoint by 0.1 cm along robot-base -Y, keeping the taught orientation.
 For example, `--insertion-cm 1.5` makes the second stage descend 1.5 cm from p0;
 the non-recorded retreat then returns to p0.
 

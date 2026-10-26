@@ -1,102 +1,150 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import json
+import subprocess
 
-import evo_rlt.cli.review_manual_demo as review_module
-from evo_rlt.cli.review_manual_demo import (
-    DEFAULT_DATASET_ROOT,
-    _parser,
-    _review_from_tail,
-    analyze_dataframe,
-)
+import pytest
+
+import evo_rlt.cli.review_manual_demo as review
 
 
-STATE_NAMES = ["ee_x", "ee_y", "ee_z", "gripper_grasped"]
+def _dataset(root, total=5):
+    (root / "meta").mkdir(parents=True)
+    snapshot = json.dumps({"total_episodes": total}).encode()
+    (root / "meta" / "info.json").write_bytes(snapshot)
+    (root / "original.txt").write_text("original")
+    return snapshot
 
 
-def _episode(index: int, xyz: np.ndarray, grasped: np.ndarray) -> pd.DataFrame:
-    delta = np.diff(xyz, axis=0, append=xyz[-1:])
-    action = np.concatenate([delta, np.zeros_like(delta)], axis=1)
-    state = np.concatenate([xyz, grasped[:, None]], axis=1)
-    return pd.DataFrame(
-        {
-            "episode_index": index,
-            "frame_index": np.arange(len(xyz)),
-            "timestamp": np.arange(len(xyz)) / 30,
-            "action": list(action),
-            "observation.state": list(state),
-        }
-    )
-
-
-def test_analyzer_flags_frozen_episode_but_not_complete_pick() -> None:
-    n = 100
-    good_xyz = np.column_stack(
-        [np.linspace(0, 0.6, n), np.zeros(n), np.zeros(n)]
-    )
-    good_grasp = np.r_[np.zeros(40), np.ones(60)]
-    frozen_xyz = np.tile([0.1, 0.3, 0.2], (n, 1))
-    frozen_grasp = np.zeros(n)
-    df = pd.concat(
-        [_episode(0, good_xyz, good_grasp), _episode(1, frozen_xyz, frozen_grasp)],
-        ignore_index=True,
-    )
-
-    candidates = analyze_dataframe(
-        df,
-        state_names=STATE_NAMES,
-        fps=30,
-        require_pick_sequence=True,
-    )
-
-    assert [candidate.episode_index for candidate in candidates] == [1]
-    assert "path<0.1m" in candidates[0].reasons
-    assert "static_tail>=2s" in candidates[0].reasons
-    assert "incomplete_pick/post_grasp<0.25m" in candidates[0].reasons
-
-
-def test_parser_defaults_to_act_rlt_001_latest_episode() -> None:
-    args = _parser().parse_args([])
-
-    assert args.root == DEFAULT_DATASET_ROOT
-    assert args.repo_id is None
-    assert args.episode_index is None
-    assert not args.suspicious_only
-
-
-def test_tail_review_descends_and_deletes_only_yes(monkeypatch, tmp_path) -> None:
-    state = {"total": 3}
-    visualized = []
-    deleted = []
-    answers = iter(["y", "n", "q"])
-
-    def fake_load_dataset(root):
-        total = state["total"]
-        frame = pd.DataFrame(
-            {
-                "episode_index": np.arange(total),
-                "timestamp": np.zeros(total),
-            }
-        )
-        return {"total_episodes": total, "fps": 15}, frame, b"snapshot"
-
-    def fake_delete(repo_id, root, rejected, output_root, snapshot, *, preserve_backup):
-        deleted.extend(rejected)
-        state["total"] -= 1
-        assert not preserve_backup
-        return root
-
-    monkeypatch.setattr(review_module, "_load_dataset", fake_load_dataset)
-    monkeypatch.setattr(
-        review_module,
-        "_visualize_episode",
-        lambda episode_index, **kwargs: visualized.append(episode_index),
-    )
-    monkeypatch.setattr(review_module, "_apply_deletions", fake_delete)
+def _answers(monkeypatch, answers):
+    answers = iter(answers)
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
 
-    _review_from_tail(repo_id="act_rlt_001", root=tmp_path, viz_command="viz")
 
-    assert visualized == [2, 1, 0]
-    assert deleted == [2]
+def test_select_dataset_navigates_back_and_retries_invalid_input(monkeypatch, tmp_path):
+    root = tmp_path / "datasets"
+    (root / "a_empty").mkdir(parents=True)
+    target = root / "b_fine" / "sample"
+    _dataset(target)
+    _answers(monkeypatch, ["invalid", "9", "1", "b", "2", "1"])
+    assert review._select_dataset(root) == target
+
+
+def test_select_dataset_quit_stays_within_base(monkeypatch, tmp_path):
+    _answers(monkeypatch, ["b", "q"])
+    assert review._select_dataset(tmp_path) is None
+
+
+def test_count_rejects_invalid_and_all_episode_deletion(monkeypatch):
+    _answers(monkeypatch, ["0", "-1", "2.5", "5", "6", "2"])
+    assert review._read_count(5) == 2
+
+
+def test_count_quit_and_single_episode(monkeypatch):
+    _answers(monkeypatch, ["q"])
+    assert review._read_count(5) is None
+    assert review._read_count(1) is None
+    assert review._read_count(0) is None
+
+
+def _fake_editor(monkeypatch, *, total=3, fail=False):
+    calls = []
+    monkeypatch.setattr(review, "_resolve_editor", lambda: "editor")
+
+    def run(command, *, check):
+        calls.append(command)
+        assert check
+        if fail:
+            raise subprocess.CalledProcessError(1, command)
+        staging = review.Path(command[command.index("--new_root") + 1])
+        _dataset(staging, total)
+        (staging / "original.txt").unlink()
+        (staging / "filtered.txt").write_text("filtered")
+
+    monkeypatch.setattr(review.subprocess, "run", run)
+    return calls
+
+
+def test_delete_tail_removes_correct_indices_and_replaces_only_after_validation(monkeypatch, tmp_path):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    calls = _fake_editor(monkeypatch)
+    review._delete_tail(root, 2, snapshot)
+    assert json.loads(calls[0][-1]) == [3, 4]
+    assert (root / "filtered.txt").is_file()
+    assert not (root / "original.txt").exists()
+    assert list(tmp_path.iterdir()) == [root]
+
+
+@pytest.mark.parametrize("invalid_count", [0, -1, 5, 6])
+def test_delete_tail_validates_count_before_running_editor(tmp_path, invalid_count):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    with pytest.raises(ValueError):
+        review._delete_tail(root, invalid_count, snapshot)
+    assert (root / "original.txt").is_file()
+
+
+@pytest.mark.parametrize("fail,output_total", [(True, 3), (False, 4)])
+def test_failed_rebuild_preserves_original(monkeypatch, tmp_path, fail, output_total):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    _fake_editor(monkeypatch, total=output_total, fail=fail)
+    with pytest.raises((RuntimeError, subprocess.CalledProcessError)):
+        review._delete_tail(root, 2, snapshot)
+    assert (root / "original.txt").read_text() == "original"
+    assert (root / "meta" / "info.json").read_bytes() == snapshot
+
+
+def test_source_change_aborts_before_editing(monkeypatch, tmp_path):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    calls = _fake_editor(monkeypatch)
+    (root / "meta" / "info.json").write_text('{"total_episodes": 6}')
+    with pytest.raises(RuntimeError, match="已发生变化"):
+        review._delete_tail(root, 2, snapshot)
+    assert not calls
+
+
+def test_main_selects_dataset_and_deletes_count(monkeypatch, tmp_path):
+    root = tmp_path / "fine" / "sample"
+    _dataset(root)
+    monkeypatch.setattr(review, "DATASETS_ROOT", tmp_path)
+    calls = _fake_editor(monkeypatch)
+    _answers(monkeypatch, ["1", "1", "2"])
+    review.main()
+    assert json.loads(calls[0][-1]) == [3, 4]
+
+
+def test_source_change_during_rebuild_preserves_original(monkeypatch, tmp_path):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    _fake_editor(monkeypatch)
+    rebuild = review.subprocess.run
+
+    def run(command, *, check):
+        rebuild(command, check=check)
+        (root / "meta" / "info.json").write_text('{"total_episodes": 6}')
+
+    monkeypatch.setattr(review.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="重建期间"):
+        review._delete_tail(root, 2, snapshot)
+    assert (root / "original.txt").is_file()
+
+
+def test_failed_replacement_rolls_back_original(monkeypatch, tmp_path):
+    root = tmp_path / "sample"
+    snapshot = _dataset(root)
+    _fake_editor(monkeypatch)
+    rename = review.Path.rename
+
+    def fail_staging_rename(path, target):
+        if ".filtering-" in path.name:
+            raise OSError("simulated rename failure")
+        return rename(path, target)
+
+    monkeypatch.setattr(review.Path, "rename", fail_staging_rename)
+    with pytest.raises(OSError, match="simulated"):
+        review._delete_tail(root, 2, snapshot)
+    assert (root / "original.txt").is_file()
+    assert (root / "meta" / "info.json").read_bytes() == snapshot

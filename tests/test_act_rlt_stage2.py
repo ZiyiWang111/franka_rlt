@@ -409,17 +409,20 @@ class _FakeEnvironment:
         self.executed: list[torch.Tensor] = []
 
     def reset(self, *, episode_id: int, warmup: bool):
+        self.episode_steps = 0
         return {"observation.state": torch.zeros(1, 7)}
 
     def execute_chunk(self, action_chunk, full_reference):
         self.executed.append(action_chunk.detach().cpu())
+        self.episode_steps += self.config.chunk_length
+        done = self.episode_steps >= max(self.config.warmup_steps, self.config.chunk_length)
         return ChunkExecution(
             next_batch={"observation.state": torch.zeros(1, 7)},
             exec_chunk=action_chunk.squeeze(0).detach().cpu(),
             reward_seq=torch.zeros(self.config.chunk_length),
             actual_steps=self.config.chunk_length,
-            done=False,
-            terminated=False,
+            done=done,
+            terminated=done,
             truncated=False,
         )
 
@@ -470,6 +473,48 @@ def test_warmup_has_no_updates_and_utd_is_per_chunk() -> None:
     # The two warmup chunks are exactly the frozen reference.
     assert torch.equal(env.executed[0], torch.full((1, 4, 6), 0.1))
     assert torch.equal(env.executed[1], torch.full((1, 4, 6), 0.1))
+
+
+@pytest.mark.parametrize("warmup_steps", [4, 5, 12])
+def test_warmup_waits_for_episode_end_before_initialization(warmup_steps):
+    config = _config(warmup_steps=warmup_steps, total_env_steps=4)
+    policy = _FakeStage2Policy(config)
+    learner = Stage2Learner(policy, config)
+    replay = ReplayBuffer(config.replay_capacity)
+    env = _FakeEnvironment(config)
+    original_execute = env.execute_chunk
+    original_initialize = learner.initialize
+    initialized_at = []
+
+    def execute(action_chunk, full_reference):
+        result = original_execute(action_chunk, full_reference)
+        result.done = result.terminated = env.episode_steps == 12
+        return result
+
+    def initialize(buffer):
+        initialized_at.append(len(env.executed) * config.chunk_length)
+        assert bool(buffer.buffer[-1].done)
+        original_initialize(buffer)
+
+    env.execute_chunk = execute
+    learner.initialize = initialize
+    observed = []
+    metrics = run_online_stage2(
+        policy, learner, env, replay, config,
+        on_chunk=lambda current, execution: observed.append(
+            (execution.info["warmup"], learner.initialized, learner.critic_updates)
+        ),
+    )
+
+    assert initialized_at == [12]
+    assert metrics.warmup_env_steps == 12
+    assert metrics.online_env_steps == 4
+    assert observed[:3] == [(True, False, 0)] * 3
+    assert observed[3][0:2] == (False, True)
+    assert [int(t.source) for t in replay.buffer] == [1, 1, 1, 2]
+    assert [int(t.episode_id) for t in replay.buffer] == [0, 0, 0, 1]
+    for action in env.executed[:3]:
+        torch.testing.assert_close(action, torch.full((1, 4, 6), .1))
 
 
 def test_human_chunk_uses_executed_bc_target_with_act_reference_preserved():
@@ -526,9 +571,9 @@ def test_zero_step_workspace_refusal_resets_without_fake_replay_transition() -> 
     assert len(replay) == 2
     assert metrics.env_steps == 8
     assert metrics.chunks == 2
-    assert metrics.episodes == 1
+    assert metrics.episodes == 3
     assert observed == [{"workspace_violation": True, "warmup": True}]
-    assert env.resets == 2
+    assert env.resets == 4
 
 
 def test_environment_converts_workspace_refusal_to_truncation() -> None:
@@ -833,10 +878,20 @@ def test_human_key_release_stops_servo_without_leaving_human_mode():
     assert env._control_mode == "human"
 
 
-def test_default_online_loop_uses_persistent_collection_and_respects_phase_budget():
+def test_default_online_loop_finishes_warmup_episode_before_switching():
     config = _config(warmup_steps=4, total_env_steps=4)
     env = _threaded_env(config)
-    env.reset = lambda **kwargs: {"observation.state": torch.zeros(1, 7)}
+    env._observation_frame = lambda observation: observation
+
+    def reset(**kwargs):
+        env._monitor = SimpleNamespace(
+            poll=lambda: "s" if kwargs["warmup"] and len(env.robot.sent_at) >= 8 else None,
+            close=lambda: None,
+        )
+        return {"observation.state": torch.zeros(1, 7)}
+
+    env.reset = reset
+    env._retreat_after_outcome = lambda: None
     policy = _FakeStage2Policy(config)
     learner = Stage2Learner(policy, config)
     replay = ReplayBuffer(config.replay_capacity)
@@ -845,11 +900,11 @@ def test_default_online_loop_uses_persistent_collection_and_respects_phase_budge
             metrics = run_online_stage2(policy, learner, env, replay, config)
         finally:
             env.close()
-    assert metrics.warmup_env_steps == 4
+    assert metrics.warmup_env_steps == 8
     assert metrics.online_env_steps == 4
     assert metrics.critic_updates == 5
-    assert len(env.robot.sent_at) == 8
-    assert [int(t.source) for t in replay.buffer] == [1, 2]
+    assert len(env.robot.sent_at) == 12
+    assert [int(t.source) for t in replay.buffer] == [1, 1, 2]
 
 
 @pytest.mark.parametrize("refusal_at", [0, 2])

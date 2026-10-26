@@ -64,7 +64,9 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
         self._logged_hidden_shape = False
 
     def _load_act_policy(self) -> ACTPolicy:
-        path = Path(self.config.act_pretrained_path).expanduser().resolve()
+        from evo_rlt.artifact_paths import resolve_artifact_path
+
+        path = resolve_artifact_path(self.config.act_pretrained_path)
         if not (path / "config.json").is_file() or not (path / "model.safetensors").is_file():
             raise FileNotFoundError(f"incomplete ACT pretrained_model directory: {path}")
         act_config = PreTrainedConfig.from_pretrained(path, local_files_only=True)
@@ -145,18 +147,17 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
 
     def encode_multi(self, batch: dict[str, Tensor]) -> Tensor:
         """Stage-1 bottleneck interface: return [B,N,D]."""
-        hidden, pos = self.extract_act_hidden_and_pos(batch)
-        return self.rl_token.encode_multi(hidden + pos)
+        hidden = self.extract_act_hidden(batch)
+        return self.rl_token.encode_multi(hidden)
 
     def encode(self, batch: dict[str, Tensor]) -> Tensor:
         """Stage-2 Actor/Critic interface: mean-pool RL tokens to [B,D]."""
-        hidden, pos = self.extract_act_hidden_and_pos(batch)
-        return self.rl_token.encode(hidden + pos)
+        hidden = self.extract_act_hidden(batch)
+        return self.rl_token.encode(hidden)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        hidden, pos = self.extract_act_hidden_and_pos(batch)
-        rl_memory = hidden + pos
-        loss_recon = self.rl_token.reconstruction_loss(hidden, encoder_tokens=rl_memory)
+        hidden = self.extract_act_hidden(batch)
+        loss_recon = self.rl_token.reconstruction_loss(hidden)
         loss = self.config.recon_weight * loss_recon
         return loss, {
             "loss": loss.detach().item(),

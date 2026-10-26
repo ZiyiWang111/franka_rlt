@@ -39,7 +39,7 @@ Usage: scripts/record_franka_waypoint_demo.sh [options]
 
 Dataset options:
   --dataset NAME          Dataset repo/name (default: franka_waypoint_demo)
-  --root PATH             Dataset root (default: PROJECT/datasets/NAME)
+  --root PATH             Dataset root (default: PROJECT/datasets/ethernet_fine/NAME)
   --fps HZ                Recording frequency (default: 15)
   --episodes N            Number of saved episodes (default: 10)
   --episode-time SEC      Per-attempt safety timeout (default: 300)
@@ -144,7 +144,7 @@ done
 [[ -f "$CONTROL_SERVER_SCRIPT" ]] || die "control-server launcher not found: $CONTROL_SERVER_SCRIPT"
 
 if [[ -z "$DATASET_ROOT" ]]; then
-    DATASET_ROOT="${PROJECT_ROOT}/datasets/${DATASET_NAME}"
+    DATASET_ROOT="${PROJECT_ROOT}/datasets/ethernet_fine/${DATASET_NAME}"
 fi
 
 cleanup() {

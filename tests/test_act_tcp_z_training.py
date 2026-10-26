@@ -5,7 +5,7 @@ from lerobot.datasets import dataset_reader
 from scripts.train_act_tcp_z_tmp import install_scalar_state_dataset_support
 
 
-@pytest.mark.parametrize('state_dim', [1, 6, 7])
+@pytest.mark.parametrize('state_dim', [1, 6, 7, 13])
 def test_scalar_state_fix_preserves_vectors_and_scalar_indices(monkeypatch, state_dim):
     original = dataset_reader.get_hf_features_from_features
     monkeypatch.setattr(dataset_reader, 'get_hf_features_from_features', original)

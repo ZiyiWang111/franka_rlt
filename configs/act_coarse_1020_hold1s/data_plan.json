@@ -1,0 +1,81 @@
+{
+  "status": "COMPLETE_DOWNLOADED",
+  "source_dataset": "/home/embint/wzy/Evo-RLT/datasets/ethernet_coarse/act_coarse_1020_rgb_z_delta_tcp_hold1s",
+  "original_full_state_dataset": "/home/embint/wzy/Evo-RLT/datasets/ethernet_coarse/act_coarse_1020",
+  "fps": 15,
+  "episodes": 266,
+  "frames": 18889,
+  "original_frames": 14899,
+  "tail_frames_per_episode": 15,
+  "tail_seconds": 1.0,
+  "cameras": [
+    "observation.images.wrist"
+  ],
+  "image_shape_chw": [
+    3,
+    480,
+    640
+  ],
+  "gpus": {
+    "rgb_z_delta_tcp": 1,
+    "rgb_pose_joint_delta_tcp": 2
+  },
+  "state_fields": {
+    "rgb_z_delta_tcp": [
+      "ee_z"
+    ],
+    "rgb_pose_joint_delta_tcp": [
+      "joint_0",
+      "joint_1",
+      "joint_2",
+      "joint_3",
+      "joint_4",
+      "joint_5",
+      "joint_6",
+      "ee_x",
+      "ee_y",
+      "ee_z",
+      "ee_rx",
+      "ee_ry",
+      "ee_rz"
+    ]
+  },
+  "state_units": {
+    "joint_angles": "radians",
+    "ee_xyz": "base frame metres",
+    "ee_rotation": "base frame rotation vector radians"
+  },
+  "action_fields": [
+    "dx",
+    "dy",
+    "dz",
+    "drx",
+    "dry",
+    "drz"
+  ],
+  "action_units": {
+    "translation": "base frame metres per frame",
+    "rotation": "body-frame rotation vector radians per frame"
+  },
+  "state_recovery": "Align original episodes/frame_index. Preserve the provided hold1s RGB, actions and indices. Restore 13D state from original samples; repeat each original final state for the 15 synthetic tail frames. Recompute state statistics.",
+  "alignment_verified": [
+    "all 266 episodes",
+    "original per-frame TCP delta actions",
+    "ee_z",
+    "frame_index",
+    "timestamps",
+    "task_index",
+    "15 appended zero-action frames per episode"
+  ],
+  "initialization": "New ACT transformer and action/state projections; ImageNet pretrained ResNet18. No ACT checkpoint fine-tuning.",
+  "split": "All 266 episodes for training, no validation split",
+  "gripper": "excluded",
+  "chunk_size": 10,
+  "n_action_steps": 4,
+  "inference_note": "Existing coarse inference executes all 10 actions; 13D state model will need corresponding input-contract support before live use.",
+  "model_names": {
+    "rgb_z_delta_tcp": "coarse_z_hold1s",
+    "rgb_pose_joint_delta_tcp": "coarse_pose_joint_hold1s"
+  },
+  "save_policy": "final checkpoint only at step 30000"
+}

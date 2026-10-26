@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections import deque
 import logging
+import math
 import os
 import threading
 import time
@@ -89,6 +90,7 @@ class FrankaArmControllerClient:
 
         self._lock = threading.Lock()        # serializes the command (DEALER) socket
         self._cache = None
+        self._cache_received_at = float("-inf")
         self._cache_lock = threading.Lock()
         self._state_history = deque(maxlen=256)
         self._stream_on = True
@@ -137,6 +139,7 @@ class FrankaArmControllerClient:
                 snap = msgpack.unpackb(raw, raw=False)
                 with self._cache_lock:
                     self._cache = snap
+                    self._cache_received_at = time.monotonic()
                     self._state_history.append(snap)
             except zmq.Again:
                 continue
@@ -293,11 +296,80 @@ class FrankaArmControllerClient:
     def get_joint_angles(self):
         return list(self._snap().get("joints") or [0.0] * 7)
 
+    def get_joint_angles_after_move(self, *, timeout_s=2.0):
+        """Read validated joints from a post-move snapshot; not a servo API."""
+        joints = self._state_after_move(timeout_s=timeout_s).get("joints")
+        if joints is None or len(joints) != 7 or not all(math.isfinite(q) for q in joints):
+            raise RuntimeError("Invalid post-move joint measurement")
+        return list(joints)
+
+    def get_tool_pose_after_move(self, *, timeout_s=2.0):
+        """Read validated TCP pose from a post-move snapshot; not a servo API."""
+        pose = self._state_after_move(timeout_s=timeout_s).get("pose")
+        if pose is None or len(pose) != 6 or not all(math.isfinite(v) for v in pose):
+            raise RuntimeError("Invalid post-move TCP measurement")
+        return list(pose)
+
+    def _state_after_move(self, *, timeout_s):
+        """Wait for post-move streamed state; setup/reset use only, not servo.
+
+        Call after a blocking move returns. An idle RPC response may precede
+        publication of the final measurement, so fence on the server's current
+        snapshot sequence, then require two later snapshots. The first could
+        already have been in acquisition at the fence. Sequence numbers work
+        across hosts without assuming synchronized monotonic clocks.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and positive")
+        response = self._send("get_state")
+        if not response or not response.get("success"):
+            raise RuntimeError(f"Post-move state request failed: {response.get('error') if response else 'no reply'}")
+        baseline = response.get("state") or {}
+        sequence = baseline.get("seq")
+        if not isinstance(sequence, int):
+            raise RuntimeError("Post-move state has no snapshot sequence")
+        if baseline.get("session_fault"):
+            raise RuntimeError(f"Post-move session fault: {baseline['session_fault']}")
+        snapshot = baseline
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._cache_lock:
+                snapshot = dict(self._cache or {})
+            if snapshot.get("session_fault"):
+                raise RuntimeError(f"Post-move session fault: {snapshot['session_fault']}")
+            if (snapshot.get("seq", -1) >= sequence + 2
+                    and not snapshot.get("state_stale", False)
+                    and not snapshot.get("is_running", True)):
+                return snapshot
+            time.sleep(.01)
+        raise RuntimeError(
+            f"Timed out after {timeout_s:g}s waiting for fresh post-move state "
+            f"(baseline seq={sequence}, latest seq={snapshot.get('seq')}); "
+            "refusing to validate motion against stale state")
+
     def get_joint_speeds(self):
         return list(self._snap().get("joint_speeds") or [0.0] * 7)
 
     def get_tool_pose(self):
         return list(self._snap().get("pose") or [0.0] * 6)
+
+    def get_fresh_tool_pose(self, *, max_age_s=0.25):
+        """Read one complete, fresh streamed pose without an RPC or blocking wait.
+
+        Reception age uses the client's clock so remote control servers work too.
+        A server-side stale robot state is rejected even if its packet is new.
+        """
+        if not math.isfinite(max_age_s) or max_age_s <= 0:
+            raise ValueError("max_age_s must be finite and positive")
+        with self._cache_lock:
+            snapshot = self._cache or {}
+            age = time.monotonic() - getattr(self, "_cache_received_at", float("-inf"))
+            if snapshot.get("state_stale", False) or age > max_age_s:
+                raise RuntimeError("Fresh streamed TCP pose unavailable or stale")
+            pose = snapshot.get("pose")
+            if pose is None or len(pose) != 6 or not all(math.isfinite(v) for v in pose):
+                raise RuntimeError("Fresh streamed TCP pose is incomplete or invalid")
+            return list(pose)
 
     def get_tool_force_raw(self):
         return list(self._snap().get("force_raw") or [0.0] * 6)

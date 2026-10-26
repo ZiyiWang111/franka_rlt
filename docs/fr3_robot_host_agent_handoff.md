@@ -26,7 +26,7 @@ control_server -> FR3
 文件：`scripts/fr3_pi05_inference_server.py`
 
 - 默认加载
-  `outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k/checkpoints/030000/pretrained_model`。
+  `outputs/ethernet_act/fr3_pi05_sft_60ep_state15_action7_bs4_30k/checkpoints/030000/pretrained_model`。
 - 在 CUDA 上加载 checkpoint 自带的 preprocessor 和 postprocessor。
 - 只接受固定 schema：
   - `wrist`: RGB `uint8 [480, 640, 3]`
@@ -145,9 +145,9 @@ tests/test_franka_runtime_ik.py
 
 ### 不需要同步到机器人主机
 
-- `datasets/franka_m1_manual_demo_state15_action7`：不需要。它只用于训练和离线
+- `datasets/ethernet_fine/franka_m1_manual_demo_state15_action7`：不需要。它只用于训练和离线
   dataset dry run。
-- `outputs/.../checkpoints/030000`：不需要。模型只在 GPU server 加载。
+- `outputs/ethernet_act/.../checkpoints/030000`：不需要。模型只在 GPU server 加载。
 - `/workspace/wangziyi/models/pi05_base`：不需要。
 - Hugging Face PaliGemma tokenizer cache：不需要。
 - checkpoint 的 `training_state`：两边推理都不需要。

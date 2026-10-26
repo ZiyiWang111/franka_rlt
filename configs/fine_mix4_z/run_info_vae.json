@@ -1,0 +1,36 @@
+{
+  "status": "RUNNING",
+  "job_name": "fine_mix4_z_vae",
+  "pid": 2326200,
+  "gpus": [
+    2
+  ],
+  "global_batch": 32,
+  "started_at": "2026-10-22T18:45:59.041900",
+  "log": "logs/ethernet_act/fine_mix4_z_vae_20261022_184559.log",
+  "output_dir": "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_act/fine_mix4_z_vae",
+  "command": [
+    "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+    "-u",
+    "-m",
+    "torch.distributed.run",
+    "--standalone",
+    "--nproc_per_node=1",
+    "scripts/train_fine_mix4_z.py",
+    "--config",
+    "configs/fine_mix4_z/train_config_vae.json"
+  ],
+  "vae_verification": "configs/fine_mix4_z/vae_verification.json",
+  "last_verified_step": 110,
+  "host": "wangziyi@10.0.40.163",
+  "world_size": 1,
+  "per_gpu_batch": 32,
+  "steps": 100000,
+  "checkpoint_policy": "final only",
+  "vae_metrics_step100": {
+    "reconstruction_l1": 0.5077254772186279,
+    "kl": 0.7677347660064697,
+    "kl_weight": 10,
+    "total_loss": 8.185073137283325
+  }
+}

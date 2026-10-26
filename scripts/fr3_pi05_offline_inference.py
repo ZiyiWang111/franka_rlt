@@ -17,10 +17,10 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "datasets/pi05_dataset_928_state7_action6"
+DEFAULT_DATASET_ROOT = PROJECT_ROOT / "datasets/ethernet_fine/pi05_dataset_928_state7_action6"
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
-    / "outputs/pi05_dataset_928_state7_action6"
+    / "outputs/ethernet_act/pi05_dataset_928_state7_action6"
     / "checkpoints/030000/pretrained_model"
 )
 

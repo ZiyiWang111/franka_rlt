@@ -15,6 +15,11 @@ The ACT-specific implementation lives in `act_rlt/` and reuses RL Token,
 replay, and robot adapters from `src/evo_rlt/`. The Python package and existing
 CLI names still use `evo-rlt`; the commands below are the ACT-RLT entrypoints.
 
+Fine datasets are under `datasets/ethernet_fine/`; coarse collection uses
+`datasets/ethernet_coarse/` ([collector guide](act_rlt/data_collection/COARSE_COLLECTION.md)). Models are grouped into
+`outputs/ethernet_act/`, `outputs/ethernet_token/`, and `outputs/ethernet_rlt/`.
+See [directory layout and path compatibility](docs/artifact_layout.md).
+
 ## Contents
 
 - [Installation and runtime setup](#installation-and-runtime-setup)
@@ -93,7 +98,7 @@ bash act_rlt/data_collection/collect_sample_space.sh \
 
 The launcher starts a fresh Evo-RLT Franka control server, verifies the wrist
 and front RealSense cameras by default, starts the recorder, and shuts down the
-exact server process when recording exits. It saves to `datasets/NAME` unless
+exact server process when recording exits. It saves to `datasets/ethernet_fine/NAME` unless
 `--root PATH` is supplied. Do not start a separate server for this launcher.
 
 At startup, hand-guide the TCP to the reference pose `p0` and press `Enter`.
@@ -192,10 +197,10 @@ For joint-angle-only state (7D), first create a separate dataset. This keeps
 the original dataset and videos intact and slices state statistics as well:
 
 ```bash
-python act_rlt/prepare_joint_state.py --root datasets/act_rlt_001 \
-  --output datasets/act_rlt_001_state7
-python act_rlt/train.py --root datasets/act_rlt_001_state7 \
-  --output outputs/act_rlt_001_state7_act
+python act_rlt/prepare_joint_state.py --root datasets/ethernet_fine/act_rlt_001 \
+  --output datasets/ethernet_fine/act_rlt_001_state7
+python act_rlt/train.py --root datasets/ethernet_fine/act_rlt_001_state7 \
+  --output outputs/ethernet_act/act_rlt_001_state7_act
 ```
 
 The resulting policy takes `joint_0` through `joint_6`, in that order, together
@@ -203,7 +208,7 @@ with the camera streams present in the dataset. Deployment must supply the same
 7D state. Actions remain 7D TCP deltas plus gripper width; with VAE disabled they
 are training targets only.
 
-Copy the prepared `datasets/act_rlt_001_state7` directory (including data, meta
+Copy the prepared `datasets/ethernet_fine/act_rlt_001_state7` directory (including data, meta
 and videos) and both `act_rlt/train.py` and `act_rlt/train_scheduled.py` to the
 server. Activate a Python environment
 with LeRobot and its ACT dependencies installed (the local environment uses
@@ -213,7 +218,7 @@ The ResNet18 ImageNet weights must be cached or downloadable on first use.
 ```bash
 python act_rlt/train.py --root /path/to/act_rlt_001_state7 --dry-run
 python act_rlt/train.py --root /path/to/act_rlt_001_state7 \
-  --output outputs/act_rlt_001_state7_act
+  --output outputs/ethernet_act/act_rlt_001_state7_act
 ```
 
 Choose a preset; explicit `--steps` and `--batch-size` override it:
@@ -277,9 +282,9 @@ First inspect the generated LeRobot command:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --root datasets/act_rlt_001_state7 \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1_pos \
+  --root datasets/ethernet_fine/act_rlt_001_state7 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos \
   --dry-run
 ```
 
@@ -287,9 +292,9 @@ Then train:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --root datasets/act_rlt_001_state7 \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage1_pos
+  --root datasets/ethernet_fine/act_rlt_001_state7 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos
 ```
 
 Defaults are batch size 8, 10,000 steps, AdamW at `2e-4`, cosine decay with
@@ -310,7 +315,7 @@ step, and RNG) from the `last` checkpoint with:
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --output outputs/act_rlt_001_stage1_pos \
+  --output outputs/ethernet_token/act_rlt_001_stage1_pos \
   --resume
 ```
 
@@ -332,9 +337,9 @@ connecting to the robot:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage2 \
+  --stage1-checkpoint outputs/ethernet_token/act_rlt_001_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_rlt/act_rlt_001_stage2 \
   --dry-run
 ```
 
@@ -434,9 +439,9 @@ explicit base-frame workspace bounds:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_rlt_001_stage1_pos \
-  --act-checkpoint outputs/act_rlt_001_state7_act \
-  --output outputs/act_rlt_001_stage2 \
+  --stage1-checkpoint outputs/ethernet_token/act_rlt_001_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
+  --output outputs/ethernet_rlt/act_rlt_001_stage2 \
   --allow-motion \
   --workspace-min X_MIN Y_MIN Z_MIN \
   --workspace-max X_MAX Y_MAX Z_MAX \
@@ -457,7 +462,7 @@ samples the next reset pose, then asks whether to accept it or sample again.
 ### Z-insertion reset mode
 
 For the wrist-only `act_rlt_z_350` insertion policy, pass
-`--act-checkpoint outputs/act_rlt_z_350` with its matching RL Token checkpoint
+`--act-checkpoint outputs/ethernet_act/act_rlt_z_350` with its matching RL Token checkpoint
 and add `--z-insertion-mode`. Stage 2 opens only the checkpoint's 1280x720 wrist
 camera. At startup it asks the operator to place the TCP at p1 and press Enter
 before moving. The TCP pose read at Enter becomes the p1 reference;
@@ -482,9 +487,9 @@ For example, with the matching wrist-only ACT and Stage-1 checkpoints:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --act-checkpoint outputs/act_rlt_z_350 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_z_350 \
   --stage1-checkpoint /path/to/matching_stage1 \
-  --output outputs/act_rlt_z_stage2 \
+  --output outputs/ethernet_rlt/act_rlt_z_stage2 \
   --allow-motion --z-insertion-mode
 ```
 
@@ -566,9 +571,9 @@ with:
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --act-checkpoint outputs/act_rlt_z_350 \
+  --act-checkpoint outputs/ethernet_act/act_rlt_z_350 \
   --stage1-checkpoint /path/to/matching_stage1 \
-  --output outputs/act_rlt_z_stage2 \
+  --output outputs/ethernet_rlt/act_rlt_z_stage2 \
   --allow-motion --z-insertion-mode --resume --total-env-steps 20000
 ```
 
@@ -585,7 +590,7 @@ Check all three models without connecting to the robot:
 
 ```bash
 python -m act_rlt.infer_stage2 \
-  --checkpoint outputs/act_rlt_001_stage2 \
+  --checkpoint outputs/ethernet_rlt/act_rlt_001_stage2 \
   --dry-run
 ```
 
@@ -593,7 +598,7 @@ For the original workspace mode, use the same safe bounds as training:
 
 ```bash
 python -m act_rlt.infer_stage2 \
-  --checkpoint outputs/act_rlt_001_stage2 \
+  --checkpoint outputs/ethernet_rlt/act_rlt_001_stage2 \
   --allow-motion --episodes 1 \
   --workspace-min X_MIN Y_MIN Z_MIN \
   --workspace-max X_MAX Y_MAX Z_MAX \
@@ -633,7 +638,7 @@ before connecting. Use the 7D-state checkpoint including its saved processors.
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_rlt_001_state7_act \
+  --checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
   --dry-run --duration 10
 ```
 
@@ -698,7 +703,7 @@ the same process (omit `--dry-run-episodes` to keep the interactive prompts):
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_dataset_928_state7_act \
+  --checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
   --fps 30 --no-temporal-ensemble --duration 6 \
   --dry-run --dry-run-episodes 8 --profile-timing \
   --log-dir logs/act_rlt_infer/timing_dry_run

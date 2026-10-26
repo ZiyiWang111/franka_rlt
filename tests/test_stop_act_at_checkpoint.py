@@ -82,7 +82,7 @@ time.sleep(90)
         record.write_text(json.dumps({'runs': [run]}))
         guard = subprocess.Popen([sys.executable, str(Path(__file__).resolve().parents[1] / 'scripts/stop_act_at_checkpoint.py'),
             '--pause-record', str(record), '--root', str(root)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        status_path = root / 'outputs/run/stop_at_checkpoint.json'
+        status_path = root / 'outputs/ethernet_act/run/stop_at_checkpoint.json'
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if status_path.exists() and json.loads(status_path.read_text())['status'] == 'running_to_checkpoint':
@@ -90,7 +90,7 @@ time.sleep(90)
             time.sleep(.02)
         assert json.loads(status_path.read_text())['status'] == 'running_to_checkpoint'
         assert parent.poll() is None  # no checkpoint yet: job must be alive
-        output, checkpoint = make_checkpoint(root / 'outputs')
+        output, checkpoint = make_checkpoint(root / 'outputs/ethernet_act')
         (output / 'checkpoints/last').symlink_to('010000')
         stdout, stderr = guard.communicate(timeout=15)
         assert guard.returncode == 0, stderr

@@ -25,7 +25,7 @@ MOVE_SPEED="${MOVE_SPEED:-0.02}"
 INSERTION_SPEED="${INSERTION_SPEED:-0.01}"
 PRE_EPISODE_SLEEP="${PRE_EPISODE_SLEEP:-1.0}"
 POST_EPISODE_SLEEP="${POST_EPISODE_SLEEP:-1.0}"
-INSERT_MINUS_Z="${INSERT_MINUS_Z:-0.01}"
+INSERT_MINUS_Z="${INSERT_MINUS_Z:-0.004}"
 INSERTION_CM=""
 DEPTH_OPTION_SET=false
 ABORT_KEY="${ABORT_KEY:-x}"
@@ -44,7 +44,7 @@ Usage: act_rlt/data_collection/collect_sample_space.sh [options]
 
 Dataset:
   --dataset NAME          Dataset repo/name (default: act_rlt_sample_space)
-  --root PATH             Dataset root (default: PROJECT/datasets/NAME)
+  --root PATH             Dataset root (default: PROJECT/datasets/ethernet_fine/NAME)
   --fps HZ                Recording rate: 15 or 30 Hz (default: 15)
   --episodes N            Number of newly saved episodes (default: 10)
   --episode-time SEC      Per-attempt timeout (default: 60)
@@ -56,8 +56,8 @@ Trajectory (metres, robot-base frame):
   --insertion-speed MPS   Reference->final speed (default: 0.01)
   --pre-episode-sleep SEC Delay after reaching sample (default: 1.0)
   --post-episode-sleep SEC Delay after saving episode (default: 1.0)
-  --insert-minus-z M      Recorded -Z advance from p0 (default: 0.01)
-  --insertion-cm CM       Second-stage -Z depth in cm (default: 1); excludes --insert-minus-z
+  --insert-minus-z M      Recorded -Z advance from p0 (default: 0.004)
+  --insertion-cm CM       Second-stage -Z depth in cm (default: 0.4); excludes --insert-minus-z
   --abort-key KEY         Stop and discard active episode (default: x)
   --seed N                Optional reproducible sample sequence
 
@@ -75,10 +75,10 @@ Hardware/runtime:
 Workflow:
   1. Hand-guide to reference p0 and press ENTER once.
   2. The recorder samples and moves to a start pose outside the episode.
-  3. After 1.0 s it records sample -> p0 -> p0-depth(Z) and saves automatically.
+  3. After 1.0 s it records sample -> p0 -> p0+[0,-0.001,-depth] and saves automatically.
   4. After another 1.0 s it retreats to p0, moves to the next sample, and repeats.
 
-Samples use x0 +/-2.5cm, y0+[1,3]cm, absolute z=402mm, and a fixed
+Samples use x0 +/-2.5cm, y0+[0.3,2]cm, absolute z=402mm, and a fixed
 TCP XYZ Euler angle of [179.7, 1.4, 90.6] degrees.
 Reference p0, insertion, and retreat preserve the hand-taught TCP orientation.
 Moving to a sample changes to the fixed orientation; returning to p0 restores
@@ -165,7 +165,7 @@ done
 [[ -f "$RECORDER_SCRIPT" ]] || die "recorder not found: $RECORDER_SCRIPT"
 
 if [[ -z "$DATASET_ROOT" ]]; then
-    DATASET_ROOT="${PROJECT_ROOT}/datasets/${DATASET_NAME}"
+    DATASET_ROOT="${PROJECT_ROOT}/datasets/ethernet_fine/${DATASET_NAME}"
 fi
 
 cleanup() {
@@ -213,12 +213,12 @@ case "$CAMERA_MODE" in
     front) echo "  cameras=front only (640x480@30Hz)" ;;
     both) echo "  cameras=wrist + front (each 640x480@30Hz)" ;;
 esac
-echo "  sample x=+/-0.025m, y=[+0.010,+0.030]m from p0, z=0.402m"
+echo "  sample x=+/-0.025m, y=[+0.003,+0.020]m from p0, z=0.402m"
 echo "  sampled TCP orientation=XYZ Euler (179.7, 1.4, 90.6) deg"
 if [[ -n "$INSERTION_CM" ]]; then
-    echo "  final=-Z ${INSERTION_CM}cm; non-recorded retreat=+Z ${INSERTION_CM}cm"
+    echo "  final=-Z ${INSERTION_CM}cm, -Y 0.1cm; non-recorded retreat=+Z ${INSERTION_CM}cm, +Y 0.1cm"
 else
-    echo "  final=-Z ${INSERT_MINUS_Z}m; non-recorded retreat=+Z ${INSERT_MINUS_Z}m"
+    echo "  final=-Z ${INSERT_MINUS_Z}m, -Y 0.001m; non-recorded retreat=+Z ${INSERT_MINUS_Z}m, +Y 0.001m"
 fi
 echo "  move_speed=${MOVE_SPEED}m/s, insertion_speed=${INSERTION_SPEED}m/s"
 echo "  pre_episode_sleep=${PRE_EPISODE_SLEEP}s, post_episode_sleep=${POST_EPISODE_SLEEP}s"

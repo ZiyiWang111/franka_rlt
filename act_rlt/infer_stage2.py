@@ -93,7 +93,9 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 
 def resolve_stage2_checkpoint(path: Path) -> Path:
-    path = path.expanduser().resolve()
+    from evo_rlt.artifact_paths import resolve_artifact_path
+
+    path = resolve_artifact_path(path)
     if path.is_dir():
         path = path / "checkpoints/latest.pt"
     if not path.is_file():

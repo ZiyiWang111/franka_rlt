@@ -1,0 +1,32 @@
+{
+  "status": "RUNNING",
+  "job_name": "pi05_mix4_z",
+  "host": "wangziyi@10.0.40.163",
+  "pid": 3001513,
+  "gpus": [
+    1,
+    3
+  ],
+  "per_gpu_batch": 16,
+  "global_batch": 32,
+  "steps": 30000,
+  "chunk_size": 16,
+  "started_at": "2026-10-23T14:06:48.093133",
+  "log": "logs/ethernet_act/pi05_mix4_z_20261023_140648.log",
+  "output_dir": "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_act/pi05_mix4_z",
+  "command": [
+    "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+    "-u",
+    "-m",
+    "torch.distributed.run",
+    "--standalone",
+    "--nproc_per_node=2",
+    "scripts/train_pi05_mix4.py",
+    "--config",
+    "configs/pi05_mix4_z/train_config.json"
+  ],
+  "distributed_timeout_hours": 2,
+  "startup_check": "configs/pi05_mix4_z/startup_check.json",
+  "last_verified_step": 15,
+  "first_batch_verified": true
+}

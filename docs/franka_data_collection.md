@@ -58,7 +58,7 @@ cd /home/embint/wzy/Evo-RLT
 默认数据目录为：
 
 ```text
-/home/embint/wzy/Evo-RLT/datasets/<dataset名字>
+/home/embint/wzy/Evo-RLT/datasets/ethernet_fine/<dataset名字>
 ```
 
 也可以显式指定：
@@ -66,7 +66,7 @@ cd /home/embint/wzy/Evo-RLT
 ```bash
 ./scripts/record_franka_manual_demo.sh \
   --dataset franka_manual_demo_v1 \
-  --root /home/embint/wzy/Evo-RLT/datasets/franka_manual_demo_v1 \
+  --root /home/embint/wzy/Evo-RLT/datasets/ethernet_fine/franka_manual_demo_v1 \
   --fps 15 \
   --episodes 50 \
   --task "Insert the copper screw into the black sleeve."

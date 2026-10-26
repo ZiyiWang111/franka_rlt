@@ -57,7 +57,7 @@ def test_action6_stage1_trains_only_rl_token(state_dim, monkeypatch):
 
 ACT_CHECKPOINT = (
     Path(__file__).resolve().parents[1]
-    / "outputs/act_rlt_001_state7_act/checkpoints/last/pretrained_model"
+    / "outputs/ethernet_act/act_rlt_001_state7_act/checkpoints/last/pretrained_model"
 )
 
 

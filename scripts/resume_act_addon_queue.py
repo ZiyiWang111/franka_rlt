@@ -34,7 +34,7 @@ def main():
             raise RuntimeError('Old checkpoint-stop guard still exists; refusing to resume')
     records = []
     for name in NAMES:
-        output = root / 'outputs' / name
+        output = root / 'outputs' / 'ethernet_act' / name
         validate_checkpoint(output, 10000)
         control = output / 'stop_at_checkpoint.json'
         if control.exists():
@@ -47,14 +47,14 @@ def main():
         records.append(record)
     status = root / 'logs/act_addon_resume_20261019.status.json'
     for record in records:
-        write_json(root / 'outputs' / record['name'] / 'stop_at_checkpoint.json', record)
+        write_json(root / 'outputs' / 'ethernet_act' / record['name'] / 'stop_at_checkpoint.json', record)
     write_json(status, dict(queue_pid=os.getpid(), runs=records))
     for record in records:
         name = record['name']
         while not idle(args.gpus):
             print(f'Waiting for GPUs {args.gpus}: {name}', flush=True)
             time.sleep(10)
-        config = root / 'outputs' / name / 'checkpoints/010000/pretrained_model/train_config.json'
+        config = root / 'outputs' / 'ethernet_act' / name / 'checkpoints/010000/pretrained_model/train_config.json'
         command = [os.sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone',
                    '--nnodes=1', '--nproc_per_node=2', '--module', 'scripts.resume_act_addon_tmp',
                    f'--config_path={config}', '--resume=true', '--batch_size=8']
@@ -67,7 +67,7 @@ def main():
             process = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL,
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
         record.update(status='training_to_30000', active_pid=process.pid, command=command, started_at=time.time())
-        write_json(root / 'outputs' / name / 'stop_at_checkpoint.json', record)
+        write_json(root / 'outputs' / 'ethernet_act' / name / 'stop_at_checkpoint.json', record)
         write_json(status, dict(queue_pid=os.getpid(), runs=records))
         print(f'Started {name}, PID {process.pid}, GPUs {args.gpus}', flush=True)
         exit_code = process.wait()
@@ -75,12 +75,12 @@ def main():
         try:
             if exit_code != 0:
                 raise RuntimeError(f'training exited with code {exit_code}')
-            record['validation'] = validate_checkpoint(root / 'outputs' / name, 30000)
+            record['validation'] = validate_checkpoint(root / 'outputs' / 'ethernet_act' / name, 30000)
         except Exception as error:
             record.update(status='resume_failed', error=str(error))
         else:
             record.update(status='completed', saved_step=30000)
-        write_json(root / 'outputs' / name / 'stop_at_checkpoint.json', record)
+        write_json(root / 'outputs' / 'ethernet_act' / name / 'stop_at_checkpoint.json', record)
         write_json(status, dict(queue_pid=os.getpid(), runs=records))
         print(f'{name}: {record["status"]}', flush=True)
     print('Resume queue finished.', flush=True)

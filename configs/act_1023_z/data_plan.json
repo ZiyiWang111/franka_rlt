@@ -1,0 +1,45 @@
+{
+  "status": "COMPLETE_DOWNLOADED",
+  "source": "/home/embint/wzy/Evo-RLT/datasets/vga_fine/act_dataset_1023",
+  "info_sha256": "2cdb081a4069c8abef27bfa989a16b3eccb9cd3ebbc1ebcead55f531cfe263fe",
+  "source_bytes": 352642701,
+  "total_episodes": 450,
+  "total_frames": 35244,
+  "image_shape": [
+    3,
+    720,
+    1280
+  ],
+  "state": [
+    "ee_z"
+  ],
+  "action": [
+    "dx",
+    "dy",
+    "dz",
+    "drx",
+    "dry",
+    "drz"
+  ],
+  "use_vae": [
+    false,
+    true
+  ],
+  "gpus": [
+    0,
+    2
+  ],
+  "global_batch": 16,
+  "steps": 40000,
+  "chunk_size": 4,
+  "approx_epochs": 18.16,
+  "offline_validation_every": 0,
+  "checkpoint_policy": "final only",
+  "remote_source_present": true,
+  "transfer_destination": "/workspace/wangziyi/projects/franka_rlt/datasets/vga_fine/act_1023_z",
+  "validation": false,
+  "training_episodes": 450,
+  "training_frames": 35244,
+  "transfer_bytes": 341288960,
+  "transfer_sha256": "e0673dd7869edf8b87a76c1565c3ee4c7bfedfd3da686850b03fb3b21692b775"
+}

@@ -18,10 +18,10 @@ PRESETS = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1] / "datasets/act_rlt_001",
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1] / "datasets/ethernet_fine/act_rlt_001",
                         help="Exact dataset directory containing meta/info.json")
     parser.add_argument("--repo-id", help="Defaults to the dataset directory name")
-    parser.add_argument("--output", type=Path, default=Path("runs/act_rlt_001"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/ethernet_act/act_rlt_001"))
     parser.add_argument("--preset", choices=PRESETS, default="standard",
                         help="standard: 20000 steps/batch 8; lowmem: 20000/2; smoke: 100/2")
     parser.add_argument("--steps", type=int, help="Override preset steps")

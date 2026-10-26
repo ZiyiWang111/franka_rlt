@@ -18,7 +18,7 @@ single source of truth shared with the recorder.
 
 Usage:
     evo-rlt-verify-manual-demo --repo_id franka_m1_manual_demo \
-        --root /home/embint/Evo-RLT/datasets
+        --root datasets/ethernet_fine
 """
 from __future__ import annotations
 
@@ -169,7 +169,9 @@ def main() -> None:
         pass  # e.g. when stdout is replaced by a StringIO during tests
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", default="franka_m1_manual_demo")
-    parser.add_argument("--root", default="/home/embint/Evo-RLT/datasets")
+    parser.add_argument(
+        "--root", default=str(Path(__file__).resolve().parents[3] / "datasets/ethernet_fine")
+    )
     parser.add_argument("--tol-pos", type=float, default=1e-3, help="position tolerance in metres")
     parser.add_argument("--tol-rot", type=float, default=1e-2, help="rotation tolerance in radians")
     parser.add_argument(

@@ -1,0 +1,92 @@
+{
+  "dataset": "datasets/ethernet_coarse/act_coarse_1020",
+  "selection": "One frame_index == 0 per episode, sorted by episode_index; maximum neighbour count in L-infinity distance; earliest episode breaks ties.",
+  "total_episodes": 266,
+  "exact_unique_start_states": 266,
+  "neighbour_max_joint_error_rad": 0.005,
+  "neighbour_count": 10,
+  "neighbour_episode_indices": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "representative_episode_index": 8,
+  "joint_names": [
+    "joint_0",
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6"
+  ],
+  "joint_position_rad": [
+    -0.20299243927001953,
+    -0.007241427432745695,
+    0.34285637736320496,
+    -1.4956223964691162,
+    -0.11038023233413696,
+    1.5422743558883667,
+    2.5215561389923096
+  ],
+  "joint_position_deg": [
+    -11.630610043237793,
+    -0.4149032295465831,
+    19.64422340205634,
+    -85.69285106292227,
+    -6.324321454419511,
+    88.36581144366092,
+    144.47452456956253
+  ],
+  "measured_tcp_xyz_rotvec": [
+    0.553268551826477,
+    0.054814472794532776,
+    0.5594109892845154,
+    2.165799379348755,
+    -2.235039710998535,
+    0.19082292914390564
+  ],
+  "neighbour_joint_range_rad": [
+    0.006595700979232788,
+    4.765903577208519e-05,
+    0.006575077772140503,
+    2.658367156982422e-05,
+    5.447119474411011e-05,
+    2.396106719970703e-05,
+    3.600120544433594e-05
+  ],
+  "sensitivity": [
+    {
+      "tolerance_rad": 0.0005,
+      "max_neighbour_count": 2,
+      "representative_episode_index": 178
+    },
+    {
+      "tolerance_rad": 0.001,
+      "max_neighbour_count": 3,
+      "representative_episode_index": 1
+    },
+    {
+      "tolerance_rad": 0.002,
+      "max_neighbour_count": 5,
+      "representative_episode_index": 2
+    },
+    {
+      "tolerance_rad": 0.005,
+      "max_neighbour_count": 10,
+      "representative_episode_index": 8
+    },
+    {
+      "tolerance_rad": 0.01,
+      "max_neighbour_count": 15,
+      "representative_episode_index": 5
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "loss": 76.48804473876953,
+  "reconstruction_l1": 0.4985899031162262,
+  "kl": 7.598945617675781,
+  "latent_shape": [
+    1,
+    32
+  ],
+  "reparameterization_grad_mu": 0.00018282353994436562,
+  "reparameterization_grad_logvar": 6.759328243788332e-05,
+  "gradient_norms": {
+    "vae_encoder_action_input_proj": 32.0828857421875,
+    "vae_encoder_robot_state_input_proj": 7.682333946228027,
+    "vae_encoder_latent_output_proj": 1012.3031005859375,
+    "encoder_latent_input_proj": 0.002022096887230873
+  },
+  "padded_actions_ignored_by_posterior": true,
+  "inference_ignores_actions": true,
+  "inference_posterior_encoder_calls": 0,
+  "inference_latent": "all zeros",
+  "checks_passed": true,
+  "implementation_sha256": "69301fff11cbb8f4ba7bfe473a55ba488c3d2f89c25ecdfe512347a93b4ad04f",
+  "input_shape": [
+    1,
+    3,
+    720,
+    1280
+  ],
+  "state_shape": [
+    1,
+    1
+  ],
+  "valid_future_actions": 2
+}

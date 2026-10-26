@@ -95,7 +95,7 @@ def main():
     root = args.root.resolve()
     runs = json.loads(args.pause_record.read_text())['runs']
     for run in runs:
-        run['output'] = str(root / 'outputs' / run['name'])
+        run['output'] = str(root / 'outputs' / 'ethernet_act' / run['name'])
         run['identities'] = {}
         for pid in [run['parent'], *run['ranks']]:
             command = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode()

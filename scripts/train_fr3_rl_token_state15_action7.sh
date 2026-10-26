@@ -8,14 +8,14 @@ TRAIN_STEPS="${TRAIN_STEPS:-10000}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 SAVE_FREQUENCY="${SAVE_FREQUENCY:-2000}"
 LOG_FREQUENCY="${LOG_FREQUENCY:-50}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/fr3_rl_token_state15_action7_bs${TRAIN_BATCH_SIZE}_${TRAIN_STEPS}steps}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/ethernet_token/fr3_rl_token_state15_action7_bs${TRAIN_BATCH_SIZE}_${TRAIN_STEPS}steps}"
 
 if [[ -n "${RUN_LOG:-}" ]]; then
   exec > >(tee -a "${RUN_LOG}") 2>&1
 fi
 
-DATASET_ROOT=${PROJECT_ROOT}/datasets/franka_m1_manual_demo_state15_action7
-VLA_CHECKPOINT=${PROJECT_ROOT}/outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k/checkpoints/030000/pretrained_model
+DATASET_ROOT=${PROJECT_ROOT}/datasets/ethernet_fine/franka_m1_manual_demo_state15_action7
+VLA_CHECKPOINT=${PROJECT_ROOT}/outputs/ethernet_act/fr3_pi05_sft_60ep_state15_action7_bs4_30k/checkpoints/030000/pretrained_model
 TOKENIZER_SNAPSHOT=/workspace/wangziyi/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c
 
 for required_path in \

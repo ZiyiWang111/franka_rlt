@@ -7,11 +7,12 @@ import numpy as np
 from evo_franka.geometry import euler_xyz_deg_to_rotvec
 
 
-DEFAULT_INSERT_MINUS_Z_M = 0.01
+DEFAULT_INSERT_MINUS_Z_M = 0.004
+INSERT_MINUS_Y_M = 0.001
 
 SAMPLE_X_HALF_RANGE_M = 0.025
-SAMPLE_Y_MIN_OFFSET_M = 0.01
-SAMPLE_Y_MAX_OFFSET_M = 0.03
+SAMPLE_Y_MIN_OFFSET_M = 0.003
+SAMPLE_Y_MAX_OFFSET_M = 0.02
 SAMPLE_Z_M = 0.402
 SAMPLE_EULER_XYZ_DEG = (179.7, 1.4, 90.6)
 SAMPLE_ROTATION_VECTOR = tuple(euler_xyz_deg_to_rotvec(SAMPLE_EULER_XYZ_DEG))
@@ -41,9 +42,10 @@ def sample_z_insertion_pose(
 
 
 def insertion_pose_minus_z(reference: list[float], minus_z: float) -> list[float]:
-    """Return the fixed final pose, offset along robot-base -Z."""
+    """Return the final pose with -Z depth and a fixed 1 mm base -Y offset."""
     if len(reference) != 6 or not np.isfinite(reference).all():
         raise ValueError(f"reference must be a finite 6D TCP pose, got {reference}")
     target = reference.copy()
+    target[1] -= INSERT_MINUS_Y_M
     target[2] -= minus_z
     return target

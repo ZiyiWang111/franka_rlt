@@ -14,7 +14,7 @@ from scripts.fr3_remote_robot_client import (
 )
 
 TASK = "insert the ethernet cable into the hole"
-DEFAULT_CHECKPOINT = "/workspace/wangziyi/projects/franka_rlt/outputs/pi05_dataset_928_state7_action6/checkpoints/030000/pretrained_model"
+DEFAULT_CHECKPOINT = "/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_act/pi05_dataset_928_state7_action6/checkpoints/030000/pretrained_model"
 
 
 def parse_args():

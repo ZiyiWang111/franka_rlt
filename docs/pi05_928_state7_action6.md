@@ -1,6 +1,6 @@
 # π0.5：七维关节状态、六维动作、固定夹爪
 
-数据集：`datasets/pi05_dataset_928_state7_action6`，由 `datasets/act_dataset_928_state7` 独立复制生成。
+数据集：`datasets/ethernet_fine/pi05_dataset_928_state7_action6`，由 `datasets/ethernet_fine/act_dataset_928_state7` 独立复制生成。
 任务文本统一为 `insert the ethernet cable into the hole`。
 
 - 输入：当前 wrist RGB、`joint_0` 至 `joint_6`、任务文本。使用标准 PI05 state tokenizer，保留关节状态。
@@ -12,7 +12,7 @@
 
 ```bash
 python scripts/prepare_pi05_franka.py \
-  datasets/act_dataset_928_state7 datasets/pi05_dataset_928_state7_action6
+  datasets/ethernet_fine/act_dataset_928_state7 datasets/ethernet_fine/pi05_dataset_928_state7_action6
 ```
 
 先检查启动命令（此操作不加载模型、不训练）：
@@ -37,7 +37,7 @@ python scripts/train_pi05_franka.py \
 
 ```bash
 PYTHONPATH=src python -m evo_rlt.cli.train_pi05_masked \
-  --config_path=outputs/pi05_dataset_928_state7_action6/checkpoints/last/pretrained_model/train_config.json \
+  --config_path=outputs/ethernet_act/pi05_dataset_928_state7_action6/checkpoints/last/pretrained_model/train_config.json \
   --resume=true
 ```
 
@@ -47,7 +47,7 @@ PYTHONPATH=src python -m evo_rlt.cli.train_pi05_masked \
 
 ```bash
 PYTHONPATH=src:. CUDA_VISIBLE_DEVICES=2 python scripts/pi05_state7_inference_server.py \
-  --checkpoint outputs/pi05_dataset_928_state7_action6/checkpoints/030000/pretrained_model
+  --checkpoint outputs/ethernet_act/pi05_dataset_928_state7_action6/checkpoints/030000/pretrained_model
 ```
 
 机器人本机先只验证网络，再观察 shadow 推理；网络检查不会初始化硬件，shadow 不发送动作：

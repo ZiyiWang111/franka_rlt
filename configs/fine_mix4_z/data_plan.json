@@ -1,0 +1,209 @@
+{
+  "status": "RUNNING",
+  "model_name": "fine_mix4_z",
+  "sources": [
+    {
+      "name": "act_dataset_928",
+      "root": "/home/embint/wzy/Evo-RLT/datasets/ethernet_fine/act_dataset_928",
+      "info_sha256": "f8100f5d62a158f60c17bb74719ee4092de7089fae4949f5d6b4d36392dd1247",
+      "episodes": 470,
+      "frames": 45184,
+      "fps": 30,
+      "train_episodes": 423,
+      "validation_episodes": 47,
+      "train_frames": 40629,
+      "validation_frames": 4555
+    },
+    {
+      "name": "act_1010",
+      "root": "/home/embint/wzy/Evo-RLT/datasets/ethernet_fine/act_1010",
+      "info_sha256": "05e044cdc81a86728fac48acc3281e0b7b98be1d289a3f73f0cc17aae0b663cd",
+      "episodes": 450,
+      "frames": 43977,
+      "fps": 30,
+      "train_episodes": 405,
+      "validation_episodes": 45,
+      "train_frames": 39589,
+      "validation_frames": 4388
+    },
+    {
+      "name": "act_addon",
+      "root": "/home/embint/wzy/Evo-RLT/datasets/ethernet_fine/act_addon",
+      "info_sha256": "68b5c8562c3b99a0683e2707340e20d14daa625b62159137894cee6d9993f472",
+      "episodes": 273,
+      "frames": 26355,
+      "fps": 30,
+      "train_episodes": 246,
+      "validation_episodes": 27,
+      "train_frames": 23782,
+      "validation_frames": 2573
+    },
+    {
+      "name": "act_dataset_daylight",
+      "root": "/home/embint/wzy/Evo-RLT/datasets/ethernet_fine/act_dataset_daylight",
+      "info_sha256": "0b0b43b3a8a65e57a35d6f63372b665a3e3bf6fe7c5ded78d30f7efa5d7da0d4",
+      "episodes": 607,
+      "frames": 51465,
+      "fps": 30,
+      "train_episodes": 546,
+      "validation_episodes": 61,
+      "train_frames": 46282,
+      "validation_frames": 5183
+    }
+  ],
+  "audit": [
+    {
+      "name": "act_dataset_928",
+      "episodes": 470,
+      "frames": 45184,
+      "fps": 30,
+      "z_min": 0.3678969144821167,
+      "z_max": 0.40202954411506653,
+      "translation_p99_m": 0.0008851696038618684,
+      "rotation_p99_rad": 0.01202535443007946,
+      "delta_position_max_error": 0.0,
+      "delta_rotation_max_error": 2.2937676903202355e-07,
+      "dt_range_s": [
+        0.03333330154418945,
+        0.033333539962768555
+      ],
+      "duplicate_episodes": []
+    },
+    {
+      "name": "act_1010",
+      "episodes": 450,
+      "frames": 43977,
+      "fps": 30,
+      "z_min": 0.3666989207267761,
+      "z_max": 0.4020739495754242,
+      "translation_p99_m": 0.000902847561519593,
+      "rotation_p99_rad": 0.011289327405393124,
+      "delta_position_max_error": 0.0,
+      "delta_rotation_max_error": 2.4101455092464695e-07,
+      "dt_range_s": [
+        0.03333330154418945,
+        0.033333539962768555
+      ],
+      "duplicate_episodes": []
+    },
+    {
+      "name": "act_addon",
+      "episodes": 273,
+      "frames": 26355,
+      "fps": 30,
+      "z_min": 0.36641594767570496,
+      "z_max": 0.40213024616241455,
+      "translation_p99_m": 0.0008927967282943428,
+      "rotation_p99_rad": 0.014455702155828476,
+      "delta_position_max_error": 0.0,
+      "delta_rotation_max_error": 2.2811383487720636e-07,
+      "dt_range_s": [
+        0.03333330154418945,
+        0.033333539962768555
+      ],
+      "duplicate_episodes": []
+    },
+    {
+      "name": "act_dataset_daylight",
+      "episodes": 607,
+      "frames": 51465,
+      "fps": 30,
+      "z_min": 0.36880043148994446,
+      "z_max": 0.40215161442756653,
+      "translation_p99_m": 0.0009000085992738605,
+      "rotation_p99_rad": 0.014470268972218037,
+      "delta_position_max_error": 0.0,
+      "delta_rotation_max_error": 2.396273180454361e-07,
+      "dt_range_s": [
+        0.03333330154418945,
+        0.033333539962768555
+      ],
+      "duplicate_episodes": []
+    }
+  ],
+  "merge_order": [
+    "act_dataset_928",
+    "act_1010",
+    "act_addon",
+    "act_dataset_daylight"
+  ],
+  "episodes": 1800,
+  "frames": 166981,
+  "fps": 30,
+  "input": {
+    "rgb": "wrist native 1280x720",
+    "state": [
+      "ee_z"
+    ],
+    "state_units": "measured absolute TCP Z in base frame, metres"
+  },
+  "output": {
+    "names": [
+      "dx",
+      "dy",
+      "dz",
+      "drx",
+      "dry",
+      "drz"
+    ],
+    "translation": "base-frame metres per 1/30-second frame",
+    "rotation": "body-frame rotation vector radians per frame"
+  },
+  "gripper": "excluded",
+  "sampling": "uniform over merged training frames; no source oversampling",
+  "videos": "preserve original bitstreams and episode timestamps, no resizing/re-encoding",
+  "normalization": "compute state/action statistics only from training episodes; ImageNet visual statistics",
+  "split": {
+    "train_episodes": 1620,
+    "validation_episodes": 180,
+    "train_frames": 150282,
+    "validation_frames": 16699,
+    "validation": "final offline held-out action prediction metrics, per source, no image augmentation"
+  },
+  "distributed": {
+    "launcher": "torchrun --standalone --nproc_per_node=2",
+    "gpus": [
+      0,
+      1
+    ],
+    "gpu_selection": "recheck idle GPUs immediately before launch",
+    "world_size": 2,
+    "per_gpu_batch_size": 16,
+    "global_batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "steps_meaning": "100000 synchronized optimizer updates, not divided by number of GPUs"
+  },
+  "checkpoint_policy": "final only at step 100000",
+  "approx_training_passes": 21.293301925712992,
+  "initialization": "fresh ACT, ImageNet ResNet18 backbone; no ACT checkpoint resume",
+  "hold_tail": "no synthetic tail appended",
+  "training_runs": {
+    "fine_mix4_z": {
+      "gpus": [
+        0,
+        1
+      ],
+      "per_gpu_batch": 16,
+      "global_batch": 32,
+      "use_vae": false,
+      "status": "COMPLETE"
+    },
+    "fine_mix4_z_vae": {
+      "gpus": [
+        2
+      ],
+      "per_gpu_batch": 32,
+      "global_batch": 32,
+      "use_vae": true
+    },
+    "fine_mix4_z_token": {
+      "gpus": [
+        0
+      ],
+      "batch_size": 8,
+      "steps": 10000,
+      "status": "RUNNING",
+      "frozen_act": "fine_mix4_z"
+    }
+  }
+}

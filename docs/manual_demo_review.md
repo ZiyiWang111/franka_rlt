@@ -1,86 +1,17 @@
-# Review and remove manual-demo episodes
+# 删除数据集末尾的 episode
 
-With no arguments, `evo-rlt-review-manual-demo` opens the last episode in
-`datasets/act_rlt_001`. Close the viewer and answer `y` to delete it, `n` to
-keep it, or `q` to exit. After `y` or `n`, the tool opens the preceding episode
-and continues toward episode 0. Each `y` deletion is applied immediately.
+在项目根目录运行：
 
 ```bash
-evo-rlt-review-manual-demo
+PYTHONPATH=src /home/embint/miniconda3/envs/evo-rlt/bin/python -m evo_rlt.cli.review_manual_demo
 ```
 
-Use `--root` for another local dataset. `--repo-id` defaults to the dataset
-directory name:
+已安装项目命令时，也可以运行 `evo-rlt-review-manual-demo`。
 
-```bash
-evo-rlt-review-manual-demo --root /path/to/datasets/another_dataset
-```
+1. 从项目的 `datasets/` 目录开始，输入目录编号逐层选择，直到找到包含 `meta/info.json` 的具体 LeRobot 数据集。
+2. 输入正整数 N，立即删除最后 N 个 episode。例如有 30 个 episode，输入 3 会删除索引 27、28、29，保留 0–26。
+3. 完成后脚本退出。目录选择时可输入 `b` 返回上一级；输入 `q` 或按 Ctrl+C 退出。
 
-The optional suspicious scanner flags episodes that are static, freeze at the
-end, stop far from the dominant endpoint, or do not complete a pick sequence.
-
-Do not run the tool while the recorder is active. It refuses to continue when
-it sees an incomplete parquet file or detects that `meta/info.json` changed.
-
-## Installation
-
-After adding or updating this checkout's console scripts:
-
-```bash
-conda activate evo-rlt
-cd /home/embint/Evo-RLT
-pip install -e .
-```
-
-Without reinstalling, invoke the module directly with
-`PYTHONPATH=src python -m evo_rlt.cli.review_manual_demo`.
-
-## Scan without opening the viewer
-
-```bash
-evo-rlt-review-manual-demo \
-  --repo-id embint/franka_stage1_initial \
-  --root /home/embint/Evo-RLT/datasets/franka_stage1_initial \
-  --require-pick-sequence \
-  --scan-only
-```
-
-## Interactive review and in-place filtering
-
-```bash
-evo-rlt-review-manual-demo \
-  --repo-id embint/franka_stage1_initial \
-  --root /home/embint/Evo-RLT/datasets/franka_stage1_initial \
-  --suspicious-only \
-  --require-pick-sequence
-```
-
-For every candidate, the tool runs an equivalent of:
-
-```bash
-lerobot-dataset-viz \
-  --repo-id embint/franka_stage1_initial \
-  --root /home/embint/Evo-RLT/datasets/franka_stage1_initial \
-  --episode-index EPISODE_INDEX \
-  --mode local
-```
-
-Close the viewer and answer `y` to exclude the episode, `n` to keep it, or
-`q` to stop without modifying anything. Confirmed exclusions are applied in
-one batch after review so that videos are only rebuilt once. In-place filtering
-preserves the original directory as
-`franka_stage1_initial_backup_YYYYMMDD_HHMMSS`.
-
-To keep the source at its original path and write a filtered copy instead:
-
-```bash
-evo-rlt-review-manual-demo \
-  --repo-id embint/franka_stage1_initial \
-  --root /home/embint/Evo-RLT/datasets/franka_stage1_initial \
-  --require-pick-sequence \
-  --output-root /home/embint/Evo-RLT/datasets/franka_stage1_initial_filtered
-```
-
-Run `--help` to tune motion, static-tail, endpoint-distance, and post-grasp
-thresholds. Omit `--require-pick-sequence` for tasks that do not require a
-gripper pick followed by transport.
+必须至少保留 1 个 episode（LeRobot 编辑工具的限制）。请先停止向该数据集写入的采集程序。
+删除使用 LeRobot 工具重建数据、视频和元数据，验证 episode 数量后替换原目录，成功后清理临时备份。
+该脚本只提供目录选择和末尾批量删除，不再包含可视化、异常扫描或逐条审查功能。

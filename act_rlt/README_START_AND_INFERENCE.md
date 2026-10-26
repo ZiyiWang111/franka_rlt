@@ -10,11 +10,11 @@
 
 - 固定起点高度：`SAMPLE_Z_M = 0.402`，是绝对 Z，不是相对参考点抬高 0.402 m。
 - 固定起点姿态：内禀 XYZ 欧拉角 `(179.7°, 1.4°, 90.6°)`，转换为旋转向量后发送给机器人。
-- 数采默认插入距离：沿基坐标系 −Z 前进 0.01 m。
+- 数采默认插入距离：沿基坐标系 −Z 前进 0.004 m（0.4 cm）。
 
 | 路径 | 启动时确定的参考 | episode 起点 X/Y | 起点 Z / 姿态 |
 | --- | --- | --- | --- |
-| ACT 数采 | 手动示教完整参考位姿 p0 | X=p0.X±2 cm；Y=p0.Y+[1.5, 2.5] cm | Z=0.402 m；固定采样姿态 |
+| ACT 数采 | 手动示教完整参考位姿 p0 | X=p0.X±2.5 cm；Y=p0.Y+[0.3, 2] cm | Z=0.402 m；固定采样姿态 |
 | ACT infer | 按 Enter 时的实测 TCP X/Y 中心 | X/Y 各在中心 ±1 cm 内均匀采样 | Z=0.402 m；固定采样姿态 |
 | train Stage 2，Z 插入模式 | 启动采集的 p1 参考位姿 | 默认围绕首次 reference 的 X/Y 随机采样，范围可用 =/- 调整 | Z=0.402 m；固定采样姿态 |
 | infer Stage 2，Z 插入模式 | 默认恢复 checkpoint 中首次训练采集的 p1 参考位姿；无记录时手动采集 | 与训练共用随机 XY reset；范围可用 =/- 调整 | Z=0.402 m；固定采样姿态 |
@@ -30,12 +30,12 @@
 
 1. 手动引导机器人到参考点 p0，按 Enter 保存完整 TCP 位姿，包括位置和姿态。
 2. 每个 episode 均匀采样一个起点：
-   - `X = p0.X + U(-0.02, 0.02)`。
-   - `Y = p0.Y + U(0.015, 0.025)`。
+   - `X = p0.X + U(-0.025, 0.025)`。
+   - `Y = p0.Y + U(0.003, 0.02)`。
    - `Z = 0.402`。
    - 使用固定采样姿态。
 3. 移动到起点，默认等待 1 s，然后开始录制。
-4. 录制两段运动：**采样起点 → 完整 p0 位姿 → p0 沿 −Z 移动 1 cm 的终点**。
+4. 录制两段运动：**采样起点 → 完整 p0 位姿 → 相对 p0 沿基坐标系 −Z 移动 0.4 cm、同时沿 −Y 移动 0.1 cm 的终点**；插入时姿态保持 p0 的值。
 5. 成功完成录制后保存 episode；默认等待 1 s，再回到 p0，继续下一次采样。
 
 移动到起点和保存后的回退不属于示范轨迹。由于起点使用固定姿态，而 p0 保留示教姿态，第一段运动可能同时包含平移和旋转。
@@ -48,7 +48,7 @@
 
 ```bash
 python -m act_rlt.data_collection.record_sample_space \
-  --dataset act_demo --root datasets/act_demo \
+  --dataset act_demo --root datasets/ethernet_fine/act_demo \
   --wrist-only --fps 30 --episodes 10
 ```
 
@@ -68,14 +68,14 @@ infer 根据 checkpoint 配置选择输入：无 `observation.state` 时仅输�
 
 ```bash
 # 纯相机；--dry-run 仍会连接机器人与相机，但不发送运动指令
-python -m act_rlt.infer --checkpoint outputs/act_dataset_928_camera_only_action6_act --dry-run --dry-run-episodes 1
+python -m act_rlt.infer --checkpoint outputs/ethernet_act/act_dataset_928_camera_only_action6_act --dry-run --dry-run-episodes 1
 
 # 相机 + 六维 wrench
-python -m act_rlt.infer --checkpoint outputs/act_1010_rgb_wrench_action6_act --dry-run --dry-run-episodes 1
+python -m act_rlt.infer --checkpoint outputs/ethernet_act/act_1010_rgb_wrench_action6_act --dry-run --dry-run-episodes 1
 
 # 相机 + 当前 TCP 绝对 Z；自动加载本机 last 指向的 20k 模型
 python -m act_rlt.infer \
-  --checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
+  --checkpoint outputs/ethernet_act/act_dataset_928_addon_rgb_z_action6_act \
   --no-temporal-ensemble --n-action-steps 4 --fps 30 --duration 10
 ```
 
@@ -113,7 +113,7 @@ episode 结束后：
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_dataset_928_state7_act \
+  --checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
   --fps 30 --duration 10
 ```
 
@@ -125,7 +125,7 @@ python -m act_rlt.infer \
 
 ```bash
 python -m act_rlt.infer \
-  --checkpoint outputs/act_dataset_928_state7_act \
+  --checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
   --fps 30 --duration 10
 ```
 
@@ -143,9 +143,9 @@ infer 过程中按 **`x` 或 `Esc`** 可停止本轮并标记 fail，无需按 E
 
 ```bash
 python -m act_rlt.train_rl_token \
-  --root datasets/act_dataset_928_addon_rgb_z_action6 \
-  --act-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
-  --output outputs/act_dataset_928_addon_rgb_z_action6_stage1_pos
+  --root datasets/ethernet_fine/act_dataset_928_addon_rgb_z_action6 \
+  --act-checkpoint outputs/ethernet_act/act_dataset_928_addon_rgb_z_action6_act \
+  --output outputs/ethernet_token/act_dataset_928_addon_rgb_z_action6_stage1_pos
 ```
 
 默认训练 10,000 步，batch size 8，每 2,000 步保存。断点续训使用 `--output <原输出目录> --resume`，恢复保存的训练配置、优化器和调度器状态。新训练和续训都会启用一维 Z 的数据读取兼容。
@@ -186,19 +186,19 @@ ACT 和 Stage 1 RL Token 编码器被冻结并保持 eval，在线更新 Actor �
 
 每轮结束后，在下一轮开始前的起点等待菜单按 **`p`**（无需回车），保存当前完整训练状态，并继续留在菜单；按 Enter 继续原训练。此按键在训练等待界面可用，活动 episode 中不执行快照保存。
 
-快照创建在原 output 的同级目录，名字为 `<原output名字>_step<累计env_steps>`。例如原 output 是 `outputs/stage2_new_run`、当前累计 1234 步，则创建：
+快照创建在原 output 的同级目录，名字为 `<原output名字>_step<累计env_steps>`。例如原 output 是 `outputs/ethernet_rlt/stage2_new_run`、当前累计 1234 步，则创建：
 
 ```text
-outputs/stage2_new_run_step1234/
+outputs/ethernet_rlt/stage2_new_run_step1234/
   checkpoints/latest.pt
   config.json
   startup_reference.json   # Z 插入模式
   snapshot.json
 ```
 
-包含 Actor/Critic、目标网络、优化器、replay、训练进度、随机状态、reference 和当前 XY reset 范围。保存通过临时目录完成后再发布，同一步数已存在的快照不会覆盖。原训练仍继续写 `outputs/stage2_new_run`，后续自动保存不会覆盖这个并列快照。
+包含 Actor/Critic、目标网络、优化器、replay、训练进度、随机状态、reference 和当前 XY reset 范围。保存通过临时目录完成后再发布，同一步数已存在的快照不会覆盖。原训练仍继续写 `outputs/ethernet_rlt/stage2_new_run`，后续自动保存不会覆盖这个并列快照。
 
-- **Resume**：在原训练命令中将 `--output` 改为 `outputs/stage2_new_run_step1234`，添加现有 `--resume`，其他训练参数保持兼容；无需 `--resume-from`。这会在快照目录中继续训练，其 `latest.pt` 随后按原规则更新。
+- **Resume**：在原训练命令中将 `--output` 改为 `outputs/ethernet_rlt/stage2_new_run_step1234`，添加现有 `--resume`，其他训练参数保持兼容；无需 `--resume-from`。这会在快照目录中继续训练，其 `latest.pt` 随后按原规则更新。
 - **Infer**：将 `--checkpoint` 指向该快照目录；Actor 必须已经初始化，warmup 阶段的未初始化快照可 resume，不能直接 infer。
 - Resume 和 infer 恢复保存的 XY reset 范围；无此字段的旧 checkpoint 使用默认 ±1 cm。
 
@@ -207,7 +207,7 @@ outputs/stage2_new_run_step1234/
 ```text
 观测 → ACT preprocessor → 完整 ACT
                           ├─ 参考 action chunk
-                          └─ encoder hidden + position → RL Token
+                          └─ encoder hidden → RL Token
 RL Token + 归一化关节状态 + 参考 chunk → Actor
   → ACT postprocessor → 物理限幅 → 固定 chunk 执行
   → 下一观测 → replay transition → Actor/Critic 更新
@@ -227,9 +227,9 @@ RL Token + 归一化关节状态 + 参考 chunk → Actor
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_dataset_928_state7_stage1_pos \
-  --act-checkpoint outputs/act_dataset_928_state7_act \
-  --output outputs/stage2_new_run \
+  --stage1-checkpoint outputs/ethernet_token/act_dataset_928_state7_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
+  --output outputs/ethernet_rlt/stage2_new_run \
   --z-insertion-mode --fps 30 --allow-motion
 ```
 
@@ -260,7 +260,7 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 
 ```bash
 python -m act_rlt.infer_stage2 \
-  --checkpoint outputs/stage2_new_run \
+  --checkpoint outputs/ethernet_rlt/stage2_new_run \
   --z-insertion-mode --fps 30 --episodes 10 \
   --episode-time 5 --allow-motion
 ```
@@ -277,9 +277,9 @@ Stage 2 根据 ACT checkpoint 自动选择输入：纯相机为 768 维 RL Token
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_stage1_pos \
-  --act-checkpoint outputs/act_dataset_928_addon_rgb_z_action6_act \
-  --output outputs/rlt_928_addon_rgb_z_action6 \
+  --stage1-checkpoint outputs/ethernet_token/act_dataset_928_addon_rgb_z_action6_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_dataset_928_addon_rgb_z_action6_act \
+  --output outputs/ethernet_rlt/rlt_928_addon_rgb_z_action6 \
   --z-insertion-mode --randomize-reset-xy --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```
@@ -290,9 +290,9 @@ python -m act_rlt.train_stage2 \
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_dataset_928_camera_only_action6_stage1_pos \
-  --act-checkpoint outputs/act_dataset_928_camera_only_action6_act \
-  --output outputs/rlt_camera_only_action6 \
+  --stage1-checkpoint outputs/ethernet_token/act_dataset_928_camera_only_action6_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_dataset_928_camera_only_action6_act \
+  --output outputs/ethernet_rlt/rlt_camera_only_action6 \
   --z-insertion-mode --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```
@@ -301,9 +301,9 @@ python -m act_rlt.train_stage2 \
 
 ```bash
 python -m act_rlt.train_stage2 \
-  --stage1-checkpoint outputs/act_1010_rgb_wrench_action6_stage1_pos \
-  --act-checkpoint outputs/act_1010_rgb_wrench_action6_act \
-  --output outputs/rlt_rgb_wrench_action6 \
+  --stage1-checkpoint outputs/ethernet_token/act_1010_rgb_wrench_action6_stage1_pos \
+  --act-checkpoint outputs/ethernet_act/act_1010_rgb_wrench_action6_act \
+  --output outputs/ethernet_rlt/rlt_rgb_wrench_action6 \
   --z-insertion-mode --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```

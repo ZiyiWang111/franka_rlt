@@ -6,10 +6,10 @@ PYTHON_BIN="${PYTHON_BIN:-/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python
 BASE_MODEL="${BASE_MODEL:-/workspace/wangziyi/models/pi05_base}"
 GPU_INDEX="${GPU_INDEX:-2}"
 cd "$PROJECT_ROOT"
-test -f datasets/fa1_s15/meta/info.json
+test -f datasets/ethernet_fine/fa1_s15/meta/info.json
 test -f "$BASE_MODEL/model.safetensors"
-if [[ -e outputs/fa1_rgb ]]; then
-  echo "Output already exists: outputs/fa1_rgb" >&2
+if [[ -e outputs/ethernet_act/fa1_rgb ]]; then
+  echo "Output already exists: outputs/ethernet_act/fa1_rgb" >&2
   exit 1
 fi
 IFS=',' read -r used util < <(nvidia-smi --id="$GPU_INDEX" --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits)
@@ -26,7 +26,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 exec "$PYTHON_BIN" -m evo_rlt.cli.train_pi05_rgb \
   --discrete-state-input=false \
   --dataset.repo_id=fa1_s15 \
-  --dataset.root="$PROJECT_ROOT/datasets/fa1_s15" \
+  --dataset.root="$PROJECT_ROOT/datasets/ethernet_fine/fa1_s15" \
   --policy.path="$BASE_MODEL" \
   --policy.device=cuda --policy.dtype=bfloat16 \
   --policy.push_to_hub=false --policy.input_features=null \
@@ -36,4 +36,4 @@ exec "$PYTHON_BIN" -m evo_rlt.cli.train_pi05_rgb \
   --policy.gradient_checkpointing=true \
   --batch_size=16 --steps=30000 --save_freq=5000 --log_freq=50 \
   --eval_freq=0 --tolerance_s=0.04 --seed=1000 \
-  --output_dir="$PROJECT_ROOT/outputs/fa1_rgb" --job_name=fa1_rgb
+  --output_dir="$PROJECT_ROOT/outputs/ethernet_act/fa1_rgb" --job_name=fa1_rgb

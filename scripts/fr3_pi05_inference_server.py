@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
-    / "outputs/fr3_pi05_sft_60ep_state15_action7_bs4_30k"
+    / "outputs/ethernet_act/fr3_pi05_sft_60ep_state15_action7_bs4_30k"
     / "checkpoints/030000/pretrained_model"
 )
 os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/fr3_pi05_remote_hf_cache")

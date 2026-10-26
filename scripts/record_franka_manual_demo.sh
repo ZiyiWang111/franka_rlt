@@ -34,7 +34,7 @@ Usage: scripts/record_franka_manual_demo.sh [options] [-- backend-options...]
 
 Basic options:
   --dataset NAME          Dataset repo/name (default: franka_manual_demo)
-  --root PATH             Local dataset root (default: PROJECT/datasets/NAME)
+  --root PATH             Local dataset root (default: PROJECT/datasets/ethernet_fine/NAME)
   --fps HZ                Collection frequency, integer (default: 30)
   --episodes N            Number of episodes to save (default: 10)
   --episode-time SEC      Maximum duration of one episode (default: 3000)
@@ -99,7 +99,7 @@ done
 [[ -f "$CONTROL_SERVER_SCRIPT" ]] || die "control-server launcher not found: $CONTROL_SERVER_SCRIPT"
 
 if [[ -z "$DATASET_ROOT" ]]; then
-    DATASET_ROOT="${PROJECT_ROOT}/datasets/${DATASET_NAME}"
+    DATASET_ROOT="${PROJECT_ROOT}/datasets/ethernet_fine/${DATASET_NAME}"
 fi
 
 cleanup() {

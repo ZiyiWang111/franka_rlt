@@ -13,7 +13,7 @@ cd /workspace/wangziyi
 exec /workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python \
   -m lerobot.scripts.lerobot_train \
   --dataset.repo_id=franka_m1_manual_demo_state15 \
-  --dataset.root=/workspace/wangziyi/projects/franka_rlt/datasets/franka_m1_manual_demo_state15 \
+  --dataset.root=/workspace/wangziyi/projects/franka_rlt/datasets/ethernet_fine/franka_m1_manual_demo_state15 \
   --policy.path=/workspace/wangziyi/models/pi05_base \
   --policy.device=cuda \
   --policy.dtype=bfloat16 \
@@ -24,5 +24,5 @@ exec /workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python \
   --save_freq=5000 \
   --eval_freq=0 \
   --tolerance_s=0.04 \
-  --output_dir=/workspace/wangziyi/projects/franka_rlt/outputs/fr3_pi05_sft_60ep_state15_bs4_30k \
+  --output_dir=/workspace/wangziyi/projects/franka_rlt/outputs/ethernet_act/fr3_pi05_sft_60ep_state15_bs4_30k \
   --job_name=fr3_pi05_sft_60ep_state15_bs4_30k
