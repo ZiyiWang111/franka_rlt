@@ -2,7 +2,7 @@
 """Run ACT-RLT Stage-2 online training on the local FR3.
 
 Critical-phase episodes begin at automatically sampled reset poses. Optional
-keyboard takeover switches control only after a complete action chunk.
+SpaceMouse takeover switches control only after a complete action chunk.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import termios
 import tempfile
 import time
 import tty
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from act_rlt.data_collection.sampling import (
     SAMPLE_ROTATION_VECTOR,
     SAMPLE_Z_M,
 )
+from act_rlt.exploration_bias import DOWNWARD_BIAS_STEP_M, EpisodeDownwardBias, EpisodeExplorationBias
 from act_rlt.infer import (
     bounded_action,
     checkpoint_camera_shapes,
@@ -37,6 +39,7 @@ from act_rlt.infer import (
     robot_camera_kwargs,
 )
 from act_rlt.stage2 import (
+    strip_removed_force_feedback_config,
     ACTStage2Config,
     ACTStage2Policy,
     ChunkExecution,
@@ -57,7 +60,7 @@ RESET_RETREAT_Z_M = 0.01
 RESET_MOVE_SPEED_M_S = 0.02
 RESET_XY_MARGIN_M = 0.02
 STARTUP_WORKSPACE_HALF_RANGE_M = 0.05
-Z_SAMPLE_XY_HALF_RANGE_M = 0.01
+Z_SAMPLE_XY_HALF_RANGE_M = 0.0
 RESET_XY_RANGE_STEP_M = 0.005
 RESET_XY_MAX_HALF_RANGE_M = 0.05
 
@@ -72,7 +75,9 @@ def retreat_pose_along_positive_y(
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise ValueError(f"invalid measured TCP pose: {pose}")
     pose[1] += RESET_RETREAT_Y_M
-    if np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max):
+    if workspace_min is not None and workspace_max is not None and (
+        np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max)
+    ):
         raise RuntimeError(
             "+Y reset retreat would leave workspace: "
             f"target={pose[:3]}, min={workspace_min}, max={workspace_max}"
@@ -90,7 +95,9 @@ def retreat_pose_along_positive_z(
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise ValueError(f"invalid measured TCP pose: {pose}")
     pose[2] += RESET_RETREAT_Z_M
-    if np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max):
+    if workspace_min is not None and workspace_max is not None and (
+        np.any(pose[:3] < workspace_min) or np.any(pose[:3] > workspace_max)
+    ):
         raise RuntimeError(
             "+Z reset retreat would leave workspace: "
             f"target={pose[:3]}, min={workspace_min}, max={workspace_max}"
@@ -100,19 +107,22 @@ def retreat_pose_along_positive_z(
 
 def sample_z_insertion_workspace_pose(
     reference: np.ndarray,
-    workspace_min: np.ndarray,
-    workspace_max: np.ndarray,
+    workspace_min: np.ndarray | None,
+    workspace_max: np.ndarray | None,
     *,
     randomize_xy: bool = True,
     xy_half_range: float = Z_SAMPLE_XY_HALF_RANGE_M,
+    use_reference_pose: bool = False,
 ) -> np.ndarray:
-    """Sample around the immutable reference XY, with fixed Z and orientation."""
+    """Sample reference XY; optionally retain reference Z and orientation."""
     reference = np.asarray(reference, dtype=float)
-    lower = np.asarray(workspace_min, dtype=float)
-    upper = np.asarray(workspace_max, dtype=float)
+    lower = None if workspace_min is None else np.asarray(workspace_min, dtype=float)
+    upper = None if workspace_max is None else np.asarray(workspace_max, dtype=float)
     if reference.shape != (6,) or not np.isfinite(reference).all():
         raise ValueError(f"invalid Z insertion reference pose: {reference}")
-    if (
+    if (lower is None) != (upper is None):
+        raise ValueError("supply both workspace bounds or neither")
+    if lower is not None and (
         lower.shape != (3,) or upper.shape != (3,)
         or not np.isfinite(lower).all() or not np.isfinite(upper).all()
         or np.any(lower >= upper)
@@ -123,13 +133,14 @@ def sample_z_insertion_workspace_pose(
     xy_half_range = xy_half_range if randomize_xy else 0.0
     sample_min = reference[:3] + [-xy_half_range, -xy_half_range, 0]
     sample_max = reference[:3] + [xy_half_range, xy_half_range, 0]
-    sample_min[2] = sample_max[2] = SAMPLE_Z_M
-    if np.any(sample_min < lower) or np.any(sample_max > upper):
+    sample_min[2] = sample_max[2] = reference[2] if use_reference_pose else SAMPLE_Z_M
+    if lower is not None and (np.any(sample_min < lower) or np.any(sample_max > upper)):
         raise ValueError("Z insertion sample volume extends outside the safe workspace")
-    if reference[2] - RESET_RETREAT_Z_M < lower[2]:
+    if lower is not None and reference[2] - RESET_RETREAT_Z_M < lower[2]:
         raise ValueError("Z insertion endpoint extends below the safe workspace")
     position = np.random.uniform(sample_min, sample_max) if randomize_xy else sample_min
-    return np.concatenate([position, SAMPLE_ROTATION_VECTOR])
+    orientation = reference[3:6] if use_reference_pose else SAMPLE_ROTATION_VECTOR
+    return np.concatenate([position, orientation])
 
 
 def read_reset_point_choice(prompt: str) -> str:
@@ -156,17 +167,22 @@ def read_reset_point_choice(prompt: str) -> str:
 def capture_centered_workspace(
     robot, *, randomize_xy: bool = True, terminal=None,
     workspace_y_half_range_m: float = STARTUP_WORKSPACE_HALF_RANGE_M,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Capture TCP on Enter; bound X/Z to ±5 cm and Y to the requested range."""
+    confirm_capture: bool = True,
+    enforce_workspace: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Capture TCP, optionally generating bounds when workspace is enabled."""
     if not np.isfinite(workspace_y_half_range_m) or workspace_y_half_range_m <= 0:
         raise ValueError("workspace Y half range must be finite and positive")
-    while True:
+    while confirm_capture:
         prompt = (
             "Place TCP at Z insertion p1; press Enter to capture its pose "
             f"and set workspace X/Z +/-5 cm, Y +/-{workspace_y_half_range_m * 100:g} cm (q to stop): "
         )
+        if not enforce_workspace:
+            prompt = "Place TCP at reference; press Enter to capture its pose (q to stop): "
         if terminal is not None:
-            prompt = terminal.prompt("Place TCP at p1. Enter: capture reference and workspace | q: exit")
+            label = "reference and workspace" if enforce_workspace else "reference"
+            prompt = terminal.prompt(f"Place TCP at p1. Enter: capture {label} | q: exit")
         choice = input(prompt).strip().lower()
         if not choice:
             break
@@ -176,6 +192,9 @@ def capture_centered_workspace(
     pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise RuntimeError(f"invalid TCP pose at workspace capture: {pose}")
+    if not enforce_workspace:
+        print(f"Captured reference: {pose.tolist()}; workspace disabled.", flush=True)
+        return pose, None, None
     lower = pose[:3] - STARTUP_WORKSPACE_HALF_RANGE_M
     upper = pose[:3] + STARTUP_WORKSPACE_HALF_RANGE_M
     lower[1] = pose[1] - workspace_y_half_range_m
@@ -198,14 +217,21 @@ def capture_centered_workspace(
     return pose, lower, upper
 
 
-def restore_training_reference(saved: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def restore_training_reference(
+    saved: dict, *, enforce_workspace: bool = True, use_current_reference: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Validate the base-frame pose and workspace recorded with this checkpoint."""
-    saved = saved.get("initial_reference", saved)
+    if not use_current_reference:
+        saved = saved.get("initial_reference", saved)
     if (saved.get("version") != 1 or saved.get("mode") != "z_insertion"
             or saved.get("frame") != "base" or saved.get("position_unit") != "m"
             or saved.get("orientation") != "rotation_vector_rad"):
         raise ValueError("unsupported saved training reference metadata")
     pose = np.asarray(saved["reference_pose"], dtype=float)
+    if pose.shape != (6,) or not np.isfinite(pose).all():
+        raise ValueError("invalid saved training reference pose")
+    if not enforce_workspace:
+        return pose, None, None
     lower = np.asarray(saved["workspace_min_xyz"], dtype=float)
     upper = np.asarray(saved["workspace_max_xyz"], dtype=float)
     if (pose.shape != (6,) or lower.shape != (3,) or upper.shape != (3,)
@@ -277,13 +303,30 @@ class OutcomeMonitor:
             raise RuntimeError("Stage-2 outcome labeling requires an interactive terminal")
         self.fd = sys.stdin.fileno()
         self._old = termios.tcgetattr(self.fd)
+        self._pending_outcomes = deque()
+        self._downward_bias_pending = False
         tty.setcbreak(self.fd)
 
+    def _read_available(self):
+        while select.select([self.fd], [], [], 0)[0]:
+            value = os.read(self.fd, 1)
+            if not value:
+                break
+            key = value.decode(errors="ignore").lower()
+            if key == "b":
+                self._downward_bias_pending = True
+            else:
+                self._pending_outcomes.append(key)
+
     def poll(self) -> str | None:
-        readable, _, _ = select.select([self.fd], [], [], 0)
-        if not readable:
-            return None
-        return os.read(self.fd, 1).decode(errors="ignore").lower()
+        self._read_available()
+        return self._pending_outcomes.popleft() if self._pending_outcomes else None
+
+    def consume_downward_bias(self) -> bool:
+        self._read_available()
+        pending = self._downward_bias_pending
+        self._downward_bias_pending = False
+        return pending
 
     def close(self) -> None:
         if self._old is not None:
@@ -305,21 +348,23 @@ class FrankaInsertionStage2Env:
         episode_time_s: float,
         max_step_m: float,
         max_step_rad: float,
-        sample_min: tuple[float, float, float] | None = None,
-        sample_max: tuple[float, float, float] | None = None,
         camera_shapes: dict[str, tuple[int, int, int]] | None = None,
-        z_insertion_mode: bool = False,
-        randomize_reset_xy: bool = True,
         reference_pose: np.ndarray | None = None,
         initial_reference_pose: np.ndarray | None = None,
         reset_xy_half_range_m: float = Z_SAMPLE_XY_HALF_RANGE_M,
+        use_reference_pose: bool = False,
         save_snapshot=None,
         enable_human_intervention: bool = False,
+        review_episode_replay: bool = False,
         teleop_input_backend: str = "evdev",
         teleop_keyboard: str | None = None,
-        teleop_speed_m_s: float = 0.01,
+        teleop_speed_m_s: float = 0.0135,
+        spacemouse=None,
         observation_selection: str = "boundary",
         inference_terminal=None,
+        enforce_workspace: bool = True,
+        enable_random_reset: bool = True,
+        enable_exploration_bias: bool = False,
     ) -> None:
         self.robot = robot
         self.pre = preprocessor
@@ -332,6 +377,8 @@ class FrankaInsertionStage2Env:
             raise ValueError("ACT preprocessor has no NormalizerProcessorStep") from error
         self.config = config
         self.inference_terminal = inference_terminal
+        self._exploration_bias = EpisodeExplorationBias() if enable_exploration_bias else None
+        self._downward_bias = EpisodeDownwardBias() if enable_exploration_bias else None
         self.save_snapshot = save_snapshot
         self.camera_shapes = camera_shapes
         self.period_s = 1.0 / fps
@@ -339,27 +386,27 @@ class FrankaInsertionStage2Env:
         self.max_step_m = max_step_m
         self.max_step_rad = max_step_rad
         self.enable_human_intervention = enable_human_intervention
+        self.review_episode_replay = review_episode_replay
         self.teleop_input_backend = teleop_input_backend
         self.teleop_keyboard = teleop_keyboard
         self.teleop_speed_m_s = teleop_speed_m_s
+        self._spacemouse = spacemouse
         if observation_selection not in {"latest", "boundary"}:
             raise ValueError("observation_selection must be latest or boundary")
         self.observation_selection = observation_selection
         self._control_mode = "policy"
-        self.workspace_min = np.asarray(robot.config.workspace_min_xyz, dtype=float)
-        self.workspace_max = np.asarray(robot.config.workspace_max_xyz, dtype=float)
-        self.sample_min = (
-            None if sample_min is None else np.asarray(sample_min, dtype=float)
-        )
-        self.sample_max = (
-            None if sample_max is None else np.asarray(sample_max, dtype=float)
-        )
-        self.z_insertion_mode = z_insertion_mode
-        self.randomize_reset_xy = True
+        self.enforce_workspace = enforce_workspace
+        self.workspace_min = (np.asarray(robot.config.workspace_min_xyz, dtype=float)
+                              if enforce_workspace else None)
+        self.workspace_max = (np.asarray(robot.config.workspace_max_xyz, dtype=float)
+                              if enforce_workspace else None)
+        self.enable_random_reset = enable_random_reset
+        self._inference_start_pose = None
         if (not np.isfinite(reset_xy_half_range_m)
                 or not 0 <= reset_xy_half_range_m <= RESET_XY_MAX_HALF_RANGE_M):
             raise ValueError("reset XY half range must be between 0 and 0.05 m")
         self.reset_xy_half_range_m = float(reset_xy_half_range_m)
+        self.use_reference_pose = use_reference_pose
         self._reference_pose = (
             None if reference_pose is None else np.asarray(reference_pose, dtype=float).copy()
         )
@@ -369,7 +416,7 @@ class FrankaInsertionStage2Env:
         )
         if self._initial_reference_pose is not None:
             self._reference_pose = self._initial_reference_pose.copy()
-        if (
+        if enforce_workspace and (
             self.workspace_min.shape != (3,)
             or self.workspace_max.shape != (3,)
             or not np.isfinite(self.workspace_min).all()
@@ -380,8 +427,8 @@ class FrankaInsertionStage2Env:
         if self._initial_reference_pose is not None:
             pose = self._initial_reference_pose
             if (pose.shape != (6,) or not np.isfinite(pose).all()
-                    or np.any(pose[:3] < self.workspace_min)
-                    or np.any(pose[:3] > self.workspace_max)):
+                    or (enforce_workspace and (np.any(pose[:3] < self.workspace_min)
+                                              or np.any(pose[:3] > self.workspace_max)))):
                 raise ValueError("initial training reference pose must be finite and inside workspace")
         self._monitor: OutcomeMonitor | None = None
         self._episode_start = 0.0
@@ -441,17 +488,10 @@ class FrankaInsertionStage2Env:
 
     def _retreat_after_outcome(self) -> None:
         measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
-        if self.z_insertion_mode:
-            retreat = retreat_pose_along_positive_z(
-                measured, self.workspace_min, self.workspace_max
-            )
-            label = "+Z 1 cm retreat"
-        else:
-            retreat = retreat_pose_along_positive_y(
-                measured, self.workspace_min, self.workspace_max
-            )
-            label = "+Y 1 cm retreat"
-        self._move_reset_pose(retreat, label=label)
+        retreat = retreat_pose_along_positive_z(
+            measured, self.workspace_min, self.workspace_max
+        )
+        self._move_reset_pose(retreat, label="+Z 1 cm retreat")
 
     def _read_idle_reset_choice(self, prompt: str) -> str:
         """Allow held-key XY servo motion while waiting for a reset choice."""
@@ -459,9 +499,46 @@ class FrankaInsertionStage2Env:
 
         return read_idle_xy_choice(self, prompt)
 
+    def _update_reference_xy_from_idle(self) -> None:
+        """Use measured XY after a manual idle jog, retaining reference Z/rotation."""
+        if not self.enable_random_reset or self._reference_pose is None:
+            return
+        pose = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
+        if pose.shape != (6,) or not np.isfinite(pose).all():
+            raise RuntimeError("invalid TCP pose after idle XY adjustment")
+        self._reference_pose[:2] = pose[:2]
+        self._reference_xy_revision = getattr(self, "_reference_xy_revision", 0) + 1
+        print(f"Updated reset reference XY: {pose[0]:+.6f} {pose[1]:+.6f} m", flush=True)
+
+    def _prepare_fixed_inference_start(self) -> None:
+        if self._inference_start_pose is None:
+            self._inference_start_pose = (
+                np.asarray(self.robot.robot.get_tool_pose(), dtype=float).copy()
+                if self._reference_pose is None else self._reference_pose.copy()
+            )
+        if self._first_reset_move:
+            choice = self._read_idle_reset_choice("Enter/y: move to reference | q: exit")
+            if choice not in {"", "y", "yes"}:
+                raise KeyboardInterrupt
+            self._first_reset_move = False
+        self._move_reset_pose(self._inference_start_pose.copy(), label="inference start pose")
+        while True:
+            choice = self._read_idle_reset_choice("Enter/y: start from current TCP | q: exit")
+            if choice in {"", "y", "yes"}:
+                pose = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
+                if pose.shape != (6,) or not np.isfinite(pose).all():
+                    raise RuntimeError(f"invalid inference start pose: {pose}")
+                self._inference_start_pose = pose.copy()
+                return
+            if choice in {"q", "quit"}:
+                raise KeyboardInterrupt
+
     def _move_to_accepted_workspace_sample(self) -> None:
+        if not getattr(self, "enable_random_reset", True):
+            self._prepare_fixed_inference_start()
+            return
         terminal = getattr(self, "inference_terminal", None)
-        if self.z_insertion_mode and self._reference_pose is None:
+        if self._reference_pose is None:
             measured = np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
             if measured.shape != (6,) or not np.isfinite(measured).all():
                 raise RuntimeError(f"invalid initial TCP reference pose: {measured}")
@@ -473,42 +550,29 @@ class FrankaInsertionStage2Env:
                 raise KeyboardInterrupt
             self._reference_pose = measured.copy()
         if self._reset_orientation is None:
-            measured = (
-                self._reference_pose if self.z_insertion_mode
-                else np.asarray(self.robot.robot.get_tool_pose(), dtype=float)
-            )
+            measured = self._reference_pose
             if measured.shape != (6,) or not np.isfinite(measured).all():
                 raise RuntimeError(f"invalid initial TCP pose: {measured}")
-            self._reset_orientation = (
-                np.asarray(SAMPLE_ROTATION_VECTOR, dtype=float).copy()
-                if self.z_insertion_mode else measured[3:].copy()
-            )
-            orientation_label = (
-                "fixed collection" if self.z_insertion_mode else "current TCP"
-            )
+            self._reset_orientation = np.asarray(
+                measured[3:6] if self.use_reference_pose else SAMPLE_ROTATION_VECTOR,
+                dtype=float,
+            ).copy()
             if terminal is None:
                 print(
-                    f"Using {orientation_label} reset orientation: "
+                    ("Using reference reset Z/orientation: " if self.use_reference_pose else
+                     "Using fixed collection reset orientation: ") +
+                    (f"Z={measured[2]:.6f} m; " if self.use_reference_pose else "") +
                     f"{self._format_pose(self._reset_orientation)}",
                     flush=True,
                 )
         while True:
             at_reference = False
-            if self.z_insertion_mode:
-                target = sample_z_insertion_workspace_pose(
-                    self._reference_pose, self.workspace_min, self.workspace_max,
-                    xy_half_range=self.reset_xy_half_range_m,
-                )
-                label = "sampled workspace reset pose"
-            else:
-                target = sample_workspace_pose(
-                    self.workspace_min,
-                    self.workspace_max,
-                    self._reset_orientation,
-                    sample_min=self.sample_min,
-                    sample_max=self.sample_max,
-                )
-                label = "sampled workspace reset pose"
+            target = sample_z_insertion_workspace_pose(
+                self._reference_pose, self.workspace_min, self.workspace_max,
+                xy_half_range=self.reset_xy_half_range_m,
+                use_reference_pose=self.use_reference_pose,
+            )
+            label = "sampled workspace reset pose"
             if self._first_reset_move:
                 prompt = (
                     "First sampled reset target is "
@@ -518,17 +582,21 @@ class FrankaInsertionStage2Env:
                     prompt = terminal.prompt(
                         f"First target: {terminal.pose(target)}\n  Enter/y: move | q: exit"
                     )
-                if self.z_insertion_mode:
-                    prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range"
+                prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range"
                 if self._initial_reference_pose is not None:
                     prompt += " | 4: first training reference"
                 if self.save_snapshot is not None:
                     prompt += " | p: save episode snapshot"
+                revision = getattr(self, "_reference_xy_revision", 0)
                 choice = self._read_idle_reset_choice(prompt)
+                if getattr(self, "_reference_xy_revision", 0) != revision:
+                    # The first target was sampled before the idle jog. Keep
+                    # the adjusted XY instead of moving back to the old target.
+                    target[:2] = self._reference_pose[:2]
                 if choice == "p" and self.save_snapshot is not None:
                     self.save_snapshot()
                     continue
-                if choice in {"=", "-"} and self.z_insertion_mode:
+                if choice in {"=", "-"}:
                     self._adjust_reset_xy_range(choice)
                     continue
                 if choice == "4" and self._initial_reference_pose is not None:
@@ -552,15 +620,14 @@ class FrankaInsertionStage2Env:
                     prompt = terminal.prompt(
                         f"{location} ready | Enter/y: start | r: new sample | {reference_hint}q: exit"
                     )
-                if self.z_insertion_mode:
-                    prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range: "
+                prompt += f" XY +/-{self.reset_xy_half_range_m * 100:g} cm | =/-: adjust next reset range: "
                 if self.save_snapshot is not None:
                     prompt += " p: save episode snapshot: "
                 choice = self._read_idle_reset_choice(prompt)
                 if choice == "p" and self.save_snapshot is not None:
                     self.save_snapshot()
                     continue
-                if choice in {"=", "-"} and self.z_insertion_mode:
+                if choice in {"=", "-"}:
                     self._adjust_reset_xy_range(choice)
                     continue
                 if choice in {"", "y", "yes"}:
@@ -589,23 +656,30 @@ class FrankaInsertionStage2Env:
         else:
             print(message, flush=True)
 
-    @staticmethod
-    def _prompt_outcome_after_timeout() -> str:
+    def _prompt_outcome_after_timeout(self) -> str:
         while True:
             choice = input(
-                "Episode maximum time elapsed. Confirm outcome: "
-                "s=success, f=failure, q=stop training: "
+                "Episode maximum time elapsed. Confirm outcome: " +
+                ("s=success, f=failure, d=delete episode, q=stop training: "
+                 if getattr(self, "review_episode_replay", False) else "s=success, f=failure, q=stop training: ")
             ).strip().lower()
-            if choice in {"s", "f", "q"}:
+            if choice in {"s", "f", "q"} or (choice == "d" and getattr(self, "review_episode_replay", False)):
                 return choice
             print("Please enter s, f, or q.", flush=True)
 
     def reset(self, *, episode_id: int, warmup: bool) -> dict[str, torch.Tensor]:
+        self._episode_warmup = warmup
         if self._runtime is not None:
             self._runtime.close()
             self._runtime = None
         self._close_monitor()
         self._control_mode = "policy"
+        downward_bias = getattr(self, "_downward_bias", None)
+        if downward_bias is not None:
+            downward_bias.prepare()
+        bias = getattr(self, "_exploration_bias", None)
+        if bias is not None:
+            bias.prepare(warmup=warmup)
         phase = "ACT WARMUP" if warmup else "RLT ACTOR"
         terminal = getattr(self, "inference_terminal", None)
         if terminal is not None:
@@ -613,6 +687,8 @@ class FrankaInsertionStage2Env:
         else:
             print(f"\nPreparing Episode {episode_id} [{phase}] with automatic reset.", flush=True)
         self._move_to_accepted_workspace_sample()
+        if bias is not None:
+            bias.begin()
         self._needs_automatic_reset = False
         self.robot.resync_command_pose()
         self._episode_sampled_tcp_command_sum.fill(0.0)
@@ -622,12 +698,17 @@ class FrankaInsertionStage2Env:
         self._episode_human_steps = 0
         batch = self._processed_observation()
         if self.enable_human_intervention:
-            from act_rlt.human_input import HumanInputMonitor
+            from act_rlt.spacemouse_input import SpaceMouseHumanInputMonitor
 
-            self._monitor = HumanInputMonitor(self.teleop_input_backend, self.teleop_keyboard)
+            if self._spacemouse is None:
+                raise RuntimeError('Human intervention requires a SpaceMouse input source')
+            self._monitor = SpaceMouseHumanInputMonitor(
+                self.teleop_input_backend, self.teleop_keyboard, self._spacemouse,
+            )
             print(
                 "Episode active: Space=take over/return at 4-step boundary; "
-                "W/X/A/D/P/L=human XYZ; S/F=finish after this 4-step chunk; Esc=stop training",
+                "SpaceMouse=human XYZ/rotation (release before returning); "
+                "S/F=finish and keep; D=finish and delete episode replay; Esc=stop training",
                 flush=True,
             )
         else:
@@ -635,7 +716,9 @@ class FrankaInsertionStage2Env:
             if terminal is not None:
                 terminal.active()
             else:
-                print("Episode active: s/f=finish after this 4-step chunk; q=stop training", flush=True)
+                print("Episode active: s/f=finish and keep; d=finish and delete episode replay; q=stop training", flush=True)
+        if downward_bias is not None:
+            print(f"B: enable -Z {abs(DOWNWARD_BIAS_STEP_M) * 1000:g} mm per remaining policy step (warmup/rollout).", flush=True)
         self._episode_start = time.monotonic()
         return batch
 
@@ -684,7 +767,7 @@ class FrankaInsertionStage2Env:
             result.info[f"{prefix}_rotvec_rad"] = delta[3:].tolist()
             result.info[f"{prefix}_rotation_norm_rad"] = float(np.linalg.norm(delta[3:]))
 
-        # This is the quantity that measures the net effect of sigma after
+        # This includes random noise and any directional exploration bias after
         # physical de-normalization and safety clipping.
         add_delta(
             "episode_exploration_vs_actor_mean_tcp_target",
@@ -709,6 +792,7 @@ class FrankaInsertionStage2Env:
         """Consume one result; a None budget collects until the episode ends."""
         from act_rlt.stage2_runtime import FixedChunkRuntime
 
+        self._replay_policy = policy
         if self._runtime is None:
             self._runtime = FixedChunkRuntime(
                 self, policy, initial_batch, warmup=warmup, step_budget=remaining_steps,
@@ -722,6 +806,12 @@ class FrankaInsertionStage2Env:
         if getattr(self, "inference_terminal", None) is not None:
             result.info["episode_elapsed_s"] = time.monotonic() - self._episode_start
         self._record_episode_action_comparison(result)
+        bias = getattr(self, "_exploration_bias", None)
+        if bias is not None:
+            bias.record(result)
+        downward_bias = getattr(self, "_downward_bias", None)
+        if downward_bias is not None:
+            downward_bias.record(result)
         if result.info["collector_paused"]:
             self._runtime.close()
             self._runtime = None
@@ -742,8 +832,9 @@ class FrankaInsertionStage2Env:
                 result.reward_seq[result.actual_steps - 1] = 1.0
                 result.info["success"] = True
                 result.terminated = True
-            elif key == "f":
+            elif key == "f" or (key == "d" and getattr(self, "review_episode_replay", False)):
                 result.terminated = True
+                result.info["discard_episode_replay"] = key == "d"
             else:
                 result.truncated = result.stop_requested = True
         if result.done:
@@ -753,6 +844,15 @@ class FrankaInsertionStage2Env:
             if not result.stop_requested:
                 self._needs_automatic_reset = True
         return result
+
+    def encode_replay_observation(self, observation: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a saved CPU frame only after collection/motion has stopped."""
+        if self._runtime is not None:
+            raise RuntimeError("overlap encoding requires a stopped collector")
+        frame = self._observation_frame(observation)
+        with torch.inference_mode():
+            state, reference, _ = self._replay_policy.encode_and_reference(self.pre(frame))
+        return state[0].detach().float().cpu(), reference[0].detach().float().cpu()
 
     def _normalize_executed_action(self, physical_full: torch.Tensor) -> torch.Tensor:
         """Map one bounded physical ACT action back to its saved model space."""
@@ -780,14 +880,33 @@ class FrankaInsertionStage2Env:
         actual_steps = 0
         done = terminated = truncated = stop_requested = False
         success = False
+        discard_episode_replay = False
         pending_outcome = None
         workspace_violation = False
         workspace_error: str | None = None
         last_batch = None
         clipping_count = 0
+        bias = getattr(self, "_exploration_bias", None)
+        bias_step = np.zeros(2) if bias is None else bias.step_m.copy()
+        bias_yaw_step = 0.0 if bias is None else bias.step_yaw_rad
+        bias_applied = np.zeros(2)
+        bias_yaw_applied = 0.0
+        bias_requested = np.zeros(2)
+        bias_yaw_requested = 0.0
+        downward_bias = getattr(self, "_downward_bias", None)
+        downward_requested_z = 0.0
+        downward_applied_xyz = np.zeros(3)
+        downward_steps = 0
 
         for index in range(self.config.chunk_length):
             tick = time.monotonic()
+            warmup = getattr(self, "_episode_warmup", False)
+            consume = getattr(self._monitor, "consume_downward_bias", None)
+            if consume is not None and consume():
+                if downward_bias is not None:
+                    downward_bias.enable()
+            bias_step = np.zeros(2) if bias is None or warmup else bias.step_m.copy()
+            bias_yaw_step = 0.0 if bias is None or warmup else bias.step_yaw_rad
             normalized_full = full_reference[:, index, :].clone()
             normalized_full[:, : self.config.action_dim] = action_chunk[:, index, :]
             physical_full = self.post(normalized_full).detach().cpu().reshape(-1)
@@ -795,6 +914,14 @@ class FrankaInsertionStage2Env:
                 raise RuntimeError(
                     f"unexpected Stage-2 physical action shape: {tuple(physical_full.shape)}"
                 )
+            unbiased_command = bounded_action(physical_full.numpy(), self.max_step_m, self.max_step_rad)
+            physical_full[:2] += physical_full.new_tensor(bias_step)
+            physical_full[5] += bias_yaw_step
+            baseline_command = bounded_action(physical_full.numpy(), self.max_step_m, self.max_step_rad)
+            downward_step = 0.0
+            if downward_bias is not None:
+                downward_step = downward_bias.step_m
+                physical_full[2] += downward_step
             command = bounded_action(physical_full.numpy(), self.max_step_m, self.max_step_rad)
             bounded_six = torch.tensor(list(command.values()), dtype=physical_full.dtype)
             if not torch.allclose(bounded_six, physical_full[: self.config.action_dim]):
@@ -825,13 +952,22 @@ class FrankaInsertionStage2Env:
                 )
                 break
             executed[index] = normalized_executed
+            bias_requested += bias_step
+            bias_yaw_requested += bias_yaw_step
+            bias_applied += np.asarray(list(baseline_command.values()))[:2] - np.asarray(list(unbiased_command.values()))[:2]
+            bias_yaw_applied += baseline_command["drz"] - unbiased_command["drz"]
+            if downward_step:
+                downward_requested_z += downward_step
+                downward_applied_xyz += (np.asarray(list(command.values()))[:3]
+                                         - np.asarray(list(baseline_command.values()))[:3])
+                downward_steps += 1
             actual_steps += 1
 
             time.sleep(max(0.0, self.period_s - (time.monotonic() - tick)))
             last_batch = self._processed_observation()
 
             key = self._monitor.poll() if self._monitor is not None else None
-            if key in {"s", "f"} and pending_outcome is None:
+            if (key in {"s", "f"} or (key == "d" and getattr(self, "review_episode_replay", False))) and pending_outcome is None:
                 pending_outcome = key
             if key == "q":
                 truncated = done = stop_requested = True
@@ -844,8 +980,9 @@ class FrankaInsertionStage2Env:
                     rewards[index] = 1.0
                     success = True
                     terminated = done = True
-                elif key == "f":
+                elif key == "f" or (key == "d" and getattr(self, "review_episode_replay", False)):
                     terminated = done = True
+                    discard_episode_replay = key == "d"
                 else:
                     truncated = done = stop_requested = True
             if done:
@@ -858,13 +995,14 @@ class FrankaInsertionStage2Env:
         if pending_outcome is not None and not done:
             rewards[actual_steps - 1] = float(pending_outcome == "s")
             success = pending_outcome == "s"
+            discard_episode_replay = pending_outcome == "d"
             terminated = done = True
             self._close_monitor()
             self._retreat_after_outcome()
             self._needs_automatic_reset = True
         if last_batch is None:
             raise RuntimeError("action chunk executed zero steps without a next observation")
-        return ChunkExecution(
+        result = ChunkExecution(
             next_batch=last_batch,
             exec_chunk=executed,
             reward_seq=rewards,
@@ -875,11 +1013,24 @@ class FrankaInsertionStage2Env:
             stop_requested=stop_requested,
             info={
                 "success": success,
+                "discard_episode_replay": discard_episode_replay,
                 "safety_clip_steps": clipping_count,
                 "workspace_violation": workspace_violation,
                 "workspace_error": workspace_error,
+                "exploration_bias_requested_xy_m": bias_requested.tolist(),
+                "exploration_bias_applied_xy_m": bias_applied.tolist(),
+                "exploration_bias_requested_yaw_rad": bias_yaw_requested,
+                "exploration_bias_applied_yaw_rad": bias_yaw_applied,
+                "downward_bias_requested_z_m": downward_requested_z,
+                "downward_bias_applied_xyz_m": downward_applied_xyz.tolist(),
+                "downward_bias_steps": downward_steps,
             },
         )
+        if bias is not None:
+            bias.record(result)
+        if downward_bias is not None:
+            downward_bias.record(result)
+        return result
 
     def exclude_learning_time(self, seconds: float) -> None:
         self._episode_start += seconds
@@ -901,11 +1052,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--replay-from", type=Path, help="reuse compatible replay with fresh Actor/Critic; new output required")
+    parser.add_argument(
+        "--replay-stride", type=int, choices=(2, 4), default=4,
+        help="2: cache intermediate frames and add overlapping replay after each episode; 4: original replay",
+    )
     parser.add_argument("--prepare-only", action="store_true", help="initialize from replay and save v3 checkpoint without connecting robot")
     parser.add_argument("--bc-init-steps", type=int, default=1000)
     parser.add_argument("--critic-init-steps", type=int, default=1000)
+    parser.add_argument(
+        "--three-chunk-td", action="store_true",
+        help="use 3-chunk TD (up to 12 control steps); default: 1-chunk TD",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-motion", action="store_true")
+    parser.add_argument(
+        "--use-reference-pose", action="store_true",
+        help="use captured/restored reference Z and orientation for resets; retain the XY range rules",
+    )
     parser.add_argument("--enable-human-intervention", action="store_true")
     parser.add_argument(
         "--teleop-input-backend",
@@ -914,7 +1077,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto uses pynput in an X11 session, or evdev on a headless host",
     )
     parser.add_argument("--teleop-keyboard", help="evdev input device, e.g. /dev/input/event4")
-    parser.add_argument("--teleop-speed-m-s", type=float, default=0.01)
+    parser.add_argument("--teleop-speed-m-s", type=float, default=0.0135,
+                        help="SpaceMouse translation speed per axis at full deflection (m/s)")
+    parser.add_argument("--teleop-angular-speed-rad-s", type=float, default=0.09,
+                        help="SpaceMouse roll/pitch speed; yaw uses 1.2 times this speed")
+    parser.add_argument("--spacemouse-deadzone", type=float, default=0.05)
 
     parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--wrist-camera", default="349622072679")
@@ -935,16 +1102,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y", "Z"),
         help="optional reset-pose sampling upper bound inside the safe workspace",
     )
-    parser.add_argument(
-        "--z-insertion-mode", action="store_true",
-        help="random XY reset around initial reference, fixed Z=0.402 m and collection orientation; retreat +Z 1 cm",
-    )
-    parser.add_argument(
-        "--randomize-reset-xy", action="store_true", default=True,
-        help="compatibility option; Z insertion always uses random XY reset by default",
-    )
-    parser.add_argument("--fps", type=float, default=None,
-                        help="control rate in Hz (default: 30 for Z insertion, 15 otherwise)")
+    parser.add_argument("--fps", type=float, default=30.0,
+                        help="control rate in Hz (default: 30)")
     parser.add_argument(
         "--camera-boundary-mode", choices=("timestamp", "legacy"), default="timestamp",
         help="timestamp: align image/state when available; legacy: use ordinary observations",
@@ -975,7 +1134,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--fusion-dim", type=int, default=128,
-                        help="width of each token, joint, and action input branch (default: 128)")
+                        help="projection width for each RL token, auxiliary-state and action branch (default: 128)")
     parser.add_argument("--utd-ratio", type=int, default=5)
     parser.add_argument("--beta", type=float, default=2.0,
                         help="BC regularization coefficient in -Q + beta * BC (default: 2.0)")
@@ -991,8 +1150,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.fps is None:
-        args.fps = 30.0 if args.z_insertion_mode else 15.0
     if args.teleop_input_backend == "auto":
         args.teleop_input_backend = (
             "evdev" if args.teleop_keyboard or not os.environ.get("DISPLAY") else "pynput"
@@ -1001,9 +1158,20 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--teleop-keyboard applies only to --teleop-input-backend evdev")
     if args.enable_human_intervention:
         from act_rlt.human_input import validate_teleop_speed
+        from evo_franka.spacemouse_bridge import YAW_SPEED_MULTIPLIER
 
         try:
             validate_teleop_speed(args.teleop_speed_m_s, args.fps, args.max_step_m)
+            # SpaceMouse allows three fully deflected axes simultaneously.
+            validate_teleop_speed(np.sqrt(3) * args.teleop_speed_m_s, args.fps, args.max_step_m)
+            if (not np.isfinite(args.teleop_angular_speed_rad_s)
+                    or args.teleop_angular_speed_rad_s <= 0
+                    or (np.isfinite(args.fps) and args.fps > 0 and
+                        np.sqrt(2 + YAW_SPEED_MULTIPLIER ** 2)
+                        * args.teleop_angular_speed_rad_s / args.fps > args.max_step_rad)):
+                raise ValueError('SpaceMouse angular speed must be positive and fit --max-step-rad per tick')
+            if not np.isfinite(args.spacemouse_deadzone) or not 0 <= args.spacemouse_deadzone < 1:
+                raise ValueError('--spacemouse-deadzone must be in [0, 1)')
         except ValueError as error:
             parser.error(str(error))
     if args.resume and args.replay_from:
@@ -1012,35 +1180,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--prepare-only requires --replay-from or --resume")
     if not args.dry_run and not args.prepare_only and not args.allow_motion:
         parser.error("real Stage-2 collection requires --allow-motion")
-    if args.allow_motion and not args.z_insertion_mode and (
-        args.workspace_min is None or args.workspace_max is None
-    ):
-        parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
-    if (args.workspace_min is None) != (args.workspace_max is None):
-        parser.error("supply both workspace bounds")
-    if args.z_insertion_mode and args.workspace_min is not None:
-        parser.error("--z-insertion-mode captures the +/-5 cm workspace at startup; omit workspace bounds")
-    if (args.sample_min is None) != (args.sample_max is None):
-        parser.error("supply both --sample-min and --sample-max")
-    if args.z_insertion_mode and args.sample_min is not None:
-        parser.error("--sample-min/--sample-max cannot be combined with --z-insertion-mode")
-    if args.workspace_min is not None:
-        bounds = np.asarray([args.workspace_min, args.workspace_max], dtype=float)
-        if not np.isfinite(bounds).all() or np.any(bounds[0] >= bounds[1]):
-            parser.error("workspace bounds must be finite with min < max")
-        if not args.z_insertion_mode and np.any(bounds[1, :2] - bounds[0, :2] <= 2 * RESET_XY_MARGIN_M):
-            parser.error("workspace X/Y spans must each exceed 4 cm for 2 cm margins")
-        if args.sample_min is not None:
-            sample_bounds = np.asarray([args.sample_min, args.sample_max], dtype=float)
-            if (
-                not np.isfinite(sample_bounds).all()
-                or np.any(sample_bounds[0] >= sample_bounds[1])
-            ):
-                parser.error("sample bounds must be finite with min < max")
-            if np.any(sample_bounds[0] < bounds[0]) or np.any(sample_bounds[1] > bounds[1]):
-                parser.error("sample bounds must lie inside the safe workspace")
-    elif args.sample_min is not None:
-        parser.error("sample bounds require workspace bounds")
+    if args.workspace_min is not None or args.workspace_max is not None:
+        parser.error("training workspace is disabled; omit --workspace-min/--workspace-max")
+    if args.sample_min is not None or args.sample_max is not None:
+        parser.error("training uses random XY reset with fixed Z=0.402 m; omit --sample-min/--sample-max")
     positive = {
         "fps": args.fps,
         "episode-time": args.episode_time,
@@ -1104,10 +1247,16 @@ def load_checkpoint(
         startup_metadata["startup_reference"] = saved.get("startup_reference")
     if saved["learner"].get("learner_version") != 3:
         raise ValueError(
-            "old Stage-2 network cannot resume with balanced input fusion; "
+            "old Stage-2 network cannot resume with this Actor/Critic architecture; "
             "use --replay-from with a new output directory"
         )
-    saved_config = dict(saved["config"])
+    saved_config = strip_removed_force_feedback_config(saved["config"])
+    saved_config.setdefault("input_fusion", "balanced")
+    if saved_config["input_fusion"] != config.input_fusion:
+        raise ValueError(
+            f"Stage-2 input fusion changed ({saved_config['input_fusion']} -> {config.input_fusion}); "
+            "use --replay-from with a new output directory to reuse replay and initialize fresh networks"
+        )
     current_config = config.to_dict()
     # Compare model identities after relocation, rather than saved path spelling.
     from evo_rlt.artifact_paths import resolve_artifact_path
@@ -1122,9 +1271,11 @@ def load_checkpoint(
         "temporal_ensemble_coeff", current_config["temporal_ensemble_coeff"]
     )
     saved_config.setdefault("target_q_clipping", True)
-    # Beta, exploration std, and Q clipping affect future updates/collection, without
-    # invalidating the network, optimizer state, or replay contents.
-    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta", "actor_fixed_std", "target_q_clipping"}
+    saved_config.setdefault("replay_stride", saved_config.get("chunk_length", 4))
+    saved_config.setdefault("td_chunks", 1)
+    # These settings affect future updates/collection without changing the
+    # network, optimizer state, or the semantics of existing replay entries.
+    schedule_keys = {"warmup_steps", "total_env_steps", "device", "beta", "actor_fixed_std", "target_q_clipping", "replay_stride", "td_chunks", "actor_update_interval"}
     incompatible = {
         key: (saved_config.get(key), current_config.get(key))
         for key in set(saved_config) | set(current_config)
@@ -1169,6 +1320,7 @@ def load_checkpoint(
 def import_replay(path: Path, config: ACTStage2Config, replay: ReplayBuffer) -> OnlineStage2Metrics:
     """Reuse data only. Learned weights, optimizers and old online counts are discarded."""
     saved = torch.load(path, map_location="cpu", weights_only=False)
+    strip_removed_force_feedback_config(saved["config"])
     for key in ("stage1_checkpoint", "act_checkpoint"):
         if resolve_pretrained_model(saved["config"][key]) != resolve_pretrained_model(getattr(config, key)):
             raise ValueError(f"replay {key} differs; latent/normalization spaces must match")
@@ -1220,6 +1372,7 @@ def append_metrics(writer: Stage2MetricsWriter, metrics: OnlineStage2Metrics,
         "human_env_steps": metrics.human_env_steps,
         "critic_updates": metrics.critic_updates,
         "actor_updates": metrics.actor_updates,
+        "replay_overlap_chunks": metrics.replay_overlap_chunks,
         "actual_steps": execution.actual_steps,
         "intervention": execution.intervention,
         "done": execution.done,
@@ -1260,6 +1413,10 @@ def _format_terminal_metrics(record: dict[str, Any]) -> str:
         parts.append("HUMAN")
     if record.get("safety_clip_steps"):
         parts.append(f"clip={record['safety_clip_steps']}")
+    if record.get("replay_overlap_added"):
+        parts.append(f"replay+{record['replay_overlap_added']}")
+    if record.get("episode_replay_discarded"):
+        parts.append("REPLAY=DELETED")
     if record.get("done"):
         outcome = "success" if record.get("success") else "stop" if record.get("stop_requested") else "end"
         parts.append(f"DONE={outcome}")
@@ -1321,6 +1478,8 @@ def main() -> int:
         critic_init_steps=args.critic_init_steps,
         max_step_m=args.max_step_m,
         max_step_rad=args.max_step_rad,
+        replay_stride=args.replay_stride,
+        td_chunks=3 if args.three_chunk_td else 1,
     )
     print(json.dumps(config.to_dict(), indent=2, sort_keys=True), flush=True)
 
@@ -1378,8 +1537,8 @@ def main() -> int:
             **robot_camera_kwargs(camera_shapes, args),
             include_gripper_action=policy.act_action_dim == 7,
             enable_fci_keepalive=False,
-            workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
-            workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
+            workspace_min_xyz=None,
+            workspace_max_xyz=None,
         )
     )
     if args.camera_boundary_mode == "timestamp":
@@ -1389,11 +1548,17 @@ def main() -> int:
     (output / "config.json").write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n")
     last_save_step = metrics.env_steps
     metrics_writer = None
+    spacemouse = None
 
     def current_reference() -> dict | None:
         reference = startup_metadata["startup_reference"]
         if reference is not None and env is not None:
             reference["reset_xy_half_range_m"] = env.reset_xy_half_range_m
+            if env._reference_pose is not None:
+                reference["reference_pose"] = env._reference_pose.tolist()
+            temporary = output / "startup_reference.json.tmp"
+            temporary.write_text(json.dumps(reference, indent=2) + "\n")
+            temporary.replace(output / "startup_reference.json")
         return reference
 
     def save_episode_snapshot() -> None:
@@ -1437,49 +1602,61 @@ def main() -> int:
             last_save_step = current.env_steps
 
     try:
+        if args.enable_human_intervention:
+            from act_rlt.spacemouse_input import SpaceMouseInput
+
+            # Verify live input before connecting or moving the robot. Keep the
+            # input process across episodes; it never creates a robot client.
+            spacemouse = SpaceMouseInput(
+                args.teleop_speed_m_s, args.teleop_angular_speed_rad_s, args.spacemouse_deadzone,
+            )
         metrics_writer = Stage2MetricsWriter(
             output / "metrics.jsonl", format_terminal=_format_terminal_metrics,
         )
         robot.connect()
-        reference_pose = None
-        if args.z_insertion_mode:
-            saved_reference = startup_metadata["startup_reference"]
-            if saved_reference is not None:
-                reference_pose, workspace_min, workspace_max = restore_training_reference(saved_reference)
-                print(f"Restored initial training reference: {reference_pose.tolist()}", flush=True)
-            else:
-                reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot)
-            robot.config.workspace_min_xyz = tuple(workspace_min)
-            robot.config.workspace_max_xyz = tuple(workspace_max)
-            startup_reference = {
-                "version": 1,
-                "mode": "z_insertion",
-                "frame": "base",
-                "position_unit": "m",
-                "orientation": "rotation_vector_rad",
-                "captured_at_unix_s": time.time(),
-                "reference_pose": reference_pose.tolist(),
-                "workspace_min_xyz": workspace_min.tolist(),
-                "workspace_max_xyz": workspace_max.tolist(),
-                "reset_z_m": SAMPLE_Z_M,
-                "reset_rotation_vector": np.asarray(SAMPLE_ROTATION_VECTOR).tolist(),
-                "randomize_reset_xy": True,
-                "reset_xy_half_range_m": (saved_reference.get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
-                                          if saved_reference is not None else Z_SAMPLE_XY_HALF_RANGE_M),
-            }
-            previous_reference = startup_metadata["startup_reference"]
-            startup_reference["initial_reference"] = (
-                previous_reference.get("initial_reference", previous_reference)
-                if previous_reference is not None else dict(startup_reference)
+        saved_reference = startup_metadata["startup_reference"]
+        if saved_reference is not None:
+            reference_pose, workspace_min, workspace_max = restore_training_reference(
+                saved_reference, enforce_workspace=False, use_current_reference=True,
             )
-            startup_metadata["startup_reference"] = startup_reference
-            reference_file = output / "startup_reference.json"
-            temporary_reference = output / "startup_reference.json.tmp"
-            temporary_reference.write_text(json.dumps(startup_reference, indent=2) + "\n")
-            temporary_reference.replace(reference_file)
-            save_checkpoint(output, config, learner, replay, metrics,
-                            startup_reference=startup_reference)
-            print(f"Saved training reference and workspace: {reference_file}", flush=True)
+            print(f"Restored training reference: {reference_pose.tolist()}", flush=True)
+        else:
+            reference_pose, workspace_min, workspace_max = capture_centered_workspace(robot, enforce_workspace=False)
+        robot.config.workspace_min_xyz = None
+        robot.config.workspace_max_xyz = None
+        startup_reference = {
+            "version": 1,
+            "mode": "z_insertion",
+            "frame": "base",
+            "position_unit": "m",
+            "orientation": "rotation_vector_rad",
+            "captured_at_unix_s": time.time(),
+            "reference_pose": reference_pose.tolist(),
+            "workspace_min_xyz": None,
+            "workspace_max_xyz": None,
+            "workspace_enabled": False,
+            "use_reference_pose": args.use_reference_pose,
+            "reset_z_m": float(reference_pose[2]) if args.use_reference_pose else SAMPLE_Z_M,
+            "reset_rotation_vector": np.asarray(
+                reference_pose[3:6] if args.use_reference_pose else SAMPLE_ROTATION_VECTOR
+            ).tolist(),
+            "randomize_reset_xy": True,
+            "reset_xy_half_range_m": (saved_reference.get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
+                                      if saved_reference is not None else Z_SAMPLE_XY_HALF_RANGE_M),
+        }
+        previous_reference = startup_metadata["startup_reference"]
+        startup_reference["initial_reference"] = (
+            previous_reference.get("initial_reference", previous_reference)
+            if previous_reference is not None else dict(startup_reference)
+        )
+        startup_metadata["startup_reference"] = startup_reference
+        reference_file = output / "startup_reference.json"
+        temporary_reference = output / "startup_reference.json.tmp"
+        temporary_reference.write_text(json.dumps(startup_reference, indent=2) + "\n")
+        temporary_reference.replace(reference_file)
+        save_checkpoint(output, config, learner, replay, metrics,
+                        startup_reference=startup_reference)
+        print(f"Saved training reference: {reference_file}; workspace disabled.", flush=True)
         env = FrankaInsertionStage2Env(
             robot=robot,
             preprocessor=pre,
@@ -1490,19 +1667,20 @@ def main() -> int:
             max_step_m=args.max_step_m,
             max_step_rad=args.max_step_rad,
             camera_shapes=camera_shapes,
-            z_insertion_mode=args.z_insertion_mode,
-            randomize_reset_xy=args.randomize_reset_xy,
             reference_pose=reference_pose,
+            use_reference_pose=args.use_reference_pose,
             reset_xy_half_range_m=(startup_metadata["startup_reference"].get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
                                    if startup_metadata["startup_reference"] is not None else Z_SAMPLE_XY_HALF_RANGE_M),
             save_snapshot=save_episode_snapshot,
-            sample_min=None if args.sample_min is None else tuple(args.sample_min),
-            sample_max=None if args.sample_max is None else tuple(args.sample_max),
             enable_human_intervention=args.enable_human_intervention,
+            review_episode_replay=True,
             teleop_input_backend=args.teleop_input_backend,
             teleop_keyboard=args.teleop_keyboard,
             teleop_speed_m_s=args.teleop_speed_m_s,
+            spacemouse=spacemouse,
             observation_selection=args.observation_selection,
+            enable_exploration_bias=True,
+            enforce_workspace=False,
         )
         metrics = run_online_stage2(
             policy,
@@ -1528,11 +1706,15 @@ def main() -> int:
                         robot.disconnect()
             finally:
                 try:
-                    save_checkpoint(output, config, learner, replay, metrics,
-                                    startup_reference=current_reference())
+                    if spacemouse is not None:
+                        spacemouse.close()
                 finally:
-                    if metrics_writer is not None:
-                        metrics_writer.close()
+                    try:
+                        save_checkpoint(output, config, learner, replay, metrics,
+                                        startup_reference=current_reference())
+                    finally:
+                        if metrics_writer is not None:
+                            metrics_writer.close()
     return 0
 
 

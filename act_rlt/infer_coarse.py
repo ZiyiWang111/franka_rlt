@@ -77,8 +77,14 @@ def return_to_dataset_start(robot, args):
 
 def report_final_tcp(robot, *, dry_run, z_gate_config=None):
     """Print measured endpoint Z and intrinsic XYZ Euler angles, not action deltas."""
-    pose = (read_gate_pose(robot, z_gate_config) if z_gate_config is not None else
-            np.asarray(robot.robot.get_tool_pose(), dtype=float))
+    read_after_stop = getattr(robot.robot, "get_tool_pose_after_move", None)
+    if not dry_run and callable(read_after_stop):
+        # The stop acknowledgement can arrive before the post-stop state stream.
+        # Fence on new idle snapshots rather than reading the old pose cache.
+        pose = np.asarray(read_after_stop(timeout_s=2.0), dtype=float)
+    else:
+        pose = (read_gate_pose(robot, z_gate_config) if z_gate_config is not None else
+                np.asarray(robot.robot.get_tool_pose(), dtype=float))
     if pose.shape != (6,) or not np.isfinite(pose).all():
         raise ValueError("Invalid measured TCP pose at episode end")
     euler = Rotation.from_rotvec(pose[3:]).as_euler("XYZ", degrees=True)

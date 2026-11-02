@@ -50,6 +50,19 @@ def resolve_pretrained_model(path: str | Path) -> Path:
     raise FileNotFoundError(f"no complete pretrained_model found under {path}")
 
 
+def strip_removed_force_feedback_config(config: dict) -> dict:
+    """Load legacy no-force checkpoints while rejecting the removed architecture."""
+    config = dict(config)
+    if config.pop("use_force_feedback", False):
+        raise ValueError(
+            "This checkpoint used the removed Stage-2 force-feedback branch; "
+            "its Actor/Critic and replay are incompatible. Start a new run without force feedback."
+        )
+    for key in ("force_scale_n", "torque_scale_nm", "wrench_offset", "wrench_clip"):
+        config.pop(key, None)
+    return config
+
+
 @dataclass
 class ACTStage2Config:
     """Confirmed first-version Stage-2 settings for the FR3 insertion task."""
@@ -65,6 +78,7 @@ class ACTStage2Config:
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
     fusion_dim: int = 128
+    input_fusion: str = "balanced"
     actor_fixed_std: float = 0.3
     actor_ref_dropout_p: float = 0.5
     actor_lr: float = 3e-4
@@ -74,6 +88,7 @@ class ACTStage2Config:
     critic_lr: float = 3e-4
 
     gamma: float = 0.99
+    td_chunks: int = 1
     beta: float = 2.0
     tau: float = 0.005
     batch_size: int = 256
@@ -90,15 +105,26 @@ class ACTStage2Config:
     max_step_rad: float = 0.02
 
     replay_capacity: int = 200_000
+    # None preserves non-overlapping replay for any configured chunk length.
+    replay_stride: int | None = None
     warmup_steps: int = 4_000
     total_env_steps: int = 10_000
     seed: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.td_chunks, int) or self.td_chunks < 1:
+            raise ValueError("td_chunks must be a positive integer")
+        if self.replay_stride is None:
+            self.replay_stride = self.chunk_length
+        if (not isinstance(self.replay_stride, int) or self.replay_stride <= 0
+                or self.chunk_length % self.replay_stride):
+            raise ValueError("replay_stride must be a positive divisor of chunk_length")
         if self.target_q_clip != 1.0 or self.learner_version != 3:
             raise ValueError("Stage-2 v3 requires target_q_clip=1; use target_q_clipping=False to disable clipping")
         if not isinstance(self.target_q_clipping, bool):
             raise ValueError("target_q_clipping must be boolean")
+        if self.input_fusion not in {"token_identity", "balanced"}:
+            raise ValueError("input_fusion must be token_identity or balanced")
         if self.bc_init_steps < 0 or self.critic_init_steps < 0:
             raise ValueError("initialization steps must be non-negative")
         if self.temporal_collection:
@@ -191,6 +217,7 @@ class ACTStage2Policy(nn.Module):
             num_layers=config.actor_num_layers,
             fixed_std=config.actor_fixed_std,
             ref_dropout_p=config.actor_ref_dropout_p,
+            input_fusion=config.input_fusion,
         )
 
     def _load_stage1(self) -> ACTRLTokenPolicy:
@@ -307,6 +334,7 @@ class Stage2Learner:
             fusion_dim=config.fusion_dim,
             hidden_dim=config.critic_hidden_dim,
             num_layers=config.critic_num_layers,
+            input_fusion=config.input_fusion,
         ).to(config.device)
         self.target_critic = copy.deepcopy(self.critic).eval()
         self.target_actor = copy.deepcopy(policy.actor).eval()
@@ -323,10 +351,11 @@ class Stage2Learner:
     def _batch_to_device(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         return {key: value.to(self.config.device) for key, value in batch.items()}
 
-    def _sample_batch(self, replay: ReplayBuffer) -> dict[str, Tensor]:
+    def _sample_batch(self, replay: ReplayBuffer, *, td: bool = False) -> dict[str, Tensor]:
         if isinstance(replay, ReplayBuffer):
             return self._batch_to_device(
-                replay.sample(self.config.batch_size, include_bc_target=True)
+                replay.sample(self.config.batch_size, include_bc_target=True,
+                              td_chunks=self.config.td_chunks if td else 1)
             )
         return self._batch_to_device(replay.sample(self.config.batch_size))
 
@@ -383,19 +412,23 @@ class Stage2Learner:
         self.initialized = True
 
     def update_once(self, replay: ReplayBuffer, *, update_actor: bool = True) -> LearnerStepMetrics:
-        batch = self._sample_batch(replay)
+        batch = self._sample_batch(replay, td=True)
         self.critic.train()
         self.policy.actor.train()
 
         x, action = batch["state_vec"], batch["exec_chunk_flat"]
+        td_next_state = batch.get("td_next_state_vec", batch["next_state_vec"])
+        td_next_ref = batch.get("td_next_ref_flat", batch["next_ref_flat"])
+        td_steps = batch.get("td_steps", batch["actual_steps"])
+        td_done = batch.get("td_done", batch["done"])
         with torch.no_grad():
-            next_action, _ = self.target_actor(batch["next_state_vec"], batch["next_ref_flat"])
+            next_action, _ = self.target_actor(td_next_state, td_next_ref)
             next_action = self.action_projection(next_action)
-            raw_next_q = self.target_critic.min_q(batch["next_state_vec"], next_action)
+            raw_next_q = self.target_critic.min_q(td_next_state, next_action)
             next_q = raw_next_q.clamp(0.0, 1.0) if self.config.target_q_clipping else raw_next_q
-            reward = discounted_chunk_return(batch["reward_seq"], self.config.gamma, batch["actual_steps"])
-            target = reward + self.config.gamma ** batch["actual_steps"].float().unsqueeze(-1) * (
-                1 - batch["done"].unsqueeze(-1)) * next_q
+            reward = discounted_chunk_return(batch.get("td_reward_seq", batch["reward_seq"]), self.config.gamma, td_steps)
+            target = reward + self.config.gamma ** td_steps.float().unsqueeze(-1) * (
+                1 - td_done.unsqueeze(-1)) * next_q
             if not torch.isfinite(target).all():
                 raise ValueError("non-finite TD target; check Critic output and replay")
             if self.config.target_q_clipping and ((target < 0).any() or (target > 1.00001).any()):
@@ -425,6 +458,7 @@ class Stage2Learner:
             "target_q_clip_high_fraction": (raw_next_q > 1).float().mean().item()
             if self.config.target_q_clipping else 0.0,
             "td_target_mean": target.mean().item(), "td_target_max": target.max().item(),
+            "td_steps_mean": td_steps.float().mean().item(),
             "reward_mean": reward.mean().item(), "done_fraction": batch["done"].mean().item(),
             "td_error_abs_mean": (q1.detach() - target).abs().mean().item(),
         }
@@ -487,6 +521,7 @@ class Stage2Learner:
     def state_dict(self) -> dict:
         return {
             "learner_version": 3,
+            "input_fusion": self.config.input_fusion,
             "initialized": self.initialized,
             "target_actor": self.target_actor.state_dict(),
             "actor": self.policy.actor.state_dict(),
@@ -501,6 +536,8 @@ class Stage2Learner:
     def load_state_dict(self, state: dict) -> None:
         if state.get("learner_version") != 3:
             raise ValueError("old Stage-2 network cannot resume as v3; use --replay-from for a fresh learner")
+        if state.get("input_fusion", "balanced") != self.config.input_fusion:
+            raise ValueError("Stage-2 input fusion changed; use --replay-from with a new output directory")
         self.target_actor.load_state_dict(state["target_actor"])
         self.initialized = bool(state["initialized"])
         self.policy.actor.load_state_dict(state["actor"])
@@ -534,6 +571,8 @@ class ChunkExecution:
     next_state_vec: Tensor | None = None
     next_ref_chunk: Tensor | None = None
     bc_target_chunk: Tensor | None = None
+    # CPU-only intermediate observations; excluded from info/JSON/checkpoints.
+    replay_observations: dict = field(default_factory=dict)
 
 
 class Stage2Environment(Protocol):
@@ -554,6 +593,7 @@ class OnlineStage2Metrics:
     human_env_steps: int = 0
     critic_updates: int = 0
     actor_updates: int = 0
+    replay_overlap_chunks: int = 0
     last_learner: LearnerStepMetrics | None = None
 
 
@@ -591,15 +631,96 @@ def run_online_stage2(
 
     Warmup ends at the first episode boundary at or above warmup_steps.
     Warmup transitions never trigger updates. After warmup, each collected
-    chunk triggers exactly ``utd_ratio`` critic updates, independent of C.
+    kept chunk triggers ``utd_ratio`` critic updates, independent of C.
+    With episode replay review, chunks are staged and updates run only after
+    acceptance at the episode boundary; rejected chunks never train the model.
     """
     metrics = initial_metrics or OnlineStage2Metrics()
 
     if metrics.online_env_steps >= config.total_env_steps:
         return metrics
+    overlap = None
+    if config.replay_stride < config.chunk_length:
+        from act_rlt.replay_overlap import EpisodeReplayOverlap
+
+        if not callable(getattr(env, "encode_replay_observation", None)):
+            raise ValueError("overlapping replay requires intermediate-observation encoding")
+        overlap = EpisodeReplayOverlap(config.chunk_length, config.replay_stride)
+
+    review_replay = bool(getattr(env, "review_episode_replay", False))
+    pending_replay = []
+    pending_steps = 0
+    pending_chunks = 0
+
+    def finish_overlap(execution):
+        nonlocal pending_steps, pending_chunks
+        discard = review_replay and (
+            execution.info.get("discard_episode_replay", False) or execution.stop_requested
+        )
+        if overlap is not None:
+            if discard:
+                overlap.clear()
+                execution.info["replay_overlap_added"] = 0
+            else:
+                started = time.monotonic()
+                extra, stats = overlap.finish(
+                    env.encode_replay_observation,
+                    done=execution.done, terminated=execution.terminated, truncated=execution.truncated,
+                )
+                for transition in extra:
+                    if review_replay:
+                        pending_replay.append(transition)
+                    else:
+                        replay.add(transition)
+                metrics.replay_overlap_chunks += len(extra)
+                execution.info.update(stats)
+                execution.info["replay_overlap_encode_wall_ms"] = (time.monotonic() - started) * 1000
+        if not review_replay:
+            return 1
+        updates_for_chunks = 0
+        execution.info["episode_replay_discarded"] = bool(discard)
+        execution.info["episode_replay_steps"] = pending_steps
+        execution.info["episode_replay_chunks"] = len(pending_replay)
+        if not discard:
+            for transition in pending_replay:
+                replay.add(transition)
+            if warmup:
+                metrics.warmup_env_steps += pending_steps
+            else:
+                metrics.online_env_steps += pending_steps
+            updates_for_chunks = pending_chunks
+        pending_replay.clear()
+        pending_steps = pending_chunks = 0
+        return updates_for_chunks
+
+    def update_committed_replay(execution, update_chunks):
+        # Confirmed timing: no updates for a chunk that started in warmup.
+        # Confirmed UTD: G updates per collected chunk, never G*C.
+        if not warmup and update_chunks and len(replay) >= config.batch_size:
+            updates = []
+            learner_started = time.monotonic()
+            for _ in range(config.utd_ratio * update_chunks):
+                updates.append(learner.update_once(replay))
+            execution.info["learner_updates_wall_ms"] = (time.monotonic() - learner_started) * 1000
+            metrics.last_learner = updates[-1]
+            for name in ("critic_loss", "actor_loss", "critic_grad_norm", "actor_grad_norm"):
+                values = [getattr(u, name) for u in updates if getattr(u, name) is not None]
+                setattr(metrics.last_learner, name, sum(values) / len(values) if values else None)
+            keys = set().union(*(u.diagnostics for u in updates))
+            metrics.last_learner.diagnostics = {
+                key: (max if key.endswith("_max") else min if key.endswith("_min") else
+                      lambda values: sum(values) / len(values))(
+                          [u.diagnostics[key] for u in updates if key in u.diagnostics])
+                for key in keys
+            }
+            metrics.critic_updates = learner.critic_updates
+            metrics.actor_updates = learner.actor_updates
+
+
     # A mid-episode checkpoint resumes from a fresh physical reset, so allocate
     # a new replay episode id rather than reusing the interrupted one.
     episode_id = metrics.episodes
+    episode_step = 0
     if replay.buffer:
         episode_id = max(int(transition.episode_id) for transition in replay.buffer) + 1
     warmup = metrics.warmup_env_steps < config.warmup_steps
@@ -625,7 +746,7 @@ def run_online_stage2(
             # transition before initializing or handing control to the Actor.
             remaining_steps = (
                 None if warmup
-                else config.total_env_steps - metrics.online_env_steps
+                else config.total_env_steps - metrics.online_env_steps - pending_steps
             )
             execution = execute_policy_chunk(
                 policy, batch, warmup=warmup, remaining_steps=remaining_steps
@@ -669,6 +790,9 @@ def run_online_stage2(
         if execution.actual_steps == 0:
             if not execution.done or not execution.truncated:
                 raise RuntimeError("zero-step execution must be a truncated episode")
+            committed_chunks = finish_overlap(execution)
+            if review_replay:
+                update_committed_replay(execution, committed_chunks)
             execution.info.setdefault("warmup", warmup)
             metrics.episodes += 1
             if on_chunk is not None:
@@ -676,6 +800,7 @@ def run_online_stage2(
             if execution.stop_requested:
                 break
             episode_id += 1
+            episode_step = 0
             warmup = metrics.warmup_env_steps < config.warmup_steps
             batch = env.reset(
                 episode_id=episode_id,
@@ -684,6 +809,7 @@ def run_online_stage2(
             continue
 
         transition = ChunkTransition(
+            start_step=episode_step,
             state_vec=_unbatch_cpu(state_vec),
             exec_chunk=_unbatch_cpu(execution.exec_chunk),
             ref_chunk=_unbatch_cpu(ref_chunk),
@@ -706,38 +832,33 @@ def run_online_stage2(
                 if execution.bc_target_chunk is not None else None
             ),
         )
-        replay.add(transition)
-        metrics.env_steps += execution.actual_steps
-        if warmup:
-            metrics.warmup_env_steps += execution.actual_steps
+        if review_replay:
+            pending_replay.append(transition)
+            pending_steps += execution.actual_steps
+            pending_chunks += 1
         else:
-            metrics.online_env_steps += execution.actual_steps
+            replay.add(transition)
+        episode_step += execution.actual_steps
+        if overlap is not None:
+            overlap.add(transition, execution.replay_observations)
+        execution.replay_observations.clear()
+        metrics.env_steps += execution.actual_steps
+        if not review_replay:
+            if warmup:
+                metrics.warmup_env_steps += execution.actual_steps
+            else:
+                metrics.online_env_steps += execution.actual_steps
         metrics.chunks += 1
         if execution.intervention:
             metrics.human_chunks += 1
             metrics.human_env_steps += execution.actual_steps
 
-        # Confirmed timing: no updates for a chunk that started in warmup.
-        # Confirmed UTD: G updates per collected chunk, never G*C.
-        if not warmup and len(replay) >= config.batch_size:
-            updates = []
-            learner_started = time.monotonic()
-            for _ in range(config.utd_ratio):
-                updates.append(learner.update_once(replay))
-            execution.info["learner_updates_wall_ms"] = (time.monotonic() - learner_started) * 1000
-            metrics.last_learner = updates[-1]
-            for name in ("critic_loss", "actor_loss", "critic_grad_norm", "actor_grad_norm"):
-                values = [getattr(u, name) for u in updates if getattr(u, name) is not None]
-                setattr(metrics.last_learner, name, sum(values) / len(values) if values else None)
-            keys = set().union(*(u.diagnostics for u in updates))
-            metrics.last_learner.diagnostics = {
-                key: (max if key.endswith("_max") else min if key.endswith("_min") else
-                      lambda values: sum(values) / len(values))(
-                          [u.diagnostics[key] for u in updates if key in u.diagnostics])
-                for key in keys
-            }
-            metrics.critic_updates = learner.critic_updates
-            metrics.actor_updates = learner.actor_updates
+        update_chunks = 0 if review_replay else 1
+        if (execution.done or execution.info.get("collector_paused", False)
+                or (not warmup and metrics.online_env_steps + pending_steps >= config.total_env_steps)):
+            update_chunks = finish_overlap(execution)
+
+        update_committed_replay(execution, update_chunks)
 
         execution.info.setdefault("warmup", warmup)
         if execution.done:
@@ -750,6 +871,7 @@ def run_online_stage2(
             break
         if execution.done:
             episode_id += 1
+            episode_step = 0
             warmup = metrics.warmup_env_steps < config.warmup_steps
             batch = env.reset(
                 episode_id=episode_id,

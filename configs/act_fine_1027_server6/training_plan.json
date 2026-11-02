@@ -1,0 +1,35 @@
+{
+  "host": "10.0.40.113",
+  "status": "PREPARED",
+  "poll_seconds": 120,
+  "idle_samples": 1,
+  "steps": 30000,
+  "chunk_size": 4,
+  "use_cvae": true,
+  "runs": [
+    {
+      "name": "usb_1027_z_cvae_30k",
+      "source": "datasets/usb_fine/usb_dataset_1027",
+      "dataset": "datasets/usb_fine/usb_1027_z",
+      "episodes": 362,
+      "frames": 38827,
+      "config": "configs/act_fine_1027_server6/usb_1027_z_cvae_30k.json",
+      "batch_size": 16
+    },
+    {
+      "name": "vga_1023_z_cvae_30k",
+      "source": "datasets/vga_fine/act_dataset_1023",
+      "dataset": "datasets/vga_fine/vga_1023_z_1027",
+      "episodes": 699,
+      "frames": 55125,
+      "config": "configs/act_fine_1027_server6/vga_1023_z_cvae_30k.json",
+      "batch_size": 32
+    }
+  ],
+  "execution": "sequential",
+  "gpu": 4,
+  "previous_server7_queue": "STOPPED",
+  "project": "/workspace/wangziyi/projects/act_fine_1027",
+  "python": "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+  "usb_batch_size_change": "Restart from step zero; previous batch32 run had no checkpoint"
+}

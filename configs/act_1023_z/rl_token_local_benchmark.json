@@ -1,0 +1,10 @@
+{
+  "batch": 8,
+  "samples": 8,
+  "median_seconds": 0.8732442850014195,
+  "mean_seconds": 0.872244303507614,
+  "compute_hours_10000": 2.4229008430767056,
+  "optimizer_steps": 0,
+  "peak_allocated_gib": 4.334557056427002,
+  "peak_reserved_gib": 4.568359375
+}

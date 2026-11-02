@@ -7,10 +7,11 @@ import numpy as np
 from evo_franka.geometry import euler_xyz_deg_to_rotvec
 
 
-DEFAULT_INSERT_MINUS_Z_M = 0.004
+DEFAULT_INSERT_MINUS_Z_M = 0.006
 INSERT_MINUS_Y_M = 0.001
 
-SAMPLE_X_HALF_RANGE_M = 0.025
+SAMPLE_X_MIN_OFFSET_M = 0.0
+SAMPLE_X_MAX_OFFSET_M = 0.025
 SAMPLE_Y_MIN_OFFSET_M = 0.003
 SAMPLE_Y_MAX_OFFSET_M = 0.02
 SAMPLE_Z_M = 0.402
@@ -35,7 +36,7 @@ def sample_z_insertion_pose(
     if len(reference) != 6 or not np.isfinite(reference).all():
         raise ValueError(f"reference must be a finite 6D TCP pose, got {reference}")
     sample = apply_fixed_sample_orientation(reference)
-    sample[0] += float(rng.uniform(-SAMPLE_X_HALF_RANGE_M, SAMPLE_X_HALF_RANGE_M))
+    sample[0] += float(rng.uniform(SAMPLE_X_MIN_OFFSET_M, SAMPLE_X_MAX_OFFSET_M))
     sample[1] += float(rng.uniform(SAMPLE_Y_MIN_OFFSET_M, SAMPLE_Y_MAX_OFFSET_M))
     sample[2] = SAMPLE_Z_M
     return sample

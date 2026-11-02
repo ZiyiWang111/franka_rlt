@@ -1,0 +1,72 @@
+{
+  "pid": 106029,
+  "owner": "87853ae222874fa194e54df7843cf462",
+  "host": "10.0.40.113",
+  "status": "WAITING_GPU",
+  "config": "/workspace/wangziyi/projects/vga_z_orientation_1029/configs/vga_1023_z_orientation/train_config.json",
+  "training_enabled": true,
+  "updated_at": "2026-10-29T10:13:36.504368+08:00",
+  "poll_seconds": 120,
+  "required_idle_samples": 5,
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-46d04482-9f93-1213-2cf3-f2a42f99f844",
+      "used_mib": 1105,
+      "util": 10,
+      "compute_process": false
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-bf7eeb17-20bf-c13b-e14a-42965e362870",
+      "used_mib": 15387,
+      "util": 0,
+      "compute_process": true
+    },
+    {
+      "index": 2,
+      "uuid": "GPU-2b1f192a-7a44-f862-45db-eb72df9096f8",
+      "used_mib": 15387,
+      "util": 62,
+      "compute_process": true
+    },
+    {
+      "index": 3,
+      "uuid": "GPU-4772bdcc-025c-159f-de3d-464ea90fdf6a",
+      "used_mib": 15387,
+      "util": 65,
+      "compute_process": true
+    },
+    {
+      "index": 4,
+      "uuid": "GPU-e4eec184-3339-5117-7570-1a3710eaedfa",
+      "used_mib": 8665,
+      "util": 0,
+      "compute_process": true
+    },
+    {
+      "index": 5,
+      "uuid": "GPU-c982f4f3-0153-240c-e3ee-15df8ff32da8",
+      "used_mib": 74187,
+      "util": 100,
+      "compute_process": true
+    },
+    {
+      "index": 6,
+      "uuid": "GPU-69df350b-f409-0ad7-35ad-9ca4d09c7210",
+      "used_mib": 74185,
+      "util": 100,
+      "compute_process": true
+    }
+  ],
+  "idle_streaks": {
+    "GPU-46d04482-9f93-1213-2cf3-f2a42f99f844": 0,
+    "GPU-bf7eeb17-20bf-c13b-e14a-42965e362870": 0,
+    "GPU-2b1f192a-7a44-f862-45db-eb72df9096f8": 0,
+    "GPU-4772bdcc-025c-159f-de3d-464ea90fdf6a": 0,
+    "GPU-e4eec184-3339-5117-7570-1a3710eaedfa": 0,
+    "GPU-c982f4f3-0153-240c-e3ee-15df8ff32da8": 0,
+    "GPU-69df350b-f409-0ad7-35ad-9ca4d09c7210": 0
+  },
+  "query_error": null
+}

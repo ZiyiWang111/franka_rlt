@@ -15,7 +15,7 @@ def test_z_insertion_sample_uses_the_fixed_collection_box_and_orientation():
 
     samples = np.asarray([sample_z_insertion_pose(reference, rng) for _ in range(10_000)])
 
-    assert np.all(samples[:, 0] >= reference[0] - 0.025)
+    assert np.all(samples[:, 0] >= reference[0])
     assert np.all(samples[:, 0] <= reference[0] + 0.025)
     assert np.all(samples[:, 1] >= reference[1] + 0.003)
     assert np.all(samples[:, 1] <= reference[1] + 0.02)

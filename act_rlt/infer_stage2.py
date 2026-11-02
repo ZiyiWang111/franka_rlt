@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 from pathlib import Path
 
@@ -12,16 +13,13 @@ import torch
 
 from act_rlt.infer import checkpoint_camera_shapes, robot_camera_kwargs
 from act_rlt.infer_stage2_terminal import InferenceTerminal
-from act_rlt.stage2 import ACTStage2Config, ACTStage2Policy, resolve_pretrained_model
+from act_rlt.stage2 import (
+    ACTStage2Config, ACTStage2Policy, resolve_pretrained_model,
+    strip_removed_force_feedback_config,
+)
 from act_rlt.train_stage2 import (
     FrankaInsertionStage2Env,
-    RESET_XY_MARGIN_M,
-    Z_SAMPLE_XY_HALF_RANGE_M,
-    capture_centered_workspace,
-    restore_training_reference,
 )
-
-INFERENCE_WORKSPACE_Y_HALF_RANGE_M = 0.10
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,19 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None, help="default: checkpoint device")
     parser.add_argument("--dry-run", action="store_true", help="load models and processors only")
     parser.add_argument("--allow-motion", action="store_true")
+    parser.add_argument(
+        "--teleop-input-backend", choices=("auto", "evdev", "pynput"), default="auto",
+        help="idle WASD keyboard: auto uses pynput on X11, otherwise evdev",
+    )
+    parser.add_argument("--teleop-keyboard", help="evdev input device, e.g. /dev/input/event3")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--robot-ip", default="172.16.0.2")
     parser.add_argument("--wrist-camera", default="349622072679")
     parser.add_argument("--front-camera", default="233522075778")
-    parser.add_argument("--z-insertion-mode", action="store_true")
-    parser.add_argument(
-        "--randomize-reset-xy", action="store_true", default=True,
-        help="compatibility option; Z insertion always uses random XY reset by default",
-    )
-    parser.add_argument("--workspace-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
-    parser.add_argument("--workspace-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
-    parser.add_argument("--sample-min", type=float, nargs=3, metavar=("X", "Y", "Z"))
-    parser.add_argument("--sample-max", type=float, nargs=3, metavar=("X", "Y", "Z"))
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument(
         "--camera-boundary-mode", choices=("timestamp", "legacy"), default="timestamp",
@@ -62,34 +56,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.teleop_input_backend == "auto":
+        args.teleop_input_backend = (
+            "evdev" if args.teleop_keyboard or not os.environ.get("DISPLAY") else "pynput"
+        )
+    if args.teleop_keyboard and args.teleop_input_backend != "evdev":
+        parser.error("--teleop-keyboard applies only to --teleop-input-backend evdev")
     if args.episodes <= 0 or not math.isfinite(args.episode_time) or args.episode_time <= 0:
         parser.error("--episodes and --episode-time must be positive")
     if args.fps is None:
-        args.fps = 30.0 if args.z_insertion_mode else 15.0
+        args.fps = 30.0
     if not math.isfinite(args.fps) or args.fps <= 0:
         parser.error("--fps must be positive and finite")
     if not args.dry_run and not args.allow_motion:
         parser.error("robot inference requires --allow-motion")
-    if (args.workspace_min is None) != (args.workspace_max is None):
-        parser.error("supply both workspace bounds")
-    if (args.sample_min is None) != (args.sample_max is None):
-        parser.error("supply both sample bounds")
-    if args.z_insertion_mode:
-        if args.workspace_min is not None or args.sample_min is not None:
-            parser.error("Z insertion restores or captures its workspace; omit workspace/sample bounds")
-    elif not args.dry_run and args.workspace_min is None:
-        parser.error("motion requires --workspace-min X Y Z and --workspace-max X Y Z")
-    if args.workspace_min is not None:
-        bounds = np.asarray([args.workspace_min, args.workspace_max])
-        if not np.isfinite(bounds).all() or np.any(bounds[0] >= bounds[1]):
-            parser.error("workspace bounds must be finite with min < max")
-        if np.any(bounds[1, :2] - bounds[0, :2] <= 2 * RESET_XY_MARGIN_M):
-            parser.error("workspace X/Y spans must each exceed 4 cm")
-        if args.sample_min is not None:
-            sample = np.asarray([args.sample_min, args.sample_max])
-            if (not np.isfinite(sample).all() or np.any(sample[0] >= sample[1])
-                    or np.any(sample[0] < bounds[0]) or np.any(sample[1] > bounds[1])):
-                parser.error("sample bounds must be finite, ordered, and inside the workspace")
 
 
 def resolve_stage2_checkpoint(path: Path) -> Path:
@@ -115,7 +95,9 @@ def load_frozen_policy(
     learner = saved["learner"]
     if learner.get("learner_version") != 3 or not learner.get("initialized"):
         raise ValueError("Stage-2 inference requires an initialized v3 Actor checkpoint")
-    config_data = dict(saved["config"])
+    config_data = strip_removed_force_feedback_config(saved["config"])
+    # Checkpoints predating the token passthrough used three equal-width branches.
+    config_data.setdefault("input_fusion", "balanced")
     config_data["device"] = device or config_data["device"]
     if device is None and str(config_data["device"]).startswith("cuda") and not torch.cuda.is_available():
         print("CUDA unavailable; using CPU.", flush=True)
@@ -172,35 +154,30 @@ def run_episodes(env: FrankaInsertionStage2Env, policy: ACTStage2Policy, episode
     terminal.session_summary("stopped" if stopped else "complete")
 
 
-def select_run_reference(robot, saved_reference, *, randomize_xy, terminal):
-    """Choose the immutable reference and workspace for this inference run."""
+def select_run_reference(robot, saved_reference, *, randomize_xy=False, terminal):
+    """Select a reference pose without restoring or generating workspace bounds."""
     if saved_reference is not None:
         while True:
             choice = input(terminal.prompt(
-                "Run reference: t: saved training point | c: current TCP | q: exit"
+                "Run reference: t: saved training point | c: capture current TCP now | q: exit"
             )).strip().lower()
             if choice == "t":
-                reference, lower, upper = restore_training_reference(saved_reference)
-                lower[1] = reference[1] - INFERENCE_WORKSPACE_Y_HALF_RANGE_M
-                upper[1] = reference[1] + INFERENCE_WORKSPACE_Y_HALF_RANGE_M
-                terminal.write("[REFERENCE] Using saved training reference; workspace Y is +/-10 cm.")
-                terminal.workspace(reference, lower, upper, None)
-                terminal.write("[REFERENCE] Before each episode, press 4 to move to the full first training pose.")
-                return reference, lower, upper, reference.copy()
+                pose = np.asarray(saved_reference["reference_pose"], dtype=float)
+                break
             if choice in {"c", "current"}:
+                pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
                 break
             if choice in {"q", "quit"}:
                 raise KeyboardInterrupt
-            terminal.write("Please use t, c, or q.")
-        terminal.write("[REFERENCE] Capture current TCP for this run; key 4 is unavailable.")
     else:
-        terminal.write("[REFERENCE] No saved training point; capture current TCP. Key 4 is unavailable.")
-    reference, lower, upper = capture_centered_workspace(
-        robot, randomize_xy=randomize_xy, terminal=terminal,
-        workspace_y_half_range_m=INFERENCE_WORKSPACE_Y_HALF_RANGE_M,
-    )
-    terminal.write("[REFERENCE] Using captured TCP reference; workspace X/Z +/-5 cm, Y +/-10 cm.")
-    return reference, lower, upper, None
+        choice = input(terminal.prompt("Enter: capture current TCP | q: exit")).strip().lower()
+        if choice:
+            raise KeyboardInterrupt
+        pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
+    if pose.shape != (6,) or not np.isfinite(pose).all():
+        raise ValueError(f"invalid reference pose: {pose}")
+    terminal.write(f"[REFERENCE] {pose.tolist()} | workspace disabled")
+    return pose.copy(), None, None, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,21 +201,25 @@ def main(argv: list[str] | None = None) -> int:
         policy.stage1._act.config, pretrained_path=str(act_path),
         preprocessor_overrides={"device_processor": {"device": config.device}},
     )
-    saved_reference = startup_metadata.get("startup_reference")
-    args.reset_xy_half_range_m = (saved_reference.get("reset_xy_half_range_m", Z_SAMPLE_XY_HALF_RANGE_M)
-                                 if saved_reference is not None else Z_SAMPLE_XY_HALF_RANGE_M)
     terminal.configuration(checkpoint, act_path, config, camera_shapes, args)
     if args.dry_run:
         terminal.write("[READY] Model check complete. Robot was not connected.")
         return 0
+
+    from act_rlt.human_input import validate_human_input
+
+    try:
+        validate_human_input(args.teleop_input_backend, args.teleop_keyboard)
+    except (RuntimeError, ImportError) as error:
+        parser.error(str(error).replace("--keyboard", "--teleop-keyboard"))
 
     from evo_rlt.adapters.lerobot.franka_robot import FrankaRobot, FrankaRobotConfig
 
     robot = FrankaRobot(FrankaRobotConfig(
         robot_ip=args.robot_ip, **robot_camera_kwargs(camera_shapes, args),
         include_gripper_action=policy.act_action_dim == 7, enable_fci_keepalive=False,
-        workspace_min_xyz=None if args.z_insertion_mode else tuple(args.workspace_min),
-        workspace_max_xyz=None if args.z_insertion_mode else tuple(args.workspace_max),
+        workspace_min_xyz=None,
+        workspace_max_xyz=None,
     ))
     if args.camera_boundary_mode == "timestamp":
         robot.enable_timestamped_observations()
@@ -247,26 +228,23 @@ def main(argv: list[str] | None = None) -> int:
         terminal.write(f"\nConnecting to robot {args.robot_ip} ...")
         robot.connect()
         terminal.write("[READY] Robot and cameras connected.")
-        reference_pose = None
-        initial_reference_pose = None
-        if args.z_insertion_mode:
-            reference_pose, workspace_min, workspace_max, initial_reference_pose = select_run_reference(
-                robot, startup_metadata.get("startup_reference"),
-                randomize_xy=args.randomize_reset_xy, terminal=terminal,
-            )
-            robot.config.workspace_min_xyz = tuple(workspace_min)
-            robot.config.workspace_max_xyz = tuple(workspace_max)
+        reference_pose, workspace_min, workspace_max, initial_reference_pose = select_run_reference(
+            robot, startup_metadata.get("startup_reference"),
+            randomize_xy=False, terminal=terminal,
+        )
+        robot.config.workspace_min_xyz = None
+        robot.config.workspace_max_xyz = None
         env = FrankaInsertionStage2Env(
             robot=robot, preprocessor=pre, postprocessor=post, config=config,
             fps=args.fps, episode_time_s=args.episode_time,
             max_step_m=config.max_step_m, max_step_rad=config.max_step_rad,
-            camera_shapes=camera_shapes, z_insertion_mode=args.z_insertion_mode,
+            camera_shapes=camera_shapes,
             reference_pose=reference_pose,
             initial_reference_pose=initial_reference_pose,
-            reset_xy_half_range_m=args.reset_xy_half_range_m,
-            randomize_reset_xy=args.randomize_reset_xy,
-            sample_min=None if args.sample_min is None else tuple(args.sample_min),
-            sample_max=None if args.sample_max is None else tuple(args.sample_max),
+            teleop_input_backend=args.teleop_input_backend,
+            teleop_keyboard=args.teleop_keyboard,
+            enforce_workspace=False,
+            enable_random_reset=False,
             observation_selection=args.observation_selection,
             inference_terminal=terminal,
         )

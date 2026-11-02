@@ -10,15 +10,14 @@
 
 - 固定起点高度：`SAMPLE_Z_M = 0.402`，是绝对 Z，不是相对参考点抬高 0.402 m。
 - 固定起点姿态：内禀 XYZ 欧拉角 `(179.7°, 1.4°, 90.6°)`，转换为旋转向量后发送给机器人。
-- 数采默认插入距离：沿基坐标系 −Z 前进 0.004 m（0.4 cm）。
+- 数采默认插入距离：沿基坐标系 −Z 前进 0.006 m（0.6 cm）。
 
 | 路径 | 启动时确定的参考 | episode 起点 X/Y | 起点 Z / 姿态 |
 | --- | --- | --- | --- |
-| ACT 数采 | 手动示教完整参考位姿 p0 | X=p0.X±2.5 cm；Y=p0.Y+[0.3, 2] cm | Z=0.402 m；固定采样姿态 |
+| ACT 数采 | 手动示教完整参考位姿 p0 | X=p0.X+[0, 2.5] cm；Y=p0.Y+[0.3, 2] cm | Z=0.402 m；固定采样姿态 |
 | ACT infer | 按 Enter 时的实测 TCP X/Y 中心 | X/Y 各在中心 ±1 cm 内均匀采样 | Z=0.402 m；固定采样姿态 |
-| train Stage 2，Z 插入模式 | 启动采集的 p1 参考位姿 | 默认围绕首次 reference 的 X/Y 随机采样，范围可用 =/- 调整 | Z=0.402 m；固定采样姿态 |
-| infer Stage 2，Z 插入模式 | 默认恢复 checkpoint 中首次训练采集的 p1 参考位姿；无记录时手动采集 | 与训练共用随机 XY reset；范围可用 =/- 调整 | Z=0.402 m；固定采样姿态 |
-| train / infer Stage 2，普通模式 | 显式 workspace，以及首次重置时的实测姿态 | 在 sample box 内采样；未指定时用 workspace 并留 XY 边距 | Z 在采样范围内随机；保留首次实测姿态 |
+| train Stage 2 | 启动采集的 p1 参考位姿；续训恢复保存值 | 默认半范围为 0，固定在当前 reference 的 X/Y；可用 =/- 调整范围 | Z=0.402 m；固定采样姿态 |
+| infer Stage 2 | 选择训练参考位姿或当前 TCP | 固定起点；可用 WASD 微调 | 保留确认后的完整起点位姿 |
 
 **数采的 p0 是轨迹经过的参考点；Stage 2 的 p1 是起点生成的 XY 基准。两者不是程序自动关联的同一个点。**当前数采、ACT infer 和 Stage 2 的起点分布也不同，比较效果时应记录实际起点。
 
@@ -30,12 +29,12 @@
 
 1. 手动引导机器人到参考点 p0，按 Enter 保存完整 TCP 位姿，包括位置和姿态。
 2. 每个 episode 均匀采样一个起点：
-   - `X = p0.X + U(-0.025, 0.025)`。
+   - `X = p0.X + U(0, 0.025)`。
    - `Y = p0.Y + U(0.003, 0.02)`。
    - `Z = 0.402`。
    - 使用固定采样姿态。
 3. 移动到起点，默认等待 1 s，然后开始录制。
-4. 录制两段运动：**采样起点 → 完整 p0 位姿 → 相对 p0 沿基坐标系 −Z 移动 0.4 cm、同时沿 −Y 移动 0.1 cm 的终点**；插入时姿态保持 p0 的值。
+4. 录制两段运动：**采样起点 → 完整 p0 位姿 → 相对 p0 沿基坐标系 −Z 移动 0.6 cm、同时沿 −Y 移动 0.1 cm 的终点**；插入时姿态保持 p0 的值。
 5. 成功完成录制后保存 episode；默认等待 1 s，再回到 p0，继续下一次采样。
 
 移动到起点和保存后的回退不属于示范轨迹。由于起点使用固定姿态，而 p0 保留示教姿态，第一段运动可能同时包含平移和旋转。
@@ -83,7 +82,11 @@ python -m act_rlt.infer \
 
 启动后加载 ACT checkpoint 和保存的 pre/postprocessor，连接机器人，用真实观测预热模型。运动模式下，按 Enter 采集当前完整 TCP 参考位姿，workspace 设为参考位置 XYZ 各 ±5 cm；起点 Z 和姿态使用上述固定采样常量。
 
-XY 采样半范围默认 **0 cm**，起点 XY 固定为首次参考点。`=` / `-` 以 0.5 cm 步长调整半范围（0–5 cm），只影响下次采样；`r` 重新采样并移动。首次移动前需确认，抵达起点后按 Enter/y 开始推理，`q` 退出；保留 `s` 开始、`n` 重采样兼容按键。首次移动确认时调整范围会重新生成目标。
+XY 采样半范围默认 **0 cm**。`=` / `-` 以 0.5 cm 步长调整半范围（0–5 cm），只影响下次采样；`r` 重新采样并移动。首次移动前需确认，抵达起点后按 Enter/y 开始推理，`q` 退出；`n` 也可重采样。首次移动确认时调整范围会重新生成目标。
+
+首次移动确认、等待开始和回合结束菜单中，均可按住 WASD 连续移动（W=-X、S=+X、A=-Y、D=+Y，3 cm/s），松开停止。选定菜单操作时先停止 servo，再用实测 TCP 更新 reference 和当前起点；之后的随机采样围绕新的 XY。首次确认菜单若发生移动，会重新显示更新后的采样目标供确认。S 仅用于移动，开始推理请按 Enter/y。键盘后端默认 `auto`（X11 用 pynput，否则 evdev），可通过 `--teleop-input-backend` 和 `--teleop-keyboard` 指定。
+
+加 `--use-reference-pose` 时，起点 Z 和姿态也使用参考点，并随 WASD 后的实测参考更新，同时取消 XYZ workspace 限制；不加时仍使用固定采集 Z/姿态。
 
 episode 结束后：
 
@@ -91,7 +94,7 @@ episode 结束后：
 - `n`：从结束位姿先沿 +Z 抬高 1 cm，再移动到新的采样点。
 - `q`：退出。
 
-采样中心始终固定在首次参考点；采样区域须位于 workspace 内。回退 +Z 1 cm 前也检查 workspace，越界则停止移动。回合结束菜单的 `r` 仍表示返回本回合起点，`n` 表示采新点。
+未启用 `--use-reference-pose` 时，workspace 保持启动确认的 XYZ ±5 cm，WASD 和采样均受该范围约束；回退 +Z 1 cm 前也检查 workspace，越界则停止移动。回合结束菜单的 `r` 表示返回当前保存的起点（WASD 移动后更新），`n` 表示采新点。
 
 ### 推理与控制流程
 
@@ -156,7 +159,7 @@ python -m act_rlt.train_rl_token \
 
 ### Z 插入模式的随机起点
 
-开启 `--z-insertion-mode` 后，新训练在启动时按 Enter 采集最初的 reference pose；workspace 为该位置 XYZ 各 ±5 cm。默认以首次 reference 的 X/Y 为中心，X/Y 各在 **±1 cm** 内均匀采样，Z 固定为 0.402 m，姿态固定为采样姿态。三个固定 reset 点及 `1/2/3` 选择已移除。`--randomize-reset-xy` 仅保留为旧命令兼容选项，无需传入。
+Stage 2 训练默认采用 Z 插入配置，已移除模式选择参数。新训练在启动时按 Enter 采集最初的 reference pose；workspace 限制已取消，旧 checkpoint 中的边界也不再生效。默认起始 XY 半范围为 **0**，固定在当前 reference 的 X/Y；通过 `=` 调大范围后，在该范围内均匀采样，Z 固定为 0.402 m，姿态固定为采样姿态。三个固定 reset 点及 `1/2/3` 选择已移除。XY 采样无需额外参数；半范围为 0 时固定 XY。
 
 每轮开始前（包括首次移动确认界面），可直接按键，无需回车：
 
@@ -168,58 +171,19 @@ python -m act_rlt.train_rl_token \
 | Enter / `y` | 从当前已抵达的位置开始 episode |
 | `q` | 停止 |
 
-半范围限制为 **0–5 cm**，初始为 1 cm；例如 2 cm 表示 X/Y 各在 reference ±2 cm 内采样。范围为 0 时，X/Y 固定为 reference 的 X/Y。按 `=` / `-` 不移动当前 TCP，新范围用于下一次 reset 或按 `r` 重采样，并在本次进程后续 episode 中保留。首次移动确认时调整范围会重新生成待确认的目标。
+半范围限制为 **0–5 cm**，初始为 0；例如 2 cm 表示 X/Y 各在 reference ±2 cm 内采样。范围为 0 时，X/Y 固定为 reference 的 X/Y。按 `=` / `-` 不移动当前 TCP，新范围用于下一次 reset 或按 `r` 重采样，并在本次进程后续 episode 中保留。首次移动确认时调整范围会重新生成待确认的目标。
 
-采样中心始终为首次 reference，不随 TCP 当前位置、上次 reset 位置或范围变化而移动。采集的完整参考位姿、workspace 和初始随机范围会写入 `startup_reference.json` 及 checkpoint 的 `startup_reference` 字段，首次信息保存在 `initial_reference` 中。使用 `--resume` 时恢复首次 reference 和 workspace，不重新采集；旧 checkpoint 没有该记录时需重新采集，此次采集成为可追溯的初始 reference。
+在起点界面用 WASD 移动后，结束该次输入时先停止伺服，再读取实际 TCP XY 更新当前 reference；后续 reset 和 `r` 重采样围绕更新后的 XY。仅更新 XY，reference 的 Z/姿态保持不变。未进行 WASD 移动时，随机 reset 或 episode 动作不会改变 reference。首次移动确认前的 WASD 调整也会更新待移动目标 XY，避免返回旧位置。当前 reference 和范围随 checkpoint 保存，并同步写入 `startup_reference.json`；续训恢复当前 reference，最初采集的信息仍保存在 `initial_reference` 中，旧 workspace 限制不恢复。
 
-首次移动需确认；每轮结束后沿当前实测位置 +Z 回退 1 cm。所有 reset 目标仍需通过 workspace 校验。
+首次移动需确认；每轮结束后沿当前实测位置 +Z 回退 1 cm。reset、episode 动作和 WASD 均不受 workspace 限制；单步动作限幅及 WASD 会话距离限制仍保留。
 
-### 普通模式
+### Episode 控制
 
-未开启 Z 插入模式时，需要传入 `--workspace-min/max`。可通过 `--sample-min/max` 指定起点采样区域；否则在 workspace 中采样，并在 X/Y 两侧各留 2 cm 边距。Z 随机采样，姿态固定为首次重置时的实测 TCP 姿态。episode 结束后沿 +Y 回退 1 cm。
+Critic 默认使用 **1 chunk TD**。添加 `--three-chunk-td` 才开启 **3 chunk TD**：累计连续三个 chunk（通常 12 个控制 step）的折扣奖励，从该跨度末端的状态 bootstrap。episode 提前结束时缩短跨度并停止 bootstrap；尚未收集满三个 chunk 的非终止样本等待后续数据。Actor/Critic 的动作输入仍为一个四步 chunk，BC 目标也只对应第一个 chunk。重叠 replay 按 episode 内真实 step 索引衔接；旧 v3 checkpoint 可直接续训并保留网络和优化器。新训练和续训均以命令行开关为准：传入 `--three-chunk-td` 使用 3 chunk，不传则使用 1 chunk，即使 checkpoint 原先使用 3 chunk。
 
-### 在线训练与推理流程
-
-ACT 和 Stage 1 RL Token 编码器被冻结并保持 eval，在线更新 Actor 和 Critic。
-
-### 按 `p` 保存独立 episode 快照
-
-每轮结束后，在下一轮开始前的起点等待菜单按 **`p`**（无需回车），保存当前完整训练状态，并继续留在菜单；按 Enter 继续原训练。此按键在训练等待界面可用，活动 episode 中不执行快照保存。
-
-快照创建在原 output 的同级目录，名字为 `<原output名字>_step<累计env_steps>`。例如原 output 是 `outputs/ethernet_rlt/stage2_new_run`、当前累计 1234 步，则创建：
-
-```text
-outputs/ethernet_rlt/stage2_new_run_step1234/
-  checkpoints/latest.pt
-  config.json
-  startup_reference.json   # Z 插入模式
-  snapshot.json
-```
-
-包含 Actor/Critic、目标网络、优化器、replay、训练进度、随机状态、reference 和当前 XY reset 范围。保存通过临时目录完成后再发布，同一步数已存在的快照不会覆盖。原训练仍继续写 `outputs/ethernet_rlt/stage2_new_run`，后续自动保存不会覆盖这个并列快照。
-
-- **Resume**：在原训练命令中将 `--output` 改为 `outputs/ethernet_rlt/stage2_new_run_step1234`，添加现有 `--resume`，其他训练参数保持兼容；无需 `--resume-from`。这会在快照目录中继续训练，其 `latest.pt` 随后按原规则更新。
-- **Infer**：将 `--checkpoint` 指向该快照目录；Actor 必须已经初始化，warmup 阶段的未初始化快照可 resume，不能直接 infer。
-- Resume 和 infer 恢复保存的 XY reset 范围；无此字段的旧 checkpoint 使用默认 ±1 cm。
-
-原 output 的自动保存机制不变：每轮 episode 结束、每累计 1000 个环境步，以及退出时更新原目录的 `checkpoints/latest.pt`。
-
-```text
-观测 → ACT preprocessor → 完整 ACT
-                          ├─ 参考 action chunk
-                          └─ encoder hidden → RL Token
-RL Token + 归一化关节状态 + 参考 chunk → Actor
-  → ACT postprocessor → 物理限幅 → 固定 chunk 执行
-  → 下一观测 → replay transition → Actor/Critic 更新
-```
-
-- 默认先采集 4,000 个低层动作步作为 warmup，只执行 ACT 参考动作、填充 replay，不更新网络。
-- warmup 结束后，默认进行 1,000 次 Actor BC 初始化及 1,000 次 Critic 初始化。
-- 随后默认采集 10,000 个 online 动作步；每个 chunk 对应一个 transition，执行 5 次 Critic 更新，每两次 Critic 更新执行一次 Actor 更新。
-- Stage 2 默认 chunk 长度为 4；ACT 完整推理的参考 chunk 取前四步。Actor 输出六维 TCP 动作，夹爪不在 RL 动作空间内。
 - online 采集使用带高斯探索噪声的 Actor；warmup 使用 ACT 参考动作。
 - 成功终止奖励为 +1，其余步骤为 0。按 `s/f` 在当前 chunk 结束后标记成功/失败，`q` 停止；超时后也会询问结果。奖励时刻应尽量贴近实际完成时刻。
-- `--enable-human-intervention` 支持 Space 在 chunk 边界接管/归还控制，人工 XYZ 控制按键为 W/X/A/D/P/L，S/F 标记结果，Esc 停止。
+- `--enable-human-intervention` 使用 SpaceMouse 六轴人工接管，Space 在 chunk 边界接管/归还，S/F 标记结果并保留 replay，D 结束并删除整轮 replay，Esc 停止。episode 内移动键停用，起点界面保留 WASD。默认每轴平移 13.5 mm/s、roll/pitch 0.09 rad/s、yaw 0.108 rad/s（角速度参数的 1.2 倍）、死区 0.05；可通过 `--teleop-speed-m-s`、`--teleop-angular-speed-rad-s`、`--spacemouse-deadzone` 调节。训练自动启动独立 ROS 输入进程，请勿同时运行独立 SpaceMouse 控制脚本；设备默认 `/dev/hidraw4`，可设置 `SPACEMOUSE_DEVICE`。松开设备再按 Space 归还策略；未请求切换时不因接管开关额外等待，下一轮观测/推理与第 4 步剩余周期重叠。边界切换判定之后收到的 Space 留到下一 chunk 边界处理。输入超过 0.2 s 未更新时停止人工运动。人工实际平移及转换后的局部旋转增量写入 replay，并作为 BC 目标。
 
 相机、推理、伺服持续运行，学习在调用线程中进行。推理使用发布的 Actor 快照，避免读取正在更新的参数。固定 chunk 不做 temporal ensemble，也不在 chunk 中途重新规划；沿用每步实测 TCP 锚定。
 
@@ -230,10 +194,14 @@ python -m act_rlt.train_stage2 \
   --stage1-checkpoint outputs/ethernet_token/act_dataset_928_state7_stage1_pos \
   --act-checkpoint outputs/ethernet_act/act_dataset_928_state7_act \
   --output outputs/ethernet_rlt/stage2_new_run \
-  --z-insertion-mode --fps 30 --allow-motion
+  --fps 30 --allow-motion
 ```
 
-Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--total-env-steps` 是累计 online 步数目标，不包含 warmup。`--dry-run` 只检查模型和 processor，不连接机器人。
+加 `--use-reference-pose` 后，reset 的 Z 和姿态使用首次采集或续训恢复的 reference；XY 继续按现有半范围采样（新训练默认 0）。不加时仍固定 Z=0.402 m 和采集姿态。该参数以本次启动命令为准，续训需要继续传入；checkpoint 的 startup reference 会记录当前选择和实际 reset Z/姿态。
+
+Online 更新中每更新 2 次 Critic，更新 1 次 Actor（`actor_update_interval=2`）；默认每个保留 chunk 更新 5 次 Critic，Actor 按该间隔更新。续训也采用当前的更新频率，历史更新计数保留。warmup 后的 BC 初始化、Critic 初始化阶段保持原规则。
+
+默认 30 Hz，可通过 `--fps` 调整，episode 默认 5 s。`--total-env-steps` 是累计 online 步数目标，不包含 warmup。`--dry-run` 只检查模型和 processor，不连接机器人。
 
 ## 5. infer Stage 2
 
@@ -241,11 +209,9 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 
 ### 起点是否与训练相同
 
-开启 `--z-insertion-mode` 后，infer 在连接机器人后选择本次 run 的参考点：`t` 使用 checkpoint 保存的首次训练 reference 和 X/Z workspace 边界，并将 Y workspace 设为该 reference 的 ±10 cm；`c` 则按 Enter 采集当前 TCP，workspace 设为 X/Z 各 ±5 cm、Y ±10 cm。整次 run 的采样中心固定为选定参考点。两种选择均沿用 checkpoint 保存的 reset 半范围（旧 checkpoint 默认 1 cm）。每轮开始前用 `=` / `-` 以 0.5 cm 步长调整下一次 reset 半范围（0–5 cm），按 `r` 可立即重新采样，按 Enter 开始本轮。与 train 共用同一套范围调整逻辑，采样中心始终不变。
+infer 默认使用 Z insertion 行为，默认 30 Hz，结束沿 +Z 回退 1 cm。已移除 `--z-insertion-mode` 参数和 workspace 限制：选择 `t` 仅恢复训练参考位姿，选择 `c` 立即采集当前 TCP，不生成或恢复空间边界。
 
-选择训练参考点时，每轮 infer 开始前还可按 **`4`** 立即移动到训练首次采集的完整 reference pose，含当时的 Z 和姿态。首次移动确认界面也支持 `4`；抵达后按 Enter 才开始 infer。按 `4` 不改变采样中心或范围，之后按 `r` 会继续围绕首次 reference 随机采样。
-
-普通随机 reset 的 Z 仍为 0.402 m、姿态仍固定。选择当前 TCP 或旧 checkpoint 无训练参考记录时，手动采集本次 reference，`4` 不可用；普通模式仍从指定的 workspace/sample box 采样。控制频率和观测选择由 infer 参数指定，比较训练与推理时应使用相同设置。
+infer 无随机采样。WASD 调整后按 Enter/y 开始，保存实际完整位姿作为后续起点。WASD 仍保留单次键盘会话距离起点 15 cm 的独立限制。
 
 ### 推理流程
 
@@ -261,11 +227,13 @@ Z 插入模式默认 30 Hz，普通模式默认 15 Hz，episode 默认 5 s。`--
 ```bash
 python -m act_rlt.infer_stage2 \
   --checkpoint outputs/ethernet_rlt/stage2_new_run \
-  --z-insertion-mode --fps 30 --episodes 10 \
+  --fps 30 --episodes 10 \
   --episode-time 5 --allow-motion
 ```
 
 `--checkpoint` 可指向 run 目录或具体 `.pt` 文件；run 目录解析为 `checkpoints/latest.pt`。配套模型路径变化时可传入 `--act-checkpoint` 和 `--stage1-checkpoint`。`--dry-run` 只加载检查模型，不连接机器人。
+
+起点确认界面的 WASD 使用 `--teleop-input-backend auto`：有 X11 `DISPLAY` 时选择 pynput，无图形会话时选择 evdev。ToDesk/X11 可显式传 `--teleop-input-backend pynput`。使用实体键盘且检测到多个设备时，传入 `--teleop-input-backend evdev --teleop-keyboard /dev/input/eventN` 指定实际使用的设备；指定设备时 auto 也会选择 evdev。键盘检查在连接机器人前完成，`--dry-run` 不检查键盘。
 
 ## 6. 图像与对比实验
 
@@ -280,7 +248,7 @@ python -m act_rlt.train_stage2 \
   --stage1-checkpoint outputs/ethernet_token/act_dataset_928_addon_rgb_z_action6_stage1_pos \
   --act-checkpoint outputs/ethernet_act/act_dataset_928_addon_rgb_z_action6_act \
   --output outputs/ethernet_rlt/rlt_928_addon_rgb_z_action6 \
-  --z-insertion-mode --randomize-reset-xy --allow-motion \
+  --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```
 
@@ -293,7 +261,7 @@ python -m act_rlt.train_stage2 \
   --stage1-checkpoint outputs/ethernet_token/act_dataset_928_camera_only_action6_stage1_pos \
   --act-checkpoint outputs/ethernet_act/act_dataset_928_camera_only_action6_act \
   --output outputs/ethernet_rlt/rlt_camera_only_action6 \
-  --z-insertion-mode --allow-motion \
+  --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```
 
@@ -304,7 +272,7 @@ python -m act_rlt.train_stage2 \
   --stage1-checkpoint outputs/ethernet_token/act_1010_rgb_wrench_action6_stage1_pos \
   --act-checkpoint outputs/ethernet_act/act_1010_rgb_wrench_action6_act \
   --output outputs/ethernet_rlt/rlt_rgb_wrench_action6 \
-  --z-insertion-mode --allow-motion \
+  --allow-motion \
   --warmup-steps 2000 --total-env-steps 50000 --episode-time 15
 ```
 
@@ -315,3 +283,21 @@ python -m act_rlt.train_stage2 \
 ACT 和 Stage 2 均按 ACT checkpoint 的相机键与图像尺寸处理输入。腕部相机保持配置的采集尺寸；前置相机输出统一为 640×480。图像转为 CHW、像素除以 255，再通过 checkpoint 的 processor 标准化。当前 ACT 路径不自动缩小为 224×224。
 
 对比 ACT 与 Stage 2 时应记录起点绝对位姿、控制频率、观测选择、temporal ensemble、residual control、单步限幅、成功标记时刻以及实际完成时间。ACT 默认 temporal ensemble，Stage 2 固定 chunk；数采和两类推理的起点分布也不同。这些差异都会影响任务完成速度和成功率。
+
+
+### Episode replay 保留 / 删除
+
+episode 内按 S（成功）或 F（失败）在当前 4-step chunk 结束后自动保留数据，
+没有二次确认。按 D 则在当前 chunk 结束后结束本轮并丢弃整轮数据；普通
+终端模式可用小写 d，SpaceMouse 接管的键盘监听也支持 D。超时后选择结果时
+同样可输入 d 删除。起点菜单的 D 仍用于 WASD 移动，不会删除数据。
+
+为保证删除的数据未参与训练，本轮所有 transition 暂存在独立列表中，
+不进入 replay；S/F 确认后一次性提交，并在机器人停止后按保留 chunk 数
+执行对应更新（默认每 chunk 5 次 Critic）。episode 内不更新 Actor/Critic，
+下一轮使用更新后的 Actor。D 会清除普通 chunk 和全部重叠窗口，不产生
+本轮训练更新，也不计入 warmup/online 有效步数。实际执行总步数、episode
+数及日志仍记录，删除时终端输出 `REPLAY=DELETED`。
+
+中途停止或异常退出时，尚未提交的本轮缓存不会写入 checkpoint。
+达到 online 总预算而暂停的最后一段默认提交，不弹出额外确认。

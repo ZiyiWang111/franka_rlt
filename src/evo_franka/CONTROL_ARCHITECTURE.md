@@ -108,7 +108,7 @@ Ruckig → q_d → FR3 内部 joint impedance controller → τ → 电机
 | ZMQ server command | 事件驱动，合并最新 streaming 目标；没有独立固定 command rate |
 | ZMQ server 状态发布 | 默认 100 Hz |
 | ACT action 播放 | 默认 30 Hz，可由 `--fps` 修改 |
-| ACT-RLT Stage-2 action 播放 | 默认 15 Hz；`z_insertion_mode` 默认 30 Hz |
+| ACT-RLT Stage-2 action 播放 | 默认 30 Hz；`--fps` 可覆盖 |
 | π0.5 remote action 播放 | 默认 15 Hz |
 
 模型推理按 chunk 进行，实际推理频率不等于 action 播放频率，取决于 checkpoint、chunk 长度、计算耗时和运行配置。

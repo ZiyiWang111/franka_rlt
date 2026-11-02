@@ -1,0 +1,33 @@
+{
+  "status": "COMPLETE_DOWNLOADED",
+  "host": "wangziyi@10.0.40.207",
+  "gpu": 0,
+  "execution": "sequential",
+  "runs": [
+    "act_1023_z_token",
+    "act_1023_z_cvae_token"
+  ],
+  "tokens_per_model": 1,
+  "batch_per_model": 16,
+  "steps_per_model": 10000,
+  "validation": false,
+  "training_episodes": 450,
+  "training_frames": 35244,
+  "encoder_input": "encoder_out only; no additional positional embedding",
+  "act_frozen": true,
+  "cvae_latent": "zeros, eval mode",
+  "code_commit": "125f740",
+  "compatibility_patch": "allow frozen CVAE",
+  "remote_project": "/home/wangziyi/workspace/franka_rlt",
+  "environment": "new isolated LeRobot 0.5.1 environment required",
+  "data_and_act_bytes": 861304082,
+  "checkpoints": "final only",
+  "image_augmentation": "same ColorJitter as ACT: brightness/contrast/saturation 0.9-1.1, hue +/-0.02, max 3",
+  "environment_strategy": "relocate verified local conda environment using conda-pack",
+  "environment_prefix": "/home/wangziyi/.conda/envs/evo-rlt-act1023",
+  "payload_sha256": "f9dc127de2f22af2df24f9b251090e37afa1dacf08076b73f5f323963f12a246",
+  "environment_sha256": "8c51d7e3c3ebaf7a146d83fb8a2e9e7f647b92a66d3bdd625ecb2283bc7ac7a7",
+  "launcher_pid": 660414,
+  "first_training_pid": 660419,
+  "started_at": "2026-10-27T11:46:09+08:00"
+}

@@ -361,7 +361,16 @@ initialization; no environment steps are consumed and its duration is excluded
 from the episode timeout. The frozen ACT and RL Token encoder remain unchanged.
 
 Success supplies a single terminal +1; other steps supply zero. The target is
-`sum(gamma**i * reward[i]) + gamma**actual_steps * (1-done) * clamp(min_target_Q, 0, 1)`.
+`sum(gamma**i * reward[i], i=0..K-1) + gamma**K * (1-done_at_horizon) * clamp(min_target_Q, 0, 1)`.
+Stage 2 defaults to one-chunk TD. Add `--three-chunk-td` to enable three-chunk
+TD: K is then the sum of actual steps over up to three
+consecutive chunks, normally 12. Episode termination/truncation shortens the
+horizon; incomplete nonterminal starts wait for more data. The Critic action
+and Actor BC target still contain only the first four-step chunk. Replay time
+indices keep overlapping windows aligned to physical steps rather than storage
+order. Existing v3 checkpoints retain network and optimizer state when changing
+horizons. Pass `--three-chunk-td` on resume to use three chunks; without the
+flag, training uses `td_chunks=1`, including when resuming a three-chunk run.
 Unexecuted reward padding is masked. Truncations (including workspace refusals)
 are treated as episode ends with no bootstrap, matching this reset-based task.
 The deterministic target Actor supplies next actions. Both target actions and
@@ -442,46 +451,20 @@ python -m act_rlt.train_stage2 \
   --stage1-checkpoint outputs/ethernet_token/act_rlt_001_stage1_pos \
   --act-checkpoint outputs/ethernet_act/act_rlt_001_state7_act \
   --output outputs/ethernet_rlt/act_rlt_001_stage2 \
-  --allow-motion \
-  --workspace-min X_MIN Y_MIN Z_MIN \
-  --workspace-max X_MAX Y_MAX Z_MAX \
-  --sample-min SAMPLE_X_MIN SAMPLE_Y_MIN SAMPLE_Z_MIN \
-  --sample-max SAMPLE_X_MAX SAMPLE_Y_MAX SAMPLE_Z_MAX
+  --allow-motion
 ```
 
-No orientation teaching or orientation argument is required. Before Episode 0,
-the program reads the current TCP rotation vector, samples a reset XYZ,
-asks for one-time authorization, and moves there. Without a sample box, sampled
-X/Y stays at least 2 cm inside the workspace boundaries; Z uses the full
-configured range. The optional `--sample-min` / `--sample-max` pair instead
-selects reset poses from that exact box, which must lie inside the workspace.
-The workspace remains the hard safety boundary for every commanded TCP target.
-Without an explicit sample box, workspace X/Y spans must each exceed 4 cm.
-After each episode, the arm automatically retreats 1 cm along base-frame +Y and
-samples the next reset pose, then asks whether to accept it or sample again.
-### Z-insertion reset mode
-
-For the wrist-only `act_rlt_z_350` insertion policy, pass
-`--act-checkpoint outputs/ethernet_act/act_rlt_z_350` with its matching RL Token checkpoint
-and add `--z-insertion-mode`. Stage 2 opens only the checkpoint's 1280x720 wrist
-camera. At startup it asks the operator to place the TCP at p1 and press Enter
-before moving. The TCP pose read at Enter becomes the p1 reference;
-its XYZ coordinates define the safety workspace at ±5 cm on each axis.
-Without `--randomize-reset-xy`, that same confirmation records three reset
-points in the base frame: p1 uses the captured XY, p2 uses X−2 cm/Y−2 cm,
-and p3 uses X+2 cm/Y−2 cm. Before each episode, press `1`, `2`, or `3` to
-move immediately to the corresponding point, then press Enter to start.
-The first reset goes to p1; subsequent resets return to the last selected
-point. The fixed-point menu has no `r` option.
-Add `--randomize-reset-xy` to sample X/Y within ±1 cm of p1 instead; this mode
-retains the Enter/y confirmation and `r` resampling menu, without point switching.
-Both modes use fixed absolute Z = 0.402 m and the
-recorder's intrinsic XYZ Euler orientation `(179.7, 1.4, 90.6)` degrees.
-The fixed sample must lie inside the captured workspace. The reference pose
-is retained as measured; the arm retreats +Z 1 cm after each episode.
-Z insertion defaults to 30 Hz; the original reset
-mode keeps its 15 Hz default. Omit `--workspace-min` / `--workspace-max` and
-`--sample-min` / `--sample-max` in Z insertion mode.
+Stage-2 training uses Z insertion reset by default at 30 Hz. At startup,
+place the TCP at the reference pose and press Enter to capture it. Workspace limits are disabled; resume restores the
+saved reference and ignores any old workspace limits. The initial reset XY half range is 0, fixing X/Y at the reference.
+Increase the half range with `=` to enable uniform XY sampling, with fixed absolute Z = 0.402 m and intrinsic XYZ Euler
+orientation `(179.7, 1.4, 90.6)` degrees. Use `=` / `-` to adjust the next XY
+half range, `r` to resample, and Enter/y to start from the current pose.
+The arm retreats +Z 1 cm after each episode. Policy, reset and idle WASD
+commands do not use workspace bounds. Per-step limits and the WASD session
+distance limit remain. Omit workspace/sample bounds;
+the mode-selection parameter has been removed. `--fps` can override 30 Hz.
+For a wrist-only ACT checkpoint, only its configured wrist camera is opened.
 
 For example, with the matching wrist-only ACT and Stage-1 checkpoints:
 
@@ -490,7 +473,7 @@ python -m act_rlt.train_stage2 \
   --act-checkpoint outputs/ethernet_act/act_rlt_z_350 \
   --stage1-checkpoint /path/to/matching_stage1 \
   --output outputs/ethernet_rlt/act_rlt_z_stage2 \
-  --allow-motion --z-insertion-mode
+  --allow-motion
 ```
 
 ### Outcomes and human intervention
@@ -503,38 +486,45 @@ that limit, if no outcome was entered, the robot stops and asks for `s`, `f`,
 or `q` before reset.
 Without human intervention, `q` also stops training during rollout.
 
-Add `--enable-human-intervention` to allow keyboard takeover during rollout.
-The keyboard is read by the Stage-2 process through pynput in an X11/ToDesk
-session, or evdev on a headless host. Set `--teleop-input-backend evdev`
-to force a physical keyboard, and `--teleop-keyboard /dev/input/eventN` if
-evdev finds more than one keyboard. Supplying `--teleop-keyboard` also selects
-evdev when the backend is left at its `auto` default.
-The input device is acquired only during an active episode and released before
-reset or outcome prompts. The separate `scripts/fr3_keyboard_teleop.py` process
-must not be launched at the same time: Stage-2 owns the single FR3 connection.
+Add `--use-reference-pose` to reset with the captured/restored reference Z and
+orientation, keeping the existing XY range rules. Without it, fixed collection
+Z/orientation remain the default. Pass the flag again when resuming. The active
+reset mode and pose are recorded in startup-reference metadata.
 
-Controls while intervention is enabled:
+Add `--enable-human-intervention` to use SpaceMouse takeover in warmup and rollout.
+Stage-2 automatically starts a read-only input worker using the same official
+publisher and axis mapping as `scripts/fr3_spacemouse_control.sh`. The worker
+uses ROS Humble's Python separately from the training environment and never
+connects to the robot. Do not run the standalone SpaceMouse control script
+alongside training. Set `SPACEMOUSE_DEVICE=/dev/hidrawN` when needed; the default
+is `/dev/hidraw4`. `SPACEMOUSE_SUPPORT_DIR` and `SPACEMOUSE_PYTHON` have the same
+meaning as in the standalone script. Live input is checked before connecting
+the robot, and the worker remains open across episodes until training exits.
 
-```text
-Space       request human takeover / return to policy
-W/X         +X / -X (base frame)
-A/D         +Y / -Y (base frame)
-P/L         +Z / -Z (base frame)
-S/F         label success / failure after the current four-action chunk
-F8/F9       alternative success / failure keys
-Esc         stop training
-```
+Keyboard events still provide Space (take over/return), S/F (success/failure),
+F8/F9 (alternative outcomes), Esc (stop), and B (policy downward bias).
+Episode movement keys W/X/A/D/P/L are disabled. The reset menu retains WASD XY
+jogging and exploration-bias keys. Keyboard selection still uses
+`--teleop-input-backend {auto,evdev,pynput}` and `--teleop-keyboard`.
 
-Space requests are applied after the current four-step chunk has finished its
-last control period. The robot stops its servo stream and acknowledges the stop
-before changing control source. Release all direction keys before pressing
-Space to return to policy. A key release stops human motion while the episode
-stays in human mode. The first policy action after return is inferred from a
-fresh observation, never from an old queued chunk. Human direction commands
-run at `--fps` using `--teleop-speed-m-s` (default 0.01 m/s); startup rejects
-a speed whose per-tick displacement exceeds `--max-step-m`. Existing workspace
-and command-lead limits remain active. Stage-2 human control covers XYZ only;
-gripper, orientation, and waypoint keys are not part of this rollout format.
+Space takes effect after the current four-step chunk's last control period,
+with an acknowledged servo stop before switching. Without a pending switch or
+outcome, enabling intervention adds no last-period wait: observation/inference
+work overlaps the fourth action's remaining period. A Space request arriving
+after the boundary decision is handled at the next chunk boundary.
+Release SpaceMouse before
+pressing Space to return. Releasing the device or receiving no fresh input
+for 0.2 s stops human motion while leaving human mode active. A failed input
+worker aborts collection and stops the servo. As with the standalone official
+publisher, a fresh cached HID value cannot prove the USB device is connected.
+
+Human six-axis velocities use `--teleop-speed-m-s` (default 0.0135 m/s per axis),
+`--teleop-angular-speed-rad-s` (default roll/pitch 0.09 rad/s, yaw 0.108 rad/s), and
+`--spacemouse-deadzone` (default 0.05). Spatial angular velocity is converted to
+the adapter's tool-local rotation increment before sending and replay storage.
+Startup checks the maximum combined per-tick translation and rotation against
+`--max-step-m` and `--max-step-rad`. Command-lead limits remain active; training
+workspace restrictions remain disabled. Gripper buttons are not connected.
 
 Takeover does not cut a policy chunk or create a short transition. Human
 control is recorded in four-step chunks with `source=HUMAN_OVERRIDE` and
@@ -574,7 +564,7 @@ python -m act_rlt.train_stage2 \
   --act-checkpoint outputs/ethernet_act/act_rlt_z_350 \
   --stage1-checkpoint /path/to/matching_stage1 \
   --output outputs/ethernet_rlt/act_rlt_z_stage2 \
-  --allow-motion --z-insertion-mode --resume --total-env-steps 20000
+  --allow-motion --resume --total-env-steps 20000
 ```
 
 ## Frozen Stage-2 inference
@@ -583,7 +573,7 @@ Use `act_rlt.infer_stage2` with an initialized Stage-2 v3 checkpoint. It loads
 the saved Actor, the matching Stage-1 RL Token and ACT checkpoints, and ACT's
 saved pre/postprocessors. It does not construct a learner, update weights, or
 save a training checkpoint. The Actor uses its mean action, without exploration
-noise. It executes fixed four-action chunks with the same workspace and physical
+noise. It executes fixed four-action chunks with the same physical
 step limits as Stage-2 training. Start the existing FR3 control server first.
 
 Check all three models without connecting to the robot:
@@ -594,24 +584,17 @@ python -m act_rlt.infer_stage2 \
   --dry-run
 ```
 
-For the original workspace mode, use the same safe bounds as training:
+Run inference from a fixed reference pose:
 
 ```bash
 python -m act_rlt.infer_stage2 \
   --checkpoint outputs/ethernet_rlt/act_rlt_001_stage2 \
-  --allow-motion --episodes 1 \
-  --workspace-min X_MIN Y_MIN Z_MIN \
-  --workspace-max X_MAX Y_MAX Z_MAX \
-  --sample-min SAMPLE_X_MIN SAMPLE_Y_MIN SAMPLE_Z_MIN \
-  --sample-max SAMPLE_X_MAX SAMPLE_Y_MAX SAMPLE_Z_MAX
+  --allow-motion --episodes 1
 ```
 
-The sample bounds are optional. For a Z-insertion checkpoint, pass its matching
-Stage-2 run and `--z-insertion-mode` instead of workspace/sample bounds.
-At startup, place the TCP at p1 and press Enter to capture the workspace.
-By default, reset points p1/p2/p3 use the same offsets and `1`/`2`/`3` selection
-menu as Stage-2 training; press Enter to start inference at the selected point.
-`--randomize-reset-xy` instead enables ±1 cm sampling around p1 with `r` resampling.
+Inference uses a fixed start pose. Choose the saved training reference or
+capture the current TCP, then use WASD and Enter/y to confirm the start.
+It has no random reset or workspace bounds and retreats +Z 1 cm after an episode.
 During
 an episode, `s` or `f` ends after the current chunk, `q` stops the session, and
 `--episode-time` sets the maximum rollout duration (default 5 seconds). Gripper

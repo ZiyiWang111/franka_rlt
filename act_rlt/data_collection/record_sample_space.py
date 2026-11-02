@@ -131,13 +131,13 @@ def build_parser(*, include_insertion_speed: bool = True) -> argparse.ArgumentPa
         "--insert-minus-z",
         type=float,
         default=DEFAULT_INSERT_MINUS_Z_M,
-        help="Recorded -Z advance from the reference pose (default: 0.004 m).",
+        help="Recorded -Z advance from the reference pose (default: 0.006 m).",
     )
     if include_insertion_speed:
         depth_options.add_argument(
             "--insertion-cm", dest="insert_minus_z", type=_centimeters_to_meters,
             default=argparse.SUPPRESS,
-            help="Second-stage insertion depth in centimetres along base -Z (default: 0.4 cm).",
+            help="Second-stage insertion depth in centimetres along base -Z (default: 0.6 cm).",
         )
     parser.add_argument("--abort-key", default="x", help="Single-key active-episode abort")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic sampler seed")
@@ -721,7 +721,7 @@ def main() -> int:
         print(f"FINAL (-Z {insertion_distance * 1000:.1f} mm, -Y 1.0 mm): {format_pose(final_pose)}")
         print(
             "Sample bounds (robot base frame): "
-            "x=x0+/-0.0250 m, y=[y0+0.0030, y0+0.0200] m, z=0.4020 m. "
+            "x=[x0, x0+0.0250] m, y=[y0+0.0030, y0+0.0200] m, z=0.4020 m. "
             f"Sample orientation is fixed XYZ Euler {SAMPLE_EULER_XYZ_DEG} deg. "
             "Reference and insertion retain the taught orientation."
         )

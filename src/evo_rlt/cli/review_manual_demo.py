@@ -56,15 +56,17 @@ def _read_count(total: int) -> int | None:
         print(f"请输入 1–{total - 1} 的整数；至少保留 1 个 episode。")
 
 
-def _resolve_editor() -> str:
-    command = "lerobot-edit-dataset"
-    resolved = shutil.which(command)
-    if resolved is not None:
-        return resolved
-    sibling = Path(sys.executable).parent / command
-    if sibling.is_file() and os.access(sibling, os.X_OK):
-        return str(sibling)
-    raise FileNotFoundError(f"当前 Python 环境中找不到 {command}")
+def _editor_command() -> list[str]:
+    # The editor is a separate process: install the shape=(1,) state reader
+    # compatibility there, just as training does, before loading the dataset.
+    project_root = Path(__file__).resolve().parents[3]
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {str(project_root)!r}); "
+        "from act_rlt.dataset_compat import install_scalar_state_dataset_edit_support; "
+        "install_scalar_state_dataset_edit_support(); "
+        "from lerobot.scripts.lerobot_edit_dataset import main; main()"
+    )
+    return [sys.executable, "-c", bootstrap]
 
 
 def _delete_tail(root: Path, count: int, snapshot: bytes) -> None:
@@ -81,7 +83,7 @@ def _delete_tail(root: Path, count: int, snapshot: bytes) -> None:
     if staging.exists() or backup.exists():
         raise FileExistsError("临时目录已存在，未执行删除")
     command = [
-        _resolve_editor(),
+        *_editor_command(),
         "--repo_id", root.name,
         "--root", str(root),
         "--new_repo_id", root.name,

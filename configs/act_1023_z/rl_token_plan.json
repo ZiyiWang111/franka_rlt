@@ -1,0 +1,13 @@
+{
+  "status": "AWAITING_CONFIG_CONFIRMATION",
+  "git_commit": "125f740",
+  "location": "local",
+  "tokens": 1,
+  "encoder_input": "encoder_out only; no extra positional embedding",
+  "steps": 10000,
+  "batch_size": 8,
+  "validation": false,
+  "gpu": "RTX 5060 Laptop 8GB",
+  "peak_allocated_gib": 5.15,
+  "peak_reserved_gib": 5.76
+}

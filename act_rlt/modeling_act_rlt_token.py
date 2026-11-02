@@ -83,8 +83,8 @@ class ACTRLTokenPolicy(PreTrainedPolicy):
         return act
 
     def _validate_act_compatibility(self, act_config: ACTConfig) -> None:
-        if act_config.use_vae:
-            raise ValueError("this Stage-1 implementation requires an ACT checkpoint with use_vae=false")
+        # Frozen eval-mode ACT uses the deterministic zero latent for both
+        # CVAE and non-CVAE checkpoints; the posterior encoder is not used.
         if act_config.dim_model != self.config.rl_token_dim:
             raise ValueError(
                 f"ACT dim_model={act_config.dim_model} does not match "

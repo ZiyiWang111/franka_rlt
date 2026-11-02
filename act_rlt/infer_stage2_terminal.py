@@ -51,11 +51,7 @@ class InferenceTerminal:
             ("Cameras", ", ".join(f"{name} {shape[1]}x{shape[0]}" for name, shape in cameras.items())),
             ("Step limits", f"{config.max_step_m * 1000:g} mm translation | {config.max_step_rad:g} rad rotation"),
         ]
-        if args.z_insertion_mode:
-            half_range_mm = getattr(args, "reset_xy_half_range_m", 0.01) * 1000
-            rows.append(("Reset", f"random XY +/-{half_range_mm:g} mm around initial reference | =/-: range +/-5 mm (0..50 mm)"))
-        else:
-            rows.append(("Reset", "random within configured sample/workspace bounds"))
+        rows.append(("Reset", "fixed start pose; WASD adjusts the next start"))
         self.write("\nSTAGE-2 INFERENCE")
         self.write("-" * 72)
         for label, value in rows:

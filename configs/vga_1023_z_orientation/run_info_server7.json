@@ -1,0 +1,80 @@
+{
+  "pid": 1427957,
+  "owner": "cefc3ccb50d34b068710970f60fd2c0d",
+  "host": "10.0.40.163",
+  "status": "WAITING_GPU",
+  "config": "/workspace/wangziyi/projects/vga_z_orientation_1029/configs/vga_1023_z_orientation/train_config.json",
+  "training_enabled": true,
+  "updated_at": "2026-10-29T10:13:50.475021+08:00",
+  "poll_seconds": 120,
+  "required_idle_samples": 5,
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-f3a68f3e-60dd-3993-0fde-aabc61ee8214",
+      "used_mib": 77555,
+      "util": 40,
+      "compute_process": true
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-32ebd8f8-32c3-602f-c048-238e1d27cde0",
+      "used_mib": 77553,
+      "util": 44,
+      "compute_process": true
+    },
+    {
+      "index": 2,
+      "uuid": "GPU-17881b37-6a1f-755b-98a5-afc9f543d387",
+      "used_mib": 77555,
+      "util": 41,
+      "compute_process": true
+    },
+    {
+      "index": 3,
+      "uuid": "GPU-67a7f147-bfa4-167d-7a03-6474ebbc3596",
+      "used_mib": 77556,
+      "util": 41,
+      "compute_process": true
+    },
+    {
+      "index": 4,
+      "uuid": "GPU-63853dd5-2691-1eff-65d1-0f552b5c03f4",
+      "used_mib": 74197,
+      "util": 100,
+      "compute_process": true
+    },
+    {
+      "index": 5,
+      "uuid": "GPU-9c805720-aaa9-a837-5ed8-7df9e2aab18f",
+      "used_mib": 74198,
+      "util": 100,
+      "compute_process": true
+    },
+    {
+      "index": 6,
+      "uuid": "GPU-9e3daefb-1cac-1498-fc08-2116f68b9a1f",
+      "used_mib": 74187,
+      "util": 100,
+      "compute_process": true
+    },
+    {
+      "index": 7,
+      "uuid": "GPU-c140f91c-7b12-ae62-96b0-ae4a32d8b5e8",
+      "used_mib": 74185,
+      "util": 100,
+      "compute_process": true
+    }
+  ],
+  "idle_streaks": {
+    "GPU-f3a68f3e-60dd-3993-0fde-aabc61ee8214": 0,
+    "GPU-32ebd8f8-32c3-602f-c048-238e1d27cde0": 0,
+    "GPU-17881b37-6a1f-755b-98a5-afc9f543d387": 0,
+    "GPU-67a7f147-bfa4-167d-7a03-6474ebbc3596": 0,
+    "GPU-63853dd5-2691-1eff-65d1-0f552b5c03f4": 0,
+    "GPU-9c805720-aaa9-a837-5ed8-7df9e2aab18f": 0,
+    "GPU-9e3daefb-1cac-1498-fc08-2116f68b9a1f": 0,
+    "GPU-c140f91c-7b12-ae62-96b0-ae4a32d8b5e8": 0
+  },
+  "query_error": null
+}

@@ -37,8 +37,8 @@ def test_model_contract_encoding_learning_and_roundtrip(state_dim, action_dim, m
         fusion_dim=8, actor_update_interval=1,
     )
     frozen = FrozenStage1(state_dim, action_dim)
-    monkeypatch.setattr('act_rlt.stage2.predict_act_chunk_with_encoder_hidden_and_pos',
-        lambda act, batch: (torch.zeros(2, 16, action_dim), torch.ones(2, 5, 8), torch.zeros(1, 5, 8)))
+    monkeypatch.setattr('act_rlt.stage2.predict_act_chunk_with_encoder_hidden',
+        lambda act, batch: (torch.zeros(2, 16, action_dim), torch.ones(2, 5, 8)))
     policy = ACTStage2Policy(config, stage1_policy=frozen)
     batch = {'action': None, 'observation.images.wrist': torch.zeros(2, 3, 8, 8)}
     if state_dim:

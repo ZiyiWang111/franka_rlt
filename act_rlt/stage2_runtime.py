@@ -10,10 +10,21 @@ import time
 from dataclasses import dataclass
 
 import torch
+from scipy.spatial.transform import Rotation
 
 from act_rlt.infer import MAX_INFERENCE_S, bounded_action, observation_frame
 from act_rlt.stage2 import ACTStage2Policy, ChunkExecution
 from act_rlt.stage2_timing import Stage2Timing
+from act_rlt.replay_overlap import ReplayObservation
+from act_rlt.exploration_bias import DOWNWARD_BIAS_STEP_M
+
+
+@dataclass
+class PreparedActions:
+    commands: list[dict]
+    executed: torch.Tensor
+    clipped: list[bool]
+    delta_xyz: torch.Tensor | None = None
 
 
 @dataclass
@@ -29,6 +40,9 @@ class Prediction:
     gripper_values: list[float] | None = None
     timing: Stage2Timing | None = None
     ready_at: float = 0.0
+    bias_step_xyyaw: torch.Tensor | None = None  # X/Y meters, local yaw radians
+    bias_delta: torch.Tensor | None = None
+    downward: PreparedActions | None = None
 
 
 class FixedChunkRuntime:
@@ -50,6 +64,11 @@ class FixedChunkRuntime:
         self.warmup = warmup
         self.step_budget = step_budget
         self.deterministic = deterministic
+        self.replay_stride = (
+            env.config.chunk_length if deterministic else
+            (getattr(env.config, "replay_stride", None) or env.config.chunk_length)
+        )
+        self._last_replay_sequence = 0
         self.observation_selection = getattr(env, "observation_selection", "boundary")
         if self.observation_selection not in {"latest", "boundary"}:
             raise ValueError("observation_selection must be latest or boundary")
@@ -115,6 +134,10 @@ class FixedChunkRuntime:
                 capture_auxiliary = getattr(self.env, "_capture_auxiliary_state", None)
                 if capture_auxiliary is not None:
                     observation = capture_auxiliary(observation)
+                if self.replay_stride < self.env.config.chunk_length:
+                    # Own sensor buffers before the next camera read can reuse
+                    # them. CPU copying stays outside the servo thread/lock.
+                    observation = copy.deepcopy(observation)
                 completed = time.monotonic()
                 with self.observation_ready:
                     self.observation_seq += 1
@@ -128,6 +151,20 @@ class FixedChunkRuntime:
                     self.observation_ready.notify_all()
         except BaseException as error:
             self._fail(error)
+
+    def _replay_observation(self, after: float) -> ReplayObservation | None:
+        """Select an owned cache snapshot without waiting or advancing control."""
+        with self.observation_ready:
+            minimum_seq = max(self.last_observation_seq, self._last_replay_sequence)
+            selected = next((item for item in reversed(self.observation_history)
+                             if item[4]["observation_seq"] > minimum_seq
+                             and (self.observation_selection == "latest" or item[2] >= after)), None)
+            if selected is None:
+                return None
+            _, _, fresh_after, observation, diagnostics = selected
+            self._last_replay_sequence = diagnostics["observation_seq"]
+            return ReplayObservation(observation, self._last_replay_sequence,
+                                     time.monotonic(), fresh_after)
 
     def _boundary_batch(self, after, timing=None):
         started = time.monotonic()
@@ -233,14 +270,21 @@ class FixedChunkRuntime:
 
         post_started = time.monotonic()
         physical = physical_actions(actions)
+        unbiased_physical = physical.clone()
+        bias_step = physical.new_zeros(3)
+        bias = getattr(self.env, "_exploration_bias", None)
+        if bias is not None and not (self.warmup or human or self.deterministic):
+            bias_step = physical.new_tensor([*bias.step_m, bias.step_yaw_rad])
+            physical[:, [0, 1, 5]] += bias_step
         reference_physical = physical_actions(reference)
         mean_physical = physical_actions(mean_actions)
         timing.values["postprocess_cpu_wall_ms"] = (time.monotonic() - post_started) * 1000
         commands_started = time.monotonic()
         commands, reference_commands, mean_commands, executed, clipped = [], [], [], [], []
         gripper_values = []
-        for row, reference_row, mean_row in zip(
-            physical, reference_physical, mean_physical, strict=True
+        bias_deltas = []
+        for row, unbiased_row, reference_row, mean_row in zip(
+            physical, unbiased_physical, reference_physical, mean_physical, strict=True
         ):
             command = bounded_action(row.numpy(), self.env.max_step_m, self.env.max_step_rad)
             reference_command = bounded_action(
@@ -250,6 +294,11 @@ class FixedChunkRuntime:
                 mean_row.numpy(), self.env.max_step_m, self.env.max_step_rad
             )
             bounded = torch.tensor(list(command.values()), dtype=row.dtype)
+            unbiased_command = bounded_action(
+                unbiased_row.numpy(), self.env.max_step_m, self.env.max_step_rad
+            )
+            # Measure the offset after translation/rotation norm clipping.
+            bias_deltas.append(bounded[[0, 1, 5]] - bounded.new_tensor(list(unbiased_command.values()))[[0, 1, 5]])
             clipped.append(not torch.allclose(bounded, row[:self.env.config.action_dim]))
             actual = row.clone()
             actual[:self.env.config.action_dim] = bounded
@@ -259,11 +308,29 @@ class FixedChunkRuntime:
             executed.append(self.env._normalize_executed_action(actual))
             if reference_row.numel() > self.env.config.action_dim:
                 gripper_values.append(float(reference_row[self.env.config.action_dim]))
+        downward = None
+        if getattr(self.env, "_downward_bias", None) is not None and not (human or self.deterministic):
+            # Prepare both choices in the inference worker. The servo can then
+            # respond mid-chunk without normalization/CUDA work at a tick.
+            down_commands, down_executed, down_clipped, down_deltas = [], [], [], []
+            for row, baseline in zip(physical, commands, strict=True):
+                raw = row.clone()
+                raw[2] += DOWNWARD_BIAS_STEP_M
+                command = bounded_action(raw.numpy(), self.env.max_step_m, self.env.max_step_rad)
+                bounded = raw.new_tensor(list(command.values()))
+                down_clipped.append(not torch.allclose(bounded, raw[:self.env.config.action_dim]))
+                down_deltas.append(bounded[:3] - bounded.new_tensor(list(baseline.values()))[:3])
+                raw[:self.env.config.action_dim] = bounded
+                down_commands.append(command)
+                down_executed.append(self.env._normalize_executed_action(raw))
+            downward = PreparedActions(down_commands, torch.stack(down_executed),
+                                          down_clipped, torch.stack(down_deltas))
         timing.values["command_prepare_wall_ms"] = (time.monotonic() - commands_started) * 1000
         timing.values["prediction_wall_ms"] = (time.monotonic() - started) * 1000
         return Prediction(
             state, reference, commands, reference_commands, mean_commands,
             torch.stack(executed), clipped, human, gripper_values, timing, time.monotonic(),
+            bias_step, torch.stack(bias_deltas), downward,
         )
 
     def _encode(self, batch, timing):
@@ -331,7 +398,7 @@ class FixedChunkRuntime:
                         prediction = self.predictions.get(timeout=0.02)
                         break
                     except queue.Empty:
-                        if self.human and human_moving and not self.env._monitor.direction().any():
+                        if self.human and human_moving and not self.env._monitor.motion_velocity().any():
                             if not self.env.robot.robot.stop_servo():
                                 raise RuntimeError("control server did not acknowledge human stop_servo")
                             human_moving = False
@@ -365,9 +432,17 @@ class FixedChunkRuntime:
                     "resync_wall_ms_sum": 0.0,
                 }
                 actual = 0
+                replay_observations = {}
+                replay_missing = 0
                 sampled_sum = torch.zeros(self.env.config.action_dim)
                 reference_sum = torch.zeros(self.env.config.action_dim)
                 mean_sum = torch.zeros(self.env.config.action_dim)
+                bias_sum = torch.zeros(3)
+                bias_requested_sum = torch.zeros(3)
+                downward_bias = getattr(self.env, "_downward_bias", None)
+                downward_requested_z = 0.0
+                downward_applied_xyz = torch.zeros(3)
+                downward_steps = 0
                 done = terminated = truncated = stop_requested = False
                 pending_outcome = None
                 for index, policy_command in enumerate(prediction.commands):
@@ -381,18 +456,55 @@ class FixedChunkRuntime:
                     # Do not send a burst of relative actions to catch up after
                     # an underrun. Hold the last target while waiting; never replay it.
                     deadline = max(deadline, now) + self.env.period_s
+                    if index and index % self.replay_stride == 0:
+                        snapshot = self._replay_observation(previous_send or now)
+                        if snapshot is None:
+                            replay_missing += 1
+                        else:
+                            replay_observations[index] = snapshot
                     command = policy_command
+                    downward_step = 0.0
+                    downward_delta = torch.zeros(3)
+                    downward_executed = None
+                    step_clipped = prediction.clipped[index]
+                    if downward_bias is not None and not self.deterministic:
+                        consume = getattr(self.env._monitor, "consume_downward_bias", None)
+                        if consume is not None and consume():
+                            downward_bias.enable()
+                        if not self.human:
+                            downward_step = downward_bias.step_m
+                        if downward_step:
+                            # Read the latch at every servo tick, including
+                            # inside an already predicted four-action chunk.
+                            command = prediction.downward.commands[index]
+                            downward_delta = prediction.downward.delta_xyz[index]
+                            step_clipped = prediction.downward.clipped[index]
+                            downward_executed = prediction.downward.executed[index]
                     if self.human:
                         monitor = self.env._monitor
-                        if monitor is None or not hasattr(monitor, "direction"):
-                            raise RuntimeError("human control requires the Stage-2 teleop keyboard")
-                        delta = monitor.direction() * self.env.teleop_speed_m_s * self.env.period_s
+                        if monitor is None or not hasattr(monitor, "motion_velocity"):
+                            raise RuntimeError("human control requires the Stage-2 SpaceMouse input")
+                        delta = monitor.motion_velocity() * self.env.period_s
+                        moving = bool((delta != 0).any())
+                        if moving and not human_moving:
+                            self.env.robot.resync_command_pose()
+                        # Official bridge applies angular velocity in the working
+                        # frame (R_new = dR * R). send_action expects tool-local
+                        # increments (R_new = R * dR_local). Replay stores exactly
+                        # these converted local increments sent to the adapter.
+                        if delta[3:].any():
+                            # The adapter integrates its target while the mouse
+                            # is held, just like the standalone bridge. Convert
+                            # against that target, not a lagging measured pose.
+                            pose = getattr(self.env.robot, "_cmd_pose", None)
+                            if pose is None:
+                                pose = self.env.robot.robot.get_tool_pose()
+                            delta[3:] = Rotation.from_rotvec(pose[3:6]).inv().apply(delta[3:])
                         command = dict(zip(
                             ("dx", "dy", "dz", "drx", "dry", "drz"),
-                            (float(delta[0]), float(delta[1]), float(delta[2]), 0.0, 0.0, 0.0),
+                            (float(value) for value in delta),
                             strict=True,
                         ))
-                        moving = bool((delta != 0).any())
                         if not moving and human_moving:
                             if not self.env.robot.robot.stop_servo():
                                 raise RuntimeError("control server did not acknowledge human stop_servo")
@@ -401,7 +513,8 @@ class FixedChunkRuntime:
                     try:
                         if not self.human or human_moving:
                             resync_started = time.monotonic()
-                            self.env.robot.resync_command_pose()
+                            if not self.human:
+                                self.env.robot.resync_command_pose()
                             send_started = time.monotonic()
                             info["resync_wall_ms_sum"] += (send_started - resync_started) * 1000
                             self.env.robot.send_action(command)
@@ -436,17 +549,26 @@ class FixedChunkRuntime:
                         full_action = torch.tensor(values, dtype=executed.dtype)
                         executed[index] = self.env._normalize_executed_action(full_action)
                     else:
-                        executed[index] = prediction.executed[index]
+                        executed[index] = (prediction.executed[index] if downward_executed is None
+                                           else downward_executed)
+                        if prediction.bias_delta is not None:
+                            bias_sum += prediction.bias_delta[index]
+                            if prediction.bias_step_xyyaw is not None:
+                                bias_requested_sum += prediction.bias_step_xyyaw
+                    if downward_step:
+                        downward_requested_z += downward_step
+                        downward_applied_xyz += downward_delta
+                        downward_steps += 1
                     sampled_sum += torch.tensor(list(command.values()))
                     reference_sum += torch.tensor(
                         list(prediction.reference_commands[index].values())
                     )
                     mean_sum += torch.tensor(list(prediction.mean_commands[index].values()))
-                    info["safety_clip_steps"] += int(prediction.clipped[index]) if not self.human else 0
+                    info["safety_clip_steps"] += int(step_clipped) if not self.human else 0
                     actual += 1
                     collected += 1
                     key = self.env._monitor.poll() if self.env._monitor is not None else None
-                    if key in {"s", "f"} and pending_outcome is None:
+                    if (key in {"s", "f"} or (key == "d" and getattr(self.env, "review_episode_replay", False))) and pending_outcome is None:
                         pending_outcome = key
                     if key == "q":
                         truncated = done = stop_requested = True
@@ -460,17 +582,36 @@ class FixedChunkRuntime:
                 info["_sampled_tcp_command_sum"] = sampled_sum.tolist()
                 info["_reference_tcp_command_sum"] = reference_sum.tolist()
                 info["_mean_tcp_command_sum"] = mean_sum.tolist()
-                # In intervention mode the fourth action keeps its full control
-                # period. A Space press during that period still takes effect at
-                # this boundary, without shortening the four-step transition.
+                info["exploration_bias_requested_xy_m"] = (
+                    bias_requested_sum[:2].tolist()
+                )
+                info["exploration_bias_applied_xy_m"] = bias_sum[:2].tolist()
+                info["exploration_bias_requested_yaw_rad"] = (
+                    float(bias_requested_sum[2])
+                )
+                info["exploration_bias_applied_yaw_rad"] = float(bias_sum[2])
+                info["downward_bias_requested_z_m"] = downward_requested_z
+                info["downward_bias_applied_xyz_m"] = downward_applied_xyz.tolist()
+                info["downward_bias_steps"] = downward_steps
+                info["replay_observations_captured"] = len(replay_observations)
+                info["replay_observations_missing"] = replay_missing
+                info["replay_observation_offsets"] = list(replay_observations)
+                info["replay_observation_sequences"] = [obs.sequence for obs in replay_observations.values()]
+                info["replay_observation_age_ms"] = [
+                    (obs.selected_at - obs.fresh_after) * 1000 for obs in replay_observations.values()
+                ]
+                # Normal chunks submit camera/inference work immediately after
+                # the fourth send, overlapping its remaining control period.
+                # Only an outcome or actual handoff must finish that period
+                # before stopping. Enabling intervention alone adds no wait.
                 boundary_wait_started = time.monotonic()
                 boundary_waited = False
-                if (getattr(self.env, "enable_human_intervention", False) or pending_outcome is not None) and not done:
+                if pending_outcome is not None and not done:
                     if self.stop.wait(max(0.0, deadline - time.monotonic())):
                         return
                     boundary_waited = True
                     key = self.env._monitor.poll() if self.env._monitor is not None else None
-                    if key in {"s", "f"} and pending_outcome is None:
+                    if (key in {"s", "f"} or (key == "d" and getattr(self.env, "review_episode_replay", False))) and pending_outcome is None:
                         pending_outcome = key
                     if key == "q":
                         truncated = done = stop_requested = True
@@ -479,6 +620,7 @@ class FixedChunkRuntime:
                 if pending_outcome is not None and not done:
                     rewards[actual - 1] = float(pending_outcome == "s")
                     info["success"] = pending_outcome == "s"
+                    info["discard_episode_replay"] = pending_outcome == "d"
                     terminated = done = True
                 last = done or (self.step_budget is not None and collected >= self.step_budget)
                 info["collector_paused"] = last
@@ -487,6 +629,9 @@ class FixedChunkRuntime:
                     not done and monitor is not None and hasattr(monitor, "consume_toggle")
                     and monitor.consume_toggle(human=self.human)
                 )
+                # A Space request arriving after this decision stays pending
+                # for the next chunk boundary; it cannot change a chunk whose
+                # source/state has already been committed to inference/replay.
                 if last or handoff:
                     # Budget boundaries allow the final command its control
                     # period; handoffs and s/f episode outcomes do too.
@@ -516,6 +661,7 @@ class FixedChunkRuntime:
                     truncated=truncated, stop_requested=stop_requested, info=info,
                     intervention=prediction.human,
                     bc_target_chunk=executed.clone() if prediction.human else None,
+                    replay_observations=replay_observations,
                 )
                 info["boundary_finalize_wall_ms"] = (time.monotonic() - boundary_wait_started) * 1000
                 self.requests.put_nowait((prediction, result, time.monotonic(), last, next_human))

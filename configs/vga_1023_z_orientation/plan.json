@@ -1,0 +1,66 @@
+{
+  "status": "WAITING_GPU",
+  "training_enabled": true,
+  "source": "datasets/vga_fine/act_dataset_1023",
+  "source_info_sha256": "502eec646629259047cd66adb64ec297642da97d20bd2c4fe44935bd11c241ad",
+  "episodes": 701,
+  "frames": 55434,
+  "state_names": [
+    "ee_z",
+    "ee_rx",
+    "ee_ry",
+    "ee_rz"
+  ],
+  "state_representation": "measured Z in metres and orientation rotation vector in radians",
+  "action_names": [
+    "dx",
+    "dy",
+    "dz",
+    "drx",
+    "dry",
+    "drz"
+  ],
+  "global_batch": 64,
+  "per_gpu_batch": {
+    "single_gpu": 64,
+    "two_gpus": 32
+  },
+  "gpus_per_job": [
+    1,
+    2
+  ],
+  "servers": [
+    "10.0.40.113",
+    "10.0.40.163"
+  ],
+  "poll_seconds": 120,
+  "consecutive_idle_samples": 3,
+  "one_training_run_only": true,
+  "action_translation_frame": "robot base",
+  "action_rotation_frame": "current TCP body frame",
+  "action_rotation_definition": "rotvec(R_t.T @ R_t_plus_1)",
+  "action_translation_definition": "p_t_plus_1 - p_t",
+  "action_units": [
+    "m",
+    "m",
+    "m",
+    "rad",
+    "rad",
+    "rad"
+  ],
+  "action_temporal_alignment": "observation t predicts measured transition t to t+1, dataset 30Hz",
+  "terminal_action": "zero TCP delta",
+  "label_verification": {
+    "pairs": 54733,
+    "max_translation_error_m": 2.9103830456733704e-11,
+    "max_rotation_error_rad": 2.2803362341623779e-07
+  },
+  "use_cvae": false,
+  "checkpoint_every_steps": 10000,
+  "deployment_project": "/workspace/wangziyi/projects/vga_z_orientation_1029",
+  "watcher_pids": {
+    "server6": 106029,
+    "server7": 1427957
+  },
+  "coordinator_pid": 1427552
+}

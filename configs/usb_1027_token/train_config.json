@@ -1,0 +1,167 @@
+{
+  "dataset": {
+    "repo_id": "usb_1027_z",
+    "root": "/workspace/wangziyi/projects/act_fine_1027/datasets/usb_fine/usb_1027_z",
+    "episodes": null,
+    "image_transforms": {
+      "enable": true,
+      "max_num_transforms": 3,
+      "random_order": false,
+      "tfs": {
+        "brightness": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {
+            "brightness": [
+              0.9,
+              1.1
+            ]
+          }
+        },
+        "contrast": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {
+            "contrast": [
+              0.9,
+              1.1
+            ]
+          }
+        },
+        "saturation": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {
+            "saturation": [
+              0.9,
+              1.1
+            ]
+          }
+        },
+        "hue": {
+          "weight": 1.0,
+          "type": "ColorJitter",
+          "kwargs": {
+            "hue": [
+              -0.02,
+              0.02
+            ]
+          }
+        }
+      }
+    },
+    "revision": null,
+    "use_imagenet_stats": true,
+    "video_backend": "pyav",
+    "streaming": false
+  },
+  "env": null,
+  "policy": {
+    "type": "act_rlt_token",
+    "n_obs_steps": 1,
+    "input_features": {
+      "observation.images.wrist": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          720,
+          1280
+        ]
+      },
+      "observation.state": {
+        "type": "STATE",
+        "shape": [
+          1
+        ]
+      }
+    },
+    "output_features": {
+      "action": {
+        "type": "ACTION",
+        "shape": [
+          6
+        ]
+      }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "use_peft": false,
+    "push_to_hub": false,
+    "repo_id": null,
+    "private": null,
+    "tags": null,
+    "license": null,
+    "pretrained_path": null,
+    "act_pretrained_path": "/workspace/wangziyi/projects/act_fine_1027/outputs/act_fine/usb_1027_z_cvae_30k/checkpoints/030000/pretrained_model",
+    "rl_token_dim": 768,
+    "rl_token_nhead": 8,
+    "rl_token_enc_layers": 3,
+    "rl_token_dec_layers": 3,
+    "rl_token_ff_dim": 4096,
+    "rl_token_num_rl_tokens": 1,
+    "recon_weight": 1.0,
+    "verify_encoder_equivalence": true,
+    "chunk_size": 4,
+    "rl_token_lr": 0.0002,
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD",
+      "STATE": "MEAN_STD",
+      "ACTION": "MEAN_STD"
+    }
+  },
+  "output_dir": "/workspace/wangziyi/projects/usb_rl_token_1027/outputs/usb_1027_token",
+  "job_name": "usb_1027_token",
+  "resume": false,
+  "seed": 1000,
+  "cudnn_deterministic": false,
+  "num_workers": 4,
+  "batch_size": 16,
+  "steps": 10000,
+  "eval_freq": 0,
+  "log_freq": 50,
+  "tolerance_s": 0.0001,
+  "save_checkpoint": true,
+  "save_freq": 10000,
+  "use_policy_training_preset": false,
+  "optimizer": {
+    "type": "adamw",
+    "lr": 0.0002,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "grad_clip_norm": 1.0
+  },
+  "scheduler": {
+    "type": "cosine_decay_with_warmup",
+    "num_warmup_steps": 200,
+    "num_decay_steps": 10000,
+    "peak_lr": 0.0002,
+    "decay_lr": 5e-06
+  },
+  "eval": {
+    "n_episodes": 50,
+    "batch_size": 50,
+    "use_async_envs": false
+  },
+  "wandb": {
+    "enable": false,
+    "disable_artifact": false,
+    "project": "lerobot",
+    "entity": null,
+    "notes": null,
+    "run_id": null,
+    "mode": null,
+    "add_tags": true
+  },
+  "peft": null,
+  "use_rabc": false,
+  "rabc_progress_path": null,
+  "rabc_kappa": 0.01,
+  "rabc_epsilon": 1e-06,
+  "rabc_head_mode": "sparse",
+  "rename_map": {},
+  "checkpoint_path": null
+}

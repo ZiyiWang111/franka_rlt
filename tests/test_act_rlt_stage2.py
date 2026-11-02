@@ -169,14 +169,15 @@ def test_actor_outputs_final_action_not_reference_plus_residual() -> None:
     assert torch.equal(mean, torch.zeros_like(mean))
 
 
-def test_stage2_fusion_gives_each_input_equal_width_and_bounded_scale() -> None:
+def test_stage2_fusion_preserves_token_and_projects_auxiliary_inputs() -> None:
     fusion = ChunkInputFusion(state_dim=775, proprio_dim=7, chunk_dim=24, fusion_dim=16)
     state = torch.randn(3, 775, requires_grad=True)
     reference = torch.randn(3, 24, requires_grad=True)
     features = fusion(state, reference)
-    assert features.shape == (3, 48)
+    assert features.shape == (3, 768 + 32 + 16)
     assert torch.isfinite(features).all()
-    assert features.abs().max() <= 1
+    torch.testing.assert_close(features[:, :768], state[:, :768])
+    assert features[:, 768:].abs().max() <= 1
     features.square().sum().backward()
     assert state.grad is not None and torch.isfinite(state.grad).all()
     assert reference.grad is not None and torch.isfinite(reference.grad).all()
@@ -185,12 +186,12 @@ def test_stage2_fusion_gives_each_input_equal_width_and_bounded_scale() -> None:
     assert reference.grad.abs().sum() > 0
 
 
-def test_stage2_actor_and_twin_critic_use_balanced_production_shapes() -> None:
+def test_stage2_actor_and_twin_critic_use_token_passthrough_production_shapes() -> None:
     state = torch.randn(2, 775)
     chunk = torch.randn(2, 24)
     actor = Stage2ChunkActor(state_dim=775, proprio_dim=7, chunk_dim=24)
     critic = Stage2TwinCritic(state_dim=775, proprio_dim=7, chunk_dim=24)
-    assert actor.fusion(state, chunk).shape == (2, 384)
+    assert actor.fusion(state, chunk).shape == (2, 928)
     mean, std = actor(state, chunk)
     q1, q2 = critic(state, chunk)
     assert mean.shape == std.shape == (2, 24)
@@ -1147,7 +1148,7 @@ def test_automatic_reset_retreat_and_workspace_sample() -> None:
 
 
 @pytest.mark.parametrize("entrypoint", ["train", "infer"])
-def test_z_reset_xy_randomization_cli_is_opt_in(entrypoint) -> None:
+def test_z_reset_is_default_without_mode_flag(entrypoint) -> None:
     if entrypoint == "train":
         parser = build_parser()
         validate = validate_args
@@ -1158,14 +1159,14 @@ def test_z_reset_xy_randomization_cli_is_opt_in(entrypoint) -> None:
         parser = infer_parser()
         validate = infer_validate
         base = ["--checkpoint", "/tmp/stage2", "--dry-run"]
-    default = parser.parse_args(base + ["--z-insertion-mode"])
-    assert default.randomize_reset_xy is False
+    default = parser.parse_args(base)
     validate(parser, default)
-    enabled = parser.parse_args(base + ["--z-insertion-mode", "--randomize-reset-xy"])
-    assert enabled.randomize_reset_xy is True
-    validate(parser, enabled)
+    assert default.fps == 30.0
+    assert not hasattr(default, "randomize_reset_xy")
     with pytest.raises(SystemExit):
-        validate(parser, parser.parse_args(base + ["--randomize-reset-xy"]))
+        parser.parse_args(base + ["--randomize-reset-xy"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--z-insertion-mode"])
 
 
 @pytest.mark.parametrize("randomize_xy", [False, True])
@@ -1174,8 +1175,6 @@ def test_z_insertion_reset_uses_confirmed_p1_and_retreats_up(monkeypatch, random
     lower = np.array([0.62, -0.13, 0.357])
     upper = np.array([0.68, -0.07, 0.417])
     env = object.__new__(FrankaInsertionStage2Env)
-    env.z_insertion_mode = True
-    env.randomize_reset_xy = randomize_xy
     env._reference_pose = None
     env._reset_orientation = None
     env._first_reset_move = True
@@ -1267,8 +1266,6 @@ def test_fixed_reset_points_use_two_cm_base_xy_offsets_and_fixed_pose():
 def test_fixed_reset_menu_switches_points_before_enter_and_keeps_selection(monkeypatch):
     reference = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
     env = object.__new__(FrankaInsertionStage2Env)
-    env.z_insertion_mode = True
-    env.randomize_reset_xy = False
     env._reference_pose = reference.copy()
     env._reset_orientation = None
     env._fixed_reset_points = None
@@ -1313,8 +1310,6 @@ def test_fixed_reset_menu_switches_points_before_enter_and_keeps_selection(monke
 def test_randomized_reset_keeps_resampling_menu_without_fixed_point_switching(monkeypatch):
     reference = np.array([0.65, -0.10, 0.387, 0.1, 0.2, 0.3])
     env = object.__new__(FrankaInsertionStage2Env)
-    env.z_insertion_mode = True
-    env.randomize_reset_xy = True
     env._reference_pose = reference
     env._reset_orientation = None
     env._first_reset_move = True
@@ -1381,7 +1376,7 @@ def test_automatic_reset_can_use_explicit_narrow_sample_box() -> None:
     assert (sampled[:3] <= sample_max).all()
 
 
-def test_stage2_parser_accepts_narrow_sample_box() -> None:
+def test_stage2_parser_rejects_legacy_sample_box() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -1393,19 +1388,18 @@ def test_stage2_parser_accepts_narrow_sample_box() -> None:
             "--sample-max", "0.670", "-0.080", "0.175",
         ]
     )
-    validate_args(parser, args)
-    assert args.sample_min == [0.630, -0.120, 0.130]
-    assert args.sample_max == [0.670, -0.080, 0.175]
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
 
 
-def test_stage2_z_insertion_mode_captures_workspace_at_startup() -> None:
+def test_stage2_default_captures_workspace_at_startup() -> None:
     parser = build_parser()
     args = parser.parse_args([
         "--stage1-checkpoint", "/tmp/stage1", "--act-checkpoint", "/tmp/act",
-        "--allow-motion", "--z-insertion-mode",
+        "--allow-motion",
     ])
     validate_args(parser, args)
-    assert args.z_insertion_mode
+    assert not hasattr(args, "z_insertion_mode")
     assert args.fps == 30.0
     assert args.workspace_min is None and args.workspace_max is None
 

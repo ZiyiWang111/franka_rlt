@@ -43,9 +43,10 @@ def prepare(source, output, variant):
         state_names = [f'joint_{i}' for i in range(7)]
         action_names = state_names
     else:
-        inputs = state[:, [names.index('ee_z')]]
+        state_names = (['ee_z', 'ee_rx', 'ee_ry', 'ee_rz']
+                       if variant == 'rgb_z_orientation_delta_tcp' else ['ee_z'])
+        inputs = state[:, [names.index(name) for name in state_names]]
         labels = np.asarray(table['action'].to_pylist(), dtype=np.float32)[:, :6]
-        state_names = ['ee_z']
         action_names = ['dx', 'dy', 'dz', 'drx', 'dry', 'drz']
     assert np.isfinite(inputs).all() and np.isfinite(labels).all()
     wanted = {'action', 'observation.state', 'observation.images.wrist', 'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'}

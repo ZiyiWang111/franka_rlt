@@ -115,7 +115,8 @@ def check_fine_entry(robot, args, emit):
           f"rotvec [rad]={args.fine_entry_rotvec_rad}; "
           f"tolerance Z={args.fine_entry_z_tolerance_m * 1000:.3f} mm, "
           f"orientation={args.fine_entry_angle_tolerance_deg:.3f} deg", flush=True)
-    pose = measured_pose(robot)
+    # Fine entry runs with motion stopped; wait for post-stop/reset snapshots.
+    pose = measured_pose(robot, after_move=True)
     for adjustment in range(args.fine_entry_max_adjustments + 1):
         z_error = float(pose[2] - args.fine_entry_z_m)
         angle_error_deg = float(np.degrees(
@@ -315,7 +316,7 @@ def main(argv=None):
             robot=robot, preprocessor=fine_pre, postprocessor=fine_post, config=fine_config,
             fps=args.fine_fps, episode_time_s=args.fine_duration,
             max_step_m=fine_config.max_step_m, max_step_rad=fine_config.max_step_rad,
-            camera_shapes=fine_cameras, z_insertion_mode=True, observation_selection="latest",
+            camera_shapes=fine_cameras, observation_selection="latest",
         )
 
     try:

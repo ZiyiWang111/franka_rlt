@@ -1,0 +1,28 @@
+{
+  "host": "10.0.40.163",
+  "status": "MIGRATED_TO_SERVER6_30000_STEPS",
+  "poll_seconds": 120,
+  "idle_samples": 5,
+  "batch_size": 32,
+  "steps": 50000,
+  "chunk_size": 4,
+  "use_cvae": true,
+  "runs": [
+    {
+      "name": "vga_1023_z_cvae_50k",
+      "source": "datasets/vga_fine/act_dataset_1023",
+      "dataset": "datasets/vga_fine/vga_1023_z_1027",
+      "episodes": 699,
+      "frames": 55125,
+      "config": "configs/act_fine_1027/vga_1023_z_cvae_50k.json"
+    },
+    {
+      "name": "usb_1027_z_cvae_50k",
+      "source": "datasets/usb_fine/usb_dataset_1027",
+      "dataset": "datasets/usb_fine/usb_1027_z",
+      "episodes": 362,
+      "frames": 38827,
+      "config": "configs/act_fine_1027/usb_1027_z_cvae_50k.json"
+    }
+  ]
+}

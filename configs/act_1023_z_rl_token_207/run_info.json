@@ -1,0 +1,55 @@
+{
+  "host": "10.0.40.207",
+  "launcher_pid": 660414,
+  "started_at": "2026-10-27T11:46:09.966700+08:00",
+  "execution": "sequential",
+  "gpu": 0,
+  "runs": [
+    {
+      "name": "act_1023_z_token",
+      "status": "COMPLETE",
+      "pid": 660419,
+      "started_at": "2026-10-27T11:46:09.997790+08:00",
+      "log": "/home/wangziyi/workspace/franka_rlt/logs/vga_token/act_1023_z_token_20261027_114609.log",
+      "output_dir": "/home/wangziyi/workspace/franka_rlt/outputs/vga_token/act_1023_z_token",
+      "config": "/home/wangziyi/workspace/franka_rlt/configs/act_1023_z_rl_token_207/act_1023_z_token.json",
+      "command": [
+        "/home/wangziyi/.conda/envs/evo-rlt-act1023/bin/python",
+        "-u",
+        "-c",
+        "from act_rlt.dataset_compat import install_scalar_state_dataset_support; install_scalar_state_dataset_support(); from act_rlt import register; register(); from lerobot.scripts.lerobot_train import main; main()",
+        "--config_path=/home/wangziyi/workspace/franka_rlt/configs/act_1023_z_rl_token_207/act_1023_z_token.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-27T12:28:47.417889+08:00",
+      "step": 10000,
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/vga_token/act_1023_z_token",
+      "final_training_loss": 0.008
+    },
+    {
+      "name": "act_1023_z_cvae_token",
+      "status": "COMPLETE",
+      "pid": 3109850,
+      "started_at": "2026-10-27T12:28:47.447395+08:00",
+      "log": "/home/wangziyi/workspace/franka_rlt/logs/vga_token/act_1023_z_cvae_token_20261027_122847.log",
+      "output_dir": "/home/wangziyi/workspace/franka_rlt/outputs/vga_token/act_1023_z_cvae_token",
+      "config": "/home/wangziyi/workspace/franka_rlt/configs/act_1023_z_rl_token_207/act_1023_z_cvae_token.json",
+      "command": [
+        "/home/wangziyi/.conda/envs/evo-rlt-act1023/bin/python",
+        "-u",
+        "-c",
+        "from act_rlt.dataset_compat import install_scalar_state_dataset_support; install_scalar_state_dataset_support(); from act_rlt import register; register(); from lerobot.scripts.lerobot_train import main; main()",
+        "--config_path=/home/wangziyi/workspace/franka_rlt/configs/act_1023_z_rl_token_207/act_1023_z_cvae_token.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-27T13:11:16.031013+08:00",
+      "step": 10000,
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/vga_token/act_1023_z_cvae_token",
+      "final_training_loss": 0.008
+    }
+  ],
+  "status": "COMPLETE",
+  "finished_at": "2026-10-27T13:11:16.031313+08:00",
+  "download_sha256": "a268b09cfab99ba7670b7fce74e2b1f10ba05d0601b9adafe687c13aec83e7f9",
+  "download_status": "SHA256_VERIFIED"
+}

@@ -1,0 +1,23 @@
+{
+  "pid": 780012,
+  "status": "COMPLETE",
+  "gpu": 4,
+  "config": "/workspace/wangziyi/projects/usb_rl_token_1027/configs/usb_1027_token/train_config.json",
+  "output_dir": "/workspace/wangziyi/projects/usb_rl_token_1027/outputs/usb_1027_token",
+  "updated_at": "2026-10-28T19:21:09.496182+08:00",
+  "gpu_uuid": "GPU-e4eec184-3339-5117-7570-1a3710eaedfa",
+  "training_pid": 782648,
+  "command": [
+    "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+    "-u",
+    "-c",
+    "from act_rlt.dataset_compat import install_scalar_state_dataset_support; install_scalar_state_dataset_support(); from act_rlt import register; register(); from lerobot.scripts.lerobot_train import main; main()",
+    "--config_path=/workspace/wangziyi/projects/usb_rl_token_1027/configs/usb_1027_token/train_config.json"
+  ],
+  "exit_code": 0,
+  "finished_at": "2026-10-28T20:22:38+08:00",
+  "download_status": "SHA256_VERIFIED",
+  "downloaded_at": "2026-10-29T09:54:59.465848+08:00",
+  "local_output": "/home/embint/wzy/Evo-RLT/outputs/usb_token/usb_1027_token",
+  "final_training_loss": 0.005
+}

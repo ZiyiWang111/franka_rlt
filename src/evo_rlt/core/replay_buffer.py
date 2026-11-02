@@ -36,6 +36,7 @@ class ReplayBuffer:
 
     def __init__(self, capacity: int = 200_000):
         self.buffer: deque[ChunkTransition] = deque(maxlen=capacity)
+        self._td_indices = {}
 
     def __len__(self) -> int:
         return len(self.buffer)
@@ -47,13 +48,26 @@ class ReplayBuffer:
         return self.buffer.maxlen
 
     def add(self, transition: ChunkTransition) -> None:
+        evicted = self.buffer[0] if len(self.buffer) == self.capacity else None
         self.buffer.append(transition)
+        for index in self._td_indices.values():
+            if evicted is not None:
+                index.remove(evicted)
+            index.add(transition)
 
-    def sample(self, batch_size: int, *, include_bc_target: bool = False) -> dict[str, torch.Tensor]:
+    def sample(self, batch_size: int, *, include_bc_target: bool = False, td_chunks: int = 1) -> dict[str, torch.Tensor]:
         """Sample a batch and collate into a dict of stacked tensors."""
-        n = min(batch_size, len(self.buffer))
-        indices = random.sample(range(len(self.buffer)), n)
-        batch = [self.buffer[i] for i in indices]
+        td = {}
+        if td_chunks > 1:
+            from evo_rlt.core.multistep import ChunkTDIndex
+
+            if td_chunks not in self._td_indices:
+                self._td_indices[td_chunks] = ChunkTDIndex(self.buffer, td_chunks)
+            batch, td = self._td_indices[td_chunks].sample(batch_size)
+        else:
+            n = min(batch_size, len(self.buffer))
+            indices = random.sample(range(len(self.buffer)), n)
+            batch = [self.buffer[i] for i in indices]
         stacked_exec = torch.stack([t.exec_chunk for t in batch])
         stacked_ref = torch.stack([t.ref_chunk for t in batch])
         stacked_next_ref = torch.stack([t.next_ref_chunk for t in batch])
@@ -79,4 +93,5 @@ class ReplayBuffer:
                 for t in batch
             ])
             result[BC_TARGET_FLAT] = targets.flatten(start_dim=-2)
+        result.update(td)
         return result

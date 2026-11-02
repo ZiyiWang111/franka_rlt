@@ -359,6 +359,8 @@ def centered_bounds(measured_pose, xy_half_range=DEFAULT_RESET_XY_HALF_RANGE_M):
 
 
 def validate_sample_bounds(sample_min, sample_max, workspace_min, workspace_max):
+    if workspace_min is None and workspace_max is None:
+        return
     if (np.any(sample_min < np.asarray(workspace_min))
             or np.any(sample_max > np.asarray(workspace_max))):
         raise ValueError("Z insertion sample volume extends outside the safe workspace")
@@ -369,7 +371,7 @@ def adjust_reset_xy_range(half_range, key):
     steps = max(0, min(round(RESET_XY_MAX_HALF_RANGE_M / RESET_XY_RANGE_STEP_M),
                        steps + (1 if key == "=" else -1)))
     result = steps * RESET_XY_RANGE_STEP_M
-    print(f"Next reset: XY +/-{result * 100:g} cm around initial reference; "
+    print(f"Next reset: XY +/-{result * 100:g} cm around current reference; "
           "current pose unchanged. Press r to sample now.", flush=True)
     return result
 
@@ -401,8 +403,95 @@ def prompt_reset_choice(prompt, choices):
         print("Invalid choice; please use one of the keys shown.", flush=True)
 
 
-def confirm_centered_bounds(robot):
-    """Capture full TCP reference at Enter; use fixed collection Z and orientation."""
+def prompt_idle_choice(robot, args, prompt, choices):
+    """Run Stage-2-style XY teleop while waiting, then return the measured reference."""
+    from act_rlt.human_input import HumanInputMonitor
+    from scripts.fr3_keyboard_teleop import KEY_DIRECTIONS, Teleop, advance_schedule, build_parser as teleop_parser
+
+    class InferIdleInput(HumanInputMonitor):
+        _allow_toggle = False
+        _directions = {key: KEY_DIRECTIONS[key] for key in ("KEY_W", "KEY_A", "KEY_S", "KEY_D")}
+        _key_outcomes = {
+            "KEY_ENTER": "", "KEY_Y": "y", "KEY_Q": "q", "KEY_ESC": "q",
+            "KEY_R": "r", "KEY_N": "n", "KEY_EQUAL": "=", "KEY_MINUS": "-",
+        }
+
+    teleop_args = teleop_parser().parse_args([])
+    teleop_args.workspace_min = robot.config.workspace_min_xyz
+    teleop_args.workspace_max = robot.config.workspace_max_xyz
+    teleop = Teleop(robot.robot, teleop_args, waypoints=None)
+    monitor = None
+    moved = False
+    print(f"{prompt}\nHold WASD: W=-X, S=+X, A=-Y, D=+Y "
+          f"({teleop_args.speed_m_s * 100:g} cm/s); release to stop; movement updates reference.", flush=True)
+    try:
+        monitor = InferIdleInput(args.teleop_input_backend, args.teleop_keyboard)
+        while True:
+            choice = monitor.poll()
+            if choice in choices:
+                decision = choices[choice]
+                break
+            pressed = monitor.pressed_keys()
+            now = time.perf_counter()
+            for key in teleop.pressed - pressed:
+                teleop.key_event(key, False, now)
+            for key in pressed - teleop.pressed:
+                teleop.key_event(key, True, now)
+            if teleop.next_tick is not None and now >= teleop.next_tick:
+                advance_schedule(teleop, teleop.next_tick)
+                moved = True
+            time.sleep(.005)
+    finally:
+        try:
+            if not robot.robot.stop_servo():
+                raise RuntimeError("control server did not acknowledge idle XY stop_servo")
+        finally:
+            try:
+                if monitor is not None:
+                    monitor.close()
+            finally:
+                robot.resync_command_pose()
+    pose = None
+    if moved:
+        pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
+        if pose.shape != (6,) or not np.isfinite(pose).all():
+            raise RuntimeError(f"invalid reference pose after WASD: {pose}")
+    return decision, pose
+
+
+def update_reset_reference(pose, sample_min, sample_max, reference_xy, orientation, half_range,
+                           use_reference_pose):
+    """Recenter sampling after manual motion, preserving the selected Z/rotation mode."""
+    reference_xy[:] = pose[:2]
+    sample_min[:2] = reference_xy - half_range
+    sample_max[:2] = reference_xy + half_range
+    if use_reference_pose:
+        sample_min[2] = sample_max[2] = pose[2]
+        orientation[:] = pose[3:]
+    print(f"Updated reference TCP (m, rad): {format_pose(pose)}", flush=True)
+
+
+def confirm_centered_bounds(robot, use_reference_pose=False):
+    """Capture the reference at Enter, optionally preserving Z/rotation without bounds."""
+    if use_reference_pose:
+        while True:
+            pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
+            print(f"Current TCP reference (m, rad): {format_pose(pose)}; workspace limits disabled", flush=True)
+            decision = prompt_choice(
+                "[Enter]=capture current XYZ and orientation, r=refresh measured pose, q=quit: ",
+                {"": "confirm", "r": "refresh", "q": "quit"},
+            )
+            if decision == "quit":
+                return None
+            if decision == "confirm":
+                # Capture again: the arm may have moved while waiting for Enter.
+                pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
+                if pose.shape != (6,) or not np.isfinite(pose).all():
+                    raise ValueError(f"invalid measured TCP pose: {pose}")
+                robot.config.workspace_min_xyz = None
+                robot.config.workspace_max_xyz = None
+                print(f"Confirmed reference (m, rad): {format_pose(pose)}; workspace limits disabled", flush=True)
+                return pose[:3].copy(), pose[:3].copy(), pose[3:].copy()
     while True:
         pose = np.asarray(robot.robot.get_tool_pose(), dtype=float)
         sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
@@ -531,10 +620,25 @@ def build_parser():
     parser.add_argument("--max-step-rad", type=float, default=0.02)
     parser.add_argument("--reset-speed", type=float, default=DEFAULT_RESET_SPEED_M_S)
     parser.add_argument("--sampling-seed", type=int)
+    parser.add_argument(
+        "--use-reference-pose", action="store_true",
+        help="use captured reference Z/orientation for resets and disable XYZ workspace limits",
+    )
+    parser.add_argument(
+        "--teleop-input-backend", choices=("auto", "evdev", "pynput"), default="auto",
+        help="idle WASD keyboard: auto uses pynput on X11, otherwise evdev",
+    )
+    parser.add_argument("--teleop-keyboard", help="evdev keyboard device, e.g. /dev/input/event4")
     return parser
 
 
 def validate_args(parser, args):
+    if args.teleop_input_backend == "auto":
+        args.teleop_input_backend = (
+            "evdev" if args.teleop_keyboard or not os.environ.get("DISPLAY") else "pynput"
+        )
+    if args.teleop_input_backend == "pynput" and args.teleop_keyboard is not None:
+        parser.error("--teleop-keyboard applies only to --teleop-input-backend evdev")
     if args.dry_run_episodes is not None:
         if not args.dry_run or args.dry_run_episodes < 1:
             parser.error("dry-run-episodes requires --dry-run and a positive episode count")
@@ -1212,6 +1316,9 @@ def main():
         config, pretrained_path=checkpoint,
         preprocessor_overrides={"device_processor": {"device": args.device}},
     )
+    if not args.dry_run:
+        from act_rlt.human_input import validate_human_input
+        validate_human_input(args.teleop_input_backend, args.teleop_keyboard)
     robot = FrankaRobot(FrankaRobotConfig(
         robot_ip=args.robot_ip,
         **robot_camera_kwargs(camera_shapes, args),
@@ -1256,12 +1363,12 @@ def main():
                 )
             return
 
-        sample_bounds = confirm_centered_bounds(robot)
+        sample_bounds = confirm_centered_bounds(robot, use_reference_pose=args.use_reference_pose)
         if sample_bounds is None:
             return
         sample_min, sample_max, orientation = sample_bounds
         print(
-            "Sample reset orientation (fixed collection rotation vector, rad): "
+            "Sample reset orientation (rotation vector, rad): "
             f"{format_pose(orientation)}",
             flush=True,
         )
@@ -1272,6 +1379,16 @@ def main():
         lift_before_next_sample = False
         first_move = True
         episode_index = 0
+
+        def idle_choice(prompt, choices):
+            nonlocal episode_start
+            decision, pose = prompt_idle_choice(robot, args, prompt, choices)
+            if pose is not None:
+                update_reset_reference(pose, sample_min, sample_max, reference_xy, orientation,
+                                       half_range, args.use_reference_pose)
+                episode_start = pose.copy()
+            return decision, pose is not None
+
         while True:
             if need_new_sample:
                 sample_min[:2] = reference_xy - half_range
@@ -1287,7 +1404,7 @@ def main():
                     rng,
                 )
                 if first_move:
-                    decision = prompt_reset_choice(
+                    decision, reference_changed = idle_choice(
                         "First sampled reset target is "
                         f"{format_pose(target)}. XY +/-{half_range * 100:g} cm. "
                         "[Enter/y]=move, r=new sample, =/-=adjust range, q=quit: ",
@@ -1303,7 +1420,7 @@ def main():
                     if decision in {"increase", "decrease"}:
                         half_range = adjust_reset_xy_range(half_range, "=" if decision == "increase" else "-")
                         continue
-                    if decision == "new":
+                    if decision == "new" or reference_changed:
                         continue
                     first_move = False
                 if lift_before_next_sample:
@@ -1315,12 +1432,12 @@ def main():
                     )
                 need_new_sample = False
 
-            decision = prompt_reset_choice(
+            decision, _ = idle_choice(
                 "At inference start "
                 f"{format_pose(episode_start)}. XY +/-{half_range * 100:g} cm. "
                 "[Enter/y]=start inference, r=new sample, =/-=adjust range, q=quit: ",
                 {
-                    "": "start", "y": "start", "s": "start", "start": "start",
+                    "": "start", "y": "start",
                     "r": "new", "n": "new", "new": "new",
                     "=": "increase", "-": "decrease",
                     "q": "quit", "quit": "quit",
@@ -1343,7 +1460,7 @@ def main():
                 run_timing=run_timing,
             )
             print(f"Inference episode {episode_index} finished.", flush=True)
-            decision = prompt_choice(
+            decision, _ = idle_choice(
                 "Next action: r=return to this episode's start, "
                 "n=move to a new sampled point, q=quit: ",
                 {

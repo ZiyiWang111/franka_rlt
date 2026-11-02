@@ -1,0 +1,19 @@
+{
+  "pid": 2207572,
+  "started_at": "2026-10-27T20:29:36.343819+08:00",
+  "host": "10.0.40.163",
+  "command": [
+    "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+    "-u",
+    "/workspace/wangziyi/projects/franka_rlt/scripts/run_act_idle_queue.py",
+    "--project",
+    "/workspace/wangziyi/projects/franka_rlt",
+    "--python",
+    "/workspace/wangziyi/miniconda3/envs/evo-rlt/bin/python",
+    "--configs",
+    "configs/act_fine_1027/vga_1023_z_cvae_50k.json",
+    "configs/act_fine_1027/usb_1027_z_cvae_50k.json"
+  ],
+  "queue_log": "/workspace/wangziyi/projects/franka_rlt/logs/act_idle_queue/queue.log",
+  "status_file": "/workspace/wangziyi/projects/franka_rlt/logs/act_idle_queue/status.json"
+}

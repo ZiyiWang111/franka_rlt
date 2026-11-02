@@ -1,0 +1,71 @@
+{
+  "pid": 3671538,
+  "started_at": "2026-10-28T10:03:03.851452+08:00",
+  "interval_seconds": 120,
+  "consecutive_idle_samples": 1,
+  "allowed_gpu_indices": [
+    4
+  ],
+  "status": "RUNNING",
+  "jobs": [
+    {
+      "name": "usb_1027_z_cvae_30k",
+      "config": "/workspace/wangziyi/projects/act_fine_1027/configs/act_fine_1027_server6/usb_1027_z_cvae_30k.json",
+      "output_dir": "/workspace/wangziyi/projects/act_fine_1027/outputs/act_fine/usb_1027_z_cvae_30k",
+      "steps": 30000,
+      "status": "COMPLETE",
+      "pid": 3671856,
+      "gpu": 4,
+      "gpu_uuid": "GPU-e4eec184-3339-5117-7570-1a3710eaedfa",
+      "started_at": "2026-10-28T10:03:05.052050+08:00",
+      "log": "/workspace/wangziyi/projects/act_fine_1027/logs/act_idle_queue/usb_1027_z_cvae_30k_20261028_100305.log",
+      "command": [
+        "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+        "-u",
+        "/workspace/wangziyi/projects/act_fine_1027/scripts/train_act_fine_queue.py",
+        "--config",
+        "/workspace/wangziyi/projects/act_fine_1027/configs/act_fine_1027_server6/usb_1027_z_cvae_30k.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-28T13:05:03.861945+08:00",
+      "download_status": "SHA256_VERIFIED",
+      "local_output": "/home/embint/wzy/Evo-RLT/outputs/act_fine/usb_1027_z_cvae_30k",
+      "downloaded_at": "2026-10-28T13:47:49.689912+08:00",
+      "final_training_loss": 0.151,
+      "archive_sha256": "654256240440a2d8e6dbfd3260e07d53d1db47575ceadbc9213cbb63272a96fe"
+    },
+    {
+      "name": "vga_1023_z_cvae_30k",
+      "config": "/workspace/wangziyi/projects/act_fine_1027/configs/act_fine_1027_server6/vga_1023_z_cvae_30k.json",
+      "output_dir": "/workspace/wangziyi/projects/act_fine_1027/outputs/act_fine/vga_1023_z_cvae_30k",
+      "steps": 30000,
+      "status": "RUNNING",
+      "pid": 2678983,
+      "gpu": 4,
+      "gpu_uuid": "GPU-e4eec184-3339-5117-7570-1a3710eaedfa",
+      "started_at": "2026-10-28T13:05:04.150632+08:00",
+      "log": "/workspace/wangziyi/projects/act_fine_1027/logs/act_idle_queue/vga_1023_z_cvae_30k_20261028_130504.log",
+      "command": [
+        "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+        "-u",
+        "/workspace/wangziyi/projects/act_fine_1027/scripts/train_act_fine_queue.py",
+        "--config",
+        "/workspace/wangziyi/projects/act_fine_1027/configs/act_fine_1027_server6/vga_1023_z_cvae_30k.json"
+      ]
+    }
+  ],
+  "updated_at": "2026-10-28T13:47:04.017736+08:00",
+  "gpus": [
+    {
+      "index": 4,
+      "uuid": "GPU-e4eec184-3339-5117-7570-1a3710eaedfa",
+      "used_mib": 31675,
+      "util": 99,
+      "compute_process": true
+    }
+  ],
+  "idle_streaks": {
+    "GPU-e4eec184-3339-5117-7570-1a3710eaedfa": 0
+  },
+  "query_error": null
+}

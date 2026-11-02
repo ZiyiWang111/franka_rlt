@@ -69,6 +69,14 @@ def test_enter_stops_motion_even_if_wasd_still_held(monkeypatch):
     assert [kind for kind, _ in events][-3:] == ["stop", "close", "resync"]
 
 
+def test_wasd_allows_motion_when_workspace_is_disabled(monkeypatch):
+    env, initial, pose, events = run_idle(monkeypatch, outside=True)
+    env.workspace_min = env.workspace_max = None
+    assert read_idle_xy_choice(env, "Ready?") == ""
+    assert pose[1] - initial[1] >= .0059
+    assert any(kind == "servo" for kind, _ in events)
+
+
 @pytest.mark.parametrize("failure", ["keyboard", "workspace"])
 def test_failure_stops_servo_closes_keyboard_and_resyncs(monkeypatch, failure):
     env, _, _, events = run_idle(monkeypatch, fail=failure == "keyboard", outside=failure == "workspace")
@@ -109,7 +117,7 @@ def test_pynput_s_mapping_release_debounce_and_menu_keys(monkeypatch, idle):
         def join(self, **kwargs):
             pass
 
-    special = SimpleNamespace(**{name: object() for name in ("space", "f8", "f9", "esc", "enter")})
+    special = SimpleNamespace(**{name: object() for name in ("space", "f8", "f9", "esc", "enter", "up", "down", "left", "right")})
     keyboard = SimpleNamespace(Key=special, Listener=Listener)
     monkeypatch.setitem(sys.modules, "pynput", SimpleNamespace(keyboard=keyboard))
     clock = [0.]
@@ -118,6 +126,15 @@ def test_pynput_s_mapping_release_debounce_and_menu_keys(monkeypatch, idle):
     monitor = HumanInputMonitor("pynput", idle_xy=idle)
     listener = monitor._listener
     try:
+        for backend in ("pynput", "evdev"):
+            monitor.backend = backend
+            listener.on_press(char("b"))
+            listener.on_press(char("b"))
+            assert monitor.consume_downward_bias() is (not idle)
+            assert monitor.consume_downward_bias() is False
+            assert monitor.poll() is None
+            assert not monitor.pressed_keys()
+        monitor.backend = "pynput"
         listener.on_press(char("s"))
         if not idle:
             assert monitor.poll() == "s"
@@ -137,6 +154,78 @@ def test_pynput_s_mapping_release_debounce_and_menu_keys(monkeypatch, idle):
         assert monitor.poll() == ""
         listener.on_press(char("p"))
         assert monitor.poll() == "p"
+        for name in ("up", "down", "left", "right"):
+            key = getattr(special, name)
+            listener.on_press(key)
+            assert monitor.poll() == f"KEY_{name.upper()}"
+            listener.on_press(key)
+            assert monitor.poll() is None
+            listener.on_release(key)
+            clock[0] += .01
+            listener.on_press(key)  # ToDesk/X11 synthetic repeat release.
+            assert monitor.poll() is None
+            listener.on_release(key)
+            clock[0] += .07
+            listener.on_press(key)
+            assert monitor.poll() == f"KEY_{name.upper()}"
+        listener.on_press(char("0"))
+        assert monitor.poll() == "KEY_0"
+        for name in ("n", "m"):
+            key = char(name)
+            listener.on_press(key)
+            assert monitor.poll() == f"KEY_{name.upper()}"
+            assert monitor.pressed_keys() == set()
+            listener.on_press(key)
+            assert monitor.poll() is None
+            listener.on_release(key)
+            clock[0] += .01
+            listener.on_press(key)
+            assert monitor.poll() is None
+            listener.on_release(key)
+            clock[0] += .07
+            listener.on_press(key)
+            assert monitor.poll() == f"KEY_{name.upper()}"
+        # evdev has real releases and filters native repeat events upstream.
+        monitor.backend = "evdev"
+        for key, name in ((special.up, "KEY_UP"), (char("n"), "KEY_N"), (char("m"), "KEY_M")):
+            listener.on_release(key)
+            listener.on_press(key)
+            assert monitor.poll() == name
+            listener.on_press(key)
+            assert monitor.poll() is None
+            listener.on_release(key)
+            listener.on_press(key)
+            assert monitor.poll() == name
     finally:
         monitor.close()
     assert not listener.is_alive()
+
+
+def test_spacemouse_monitor_d_deletes_but_idle_d_still_moves(monkeypatch):
+    from act_rlt.spacemouse_input import SpaceMouseHumanInputMonitor
+    class Listener:
+        def __init__(self, **callbacks):
+            self.__dict__.update(callbacks)
+        def start(self): pass
+        def wait(self): pass
+        def is_alive(self): return True
+        def stop(self): pass
+        def join(self, **kwargs): pass
+    special = SimpleNamespace(**{name: object() for name in
+                                ('space', 'f8', 'f9', 'esc', 'enter', 'up', 'down', 'left', 'right')})
+    monkeypatch.setitem(sys.modules, 'pynput', SimpleNamespace(
+        keyboard=SimpleNamespace(Key=special, Listener=Listener)))
+    motion = SimpleNamespace(velocity=lambda: np.zeros(6))
+    monitor = SpaceMouseHumanInputMonitor('pynput', None, motion)
+    idle = HumanInputMonitor('pynput', idle_xy=True)
+    try:
+        key = namedtuple('Character', 'char')('d')
+        monitor._listener.on_press(key)
+        assert monitor.poll() == 'd'
+        assert not monitor.pressed_keys()
+        idle._listener.on_press(key)
+        assert idle.poll() is None
+        np.testing.assert_array_equal(idle.direction(), [0, 1, 0])
+    finally:
+        monitor.close()
+        idle.close()

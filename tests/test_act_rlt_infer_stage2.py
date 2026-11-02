@@ -47,6 +47,8 @@ def test_frozen_runtime_uses_actor_mean_without_sampling() -> None:
     (["--camera-boundary-mode", "legacy"], False, "latest"),
     (["--observation-selection", "boundary"], True, "boundary"),
     (["--camera-boundary-mode", "legacy", "--observation-selection", "boundary"], False, "boundary"),
+    (["--teleop-input-backend", "pynput"], True, "latest"),
+    (["--teleop-keyboard", "/dev/input/event3"], True, "latest"),
 ])
 @pytest.mark.parametrize("act_action_dim", [6, 7])
 def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, timestamped, selection, act_action_dim):
@@ -54,6 +56,15 @@ def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, time
     from lerobot.policies import factory
 
     events = []
+    monkeypatch.setenv("DISPLAY", ":123")
+    expected_backend = "evdev" if "--teleop-keyboard" in options else "pynput"
+    expected_keyboard = "/dev/input/event3" if expected_backend == "evdev" else None
+
+    def validate_keyboard(backend, path):
+        assert (backend, path) == (expected_backend, expected_keyboard)
+        events.append("keyboard")
+
+    monkeypatch.setattr("act_rlt.human_input.validate_human_input", validate_keyboard)
     policy = SimpleNamespace(stage1=SimpleNamespace(_act=SimpleNamespace(config=object())), act_action_dim=act_action_dim)
     config = SimpleNamespace(act_checkpoint="/tmp/act", stage1_checkpoint="/tmp/stage1",
                              device="cpu", max_step_m=0.002, max_step_rad=0.02)
@@ -87,6 +98,8 @@ def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, time
         def __init__(self, **kwargs):
             assert kwargs["robot"].is_connected
             assert kwargs["observation_selection"] == selection
+            assert kwargs["teleop_input_backend"] == expected_backend
+            assert kwargs["teleop_keyboard"] == expected_keyboard
             events.append("env")
 
         def close(self):
@@ -95,13 +108,75 @@ def test_infer_main_wires_camera_modes_before_connect(monkeypatch, options, time
     monkeypatch.setattr(franka_robot, "FrankaRobot", Robot)
     monkeypatch.setattr(infer_stage2, "FrankaInsertionStage2Env", Env)
     monkeypatch.setattr(infer_stage2, "run_episodes", lambda *args: events.append("run"))
+    monkeypatch.setattr(infer_stage2, "select_run_reference",
+                        lambda *a, **k: ([0.4, 0, 0.4, 0, 0, 0],
+                                          [0.3, -0.1, 0.3], [0.5, 0.1, 0.5], None))
     assert infer_stage2.main([
         "--checkpoint", "/tmp/stage2", "--allow-motion",
-        "--workspace-min", "0.3", "-0.3", "0.3",
-        "--workspace-max", "0.7", "0.1", "0.5",
         *options,
     ]) == 0
-    assert events == (["timestamp"] if timestamped else []) + ["connect", "env", "run", "close", "stop", "disconnect"]
+    assert events == ["keyboard"] + (["timestamp"] if timestamped else []) + ["connect", "env", "run", "close", "stop", "disconnect"]
+
+
+@pytest.mark.parametrize("display,path,backend,expected", [
+    (None, None, "auto", "evdev"),
+    (":1", None, "auto", "pynput"),
+    (":1", "/dev/input/event3", "auto", "evdev"),
+    (None, None, "pynput", "pynput"),
+    (":1", None, "evdev", "evdev"),
+])
+def test_infer_keyboard_backend_selection(monkeypatch, display, path, backend, expected):
+    if display is None:
+        monkeypatch.delenv("DISPLAY", raising=False)
+    else:
+        monkeypatch.setenv("DISPLAY", display)
+    parser = infer_stage2.build_parser()
+    options = ["--checkpoint", "/tmp/stage2", "--dry-run", "--teleop-input-backend", backend]
+    if path:
+        options += ["--teleop-keyboard", path]
+    args = parser.parse_args(options)
+    infer_stage2.validate_args(parser, args)
+    assert args.teleop_input_backend == expected
+
+
+def test_infer_rejects_evdev_device_with_pynput():
+    parser = infer_stage2.build_parser()
+    args = parser.parse_args(["--checkpoint", "/tmp/stage2", "--dry-run",
+                              "--teleop-input-backend", "pynput", "--teleop-keyboard", "/dev/input/event3"])
+    with pytest.raises(SystemExit):
+        infer_stage2.validate_args(parser, args)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_keyboard_failure_precedes_robot_construction_and_dry_run_skips_keyboard(monkeypatch, capsys, dry_run):
+    from evo_rlt.adapters.lerobot import franka_robot
+    from lerobot.policies import factory
+
+    policy = SimpleNamespace(stage1=SimpleNamespace(_act=SimpleNamespace(config=object())))
+    config = SimpleNamespace(act_checkpoint="/tmp/act", stage1_checkpoint="/tmp/stage1", device="cpu",
+                             max_step_m=.002, max_step_rad=.02)
+    monkeypatch.setattr(infer_stage2, "resolve_stage2_checkpoint", lambda path: path)
+    monkeypatch.setattr(infer_stage2, "load_frozen_policy", lambda *a, **kw: (policy, config))
+    monkeypatch.setattr(infer_stage2, "resolve_pretrained_model", lambda path: path)
+    monkeypatch.setattr(infer_stage2, "checkpoint_camera_shapes", lambda config: {"wrist": (480, 640, 3)})
+    monkeypatch.setattr(factory, "make_pre_post_processors", lambda *a, **kw: (object(), object()))
+    monkeypatch.setattr(franka_robot, "FrankaRobot", lambda *a, **kw: pytest.fail("robot must not be constructed"))
+    calls = []
+
+    def keyboard_failure(*args):
+        calls.append(args)
+        raise RuntimeError("multiple keyboards found; choose one with --keyboard: /dev/input/event3")
+
+    monkeypatch.setattr("act_rlt.human_input.validate_human_input", keyboard_failure)
+    options = ["--checkpoint", "/tmp/stage2", "--allow-motion"]
+    if dry_run:
+        assert infer_stage2.main(options + ["--dry-run"]) == 0
+        assert not calls
+    else:
+        with pytest.raises(SystemExit) as error:
+            infer_stage2.main(options)
+        assert error.value.code == 2 and len(calls) == 1
+        assert "--teleop-keyboard" in capsys.readouterr().err
 
 
 def _saved_reference():
@@ -130,7 +205,7 @@ def test_run_reference_uses_saved_training_point(monkeypatch, choice):
     assert initial is not reference
 
 
-@pytest.mark.parametrize("saved,answers", [(_saved_reference(), ["", "train", "invalid", "c", ""]),
+@pytest.mark.parametrize("saved,answers", [(_saved_reference(), ["", "train", "invalid", "c"]),
                                           (None, [""])])
 def test_run_reference_captures_current_tcp_and_new_workspace(monkeypatch, saved, answers):
     import io
@@ -139,7 +214,7 @@ def test_run_reference_captures_current_tcp_and_new_workspace(monkeypatch, saved
 
     answers = iter(answers)
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
-    # Real capture reads the TCP only after its Enter confirmation.
+    # Choosing c captures immediately; without a saved reference Enter confirms capture.
     current = [0.6, 0.1, 0.41, 4, 5, 6]
     robot = SimpleNamespace(robot=SimpleNamespace(get_tool_pose=lambda: current))
     reference, lower, upper, initial = infer_stage2.select_run_reference(

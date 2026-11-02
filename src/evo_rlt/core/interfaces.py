@@ -68,3 +68,5 @@ class ChunkTransition:
     truncated: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
     # Optional human correction target. Older replay entries use ref_chunk.
     bc_target_chunk: torch.Tensor | None = None
+    # Physical episode step, independent of replay insertion order/overlap.
+    start_step: int | None = None

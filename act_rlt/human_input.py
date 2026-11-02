@@ -15,6 +15,7 @@ from collections import deque
 import numpy as np
 
 from scripts.fr3_keyboard_teleop import KEY_DIRECTIONS, discover_keyboard
+from act_rlt.exploration_bias import BIAS_KEYS
 
 
 # Stage-2 reserves S/F for episode outcomes, including during human takeover.
@@ -28,30 +29,38 @@ class HumanInputMonitor:
 
     _OUTCOMES = {
         "KEY_S": "s", "KEY_F": "f", "KEY_F8": "s", "KEY_F9": "f", "KEY_ESC": "q",
+        "KEY_B": "b", "KEY_D": "d",
     }
     _RELEASE_DEBOUNCE_S = 0.06
     _directions = STAGE2_DIRECTIONS
     _key_outcomes = _OUTCOMES
     _allow_toggle = True
 
-    def __init__(self, backend: str, keyboard_path: str | None = None, *, idle_xy: bool = False):
+    def __init__(self, backend: str, keyboard_path: str | None = None, *, idle_xy: bool = False,
+                 motion_keyboard: bool = True):
         if backend not in {"evdev", "pynput"}:
             raise ValueError(f"unsupported keyboard backend: {backend}")
         if backend == "pynput" and keyboard_path is not None:
             raise ValueError("--teleop-keyboard applies only to evdev")
         self.backend = backend
+        if not motion_keyboard:
+            self._directions = {}
         if idle_xy:
             self._allow_toggle = False
             self._directions = {key: KEY_DIRECTIONS[key] for key in ("KEY_W", "KEY_A", "KEY_S", "KEY_D")}
             self._key_outcomes = {
                 "KEY_ENTER": "", "KEY_Y": "y", "KEY_Q": "q", "KEY_ESC": "q",
                 "KEY_R": "r", "KEY_P": "p", "KEY_4": "4", "KEY_EQUAL": "=", "KEY_MINUS": "-",
+                **{key: key for key in (*BIAS_KEYS, "KEY_0")},
             }
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._pressed: set[str] = set()
         self._pending_release: dict[str, float] = {}
+        self._discrete_down: set[str] = set()
+        self._discrete_releases: dict[str, float] = {}
         self._toggle_down = False
+        self._downward_bias_pending = False
         self._toggle_pending = False
         self._toggle_requested_at: float | None = None
         self.last_consumed_toggle_at: float | None = None
@@ -88,6 +97,10 @@ class HumanInputMonitor:
                     keyboard.Key.esc: "KEY_ESC",
                     keyboard.Key.enter: "KEY_ENTER",
                 }
+                for name in ("up", "down", "left", "right"):
+                    value = getattr(keyboard.Key, name, None)
+                    if value is not None:
+                        special[value] = f"KEY_{name.upper()}"
                 if key in special:
                     return special[key]
                 char = getattr(key, "char", None)
@@ -142,6 +155,11 @@ class HumanInputMonitor:
                     self._pending_release[key] = time.monotonic() + self._RELEASE_DEBOUNCE_S
                 else:
                     self._pressed.discard(key)
+            elif key == "KEY_B" and key in self._key_outcomes:
+                # A latch rather than a toggle: repeat events cannot add bias
+                # or flood the outcome queue and delay S/F/Esc.
+                if down:
+                    self._downward_bias_pending = True
             elif key == "KEY_SPACE" and self._allow_toggle:
                 if down:
                     self._toggle_release_deadline = None
@@ -154,6 +172,16 @@ class HumanInputMonitor:
                     self._toggle_release_deadline = time.monotonic() + self._RELEASE_DEBOUNCE_S
                 else:
                     self._toggle_down = False
+            elif key in (*BIAS_KEYS, "KEY_0") and key in self._key_outcomes:
+                if down:
+                    self._discrete_releases.pop(key, None)
+                    if key not in self._discrete_down:
+                        self._outcomes.append(self._key_outcomes[key])
+                    self._discrete_down.add(key)
+                elif self.backend == "pynput":
+                    self._discrete_releases[key] = time.monotonic() + self._RELEASE_DEBOUNCE_S
+                else:
+                    self._discrete_down.discard(key)
             elif key in self._key_outcomes and down:
                 self._outcomes.append(self._key_outcomes[key])
 
@@ -165,6 +193,10 @@ class HumanInputMonitor:
 
     def _expire_releases(self):
         now = time.monotonic()
+        for key, deadline in tuple(getattr(self, "_discrete_releases", {}).items()):
+            if now >= deadline:
+                self._discrete_down.discard(key)
+                del self._discrete_releases[key]
         if self._toggle_release_deadline is not None and now >= self._toggle_release_deadline:
             self._toggle_down = False
             self._toggle_release_deadline = None
@@ -177,6 +209,13 @@ class HumanInputMonitor:
         with self._lock:
             self._check()
             return self._outcomes.popleft() if self._outcomes else None
+
+    def consume_downward_bias(self) -> bool:
+        with self._lock:
+            self._check()
+            pending = self._downward_bias_pending
+            self._downward_bias_pending = False
+            return pending
 
     def direction(self) -> np.ndarray:
         with self._lock:

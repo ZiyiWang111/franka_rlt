@@ -501,6 +501,25 @@ def test_endpoint_report_reads_after_stop_and_logs_absolute_z_and_intrinsic_eule
     np.testing.assert_allclose(end["final_tcp"]["euler_xyz_deg"], angles)
 
 
+def test_endpoint_waits_for_post_stop_state_when_immediate_cache_is_stale(runtime):
+    def stale_pose(**kwargs):
+        raise RuntimeError("Fresh streamed TCP pose unavailable or stale")
+
+    def post_stop_pose(*, timeout_s):
+        assert runtime.calls.stopped == 1
+        assert timeout_s == 2.0
+        return [.55, .05, .401234, 0., 0., 0.]
+
+    runtime.robot.robot.get_tool_pose = stale_pose
+    runtime.robot.robot.get_fresh_tool_pose = stale_pose
+    runtime.robot.robot.get_tool_pose_after_move = post_stop_pose
+    trace = io.StringIO()
+    run(runtime, "joint_absolute", trace)
+    end = json.loads(trace.getvalue().splitlines()[-1])
+    assert end["final_tcp_error"] is None
+    assert end["final_tcp"]["z_m"] == .401234
+
+
 def test_endpoint_read_failure_does_not_mask_control_error_or_prevent_cleanup(runtime, capsys):
     def fail_pose():
         raise RuntimeError("endpoint state unavailable")

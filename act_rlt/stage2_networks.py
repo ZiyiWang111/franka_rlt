@@ -1,4 +1,4 @@
-"""Balanced input fusion for the ACT-backed Stage-2 actor and critics."""
+"""Input fusion for the ACT-backed Stage-2 actor and critics."""
 
 from __future__ import annotations
 
@@ -9,17 +9,25 @@ from evo_rlt.core.utils import build_mlp
 
 
 class ChunkInputFusion(nn.Module):
-    """Give token, joint state, and action equal-width normalized branches."""
+    """Project each input to equal width and a common normalized value range."""
 
-    def __init__(self, state_dim: int, proprio_dim: int, chunk_dim: int, fusion_dim: int) -> None:
+    def __init__(self, state_dim: int, proprio_dim: int, chunk_dim: int, fusion_dim: int,
+                 input_fusion: str = "balanced") -> None:
         super().__init__()
         token_dim = state_dim - proprio_dim
         if token_dim <= 0 or proprio_dim < 0 or chunk_dim <= 0 or fusion_dim <= 0:
             raise ValueError("fusion input and output dimensions must be positive")
+        if input_fusion not in {"token_identity", "balanced"}:
+            raise ValueError(f"unsupported input fusion: {input_fusion}")
         self.token_dim = token_dim
-        self.token = self._branch(token_dim, fusion_dim)
-        self.proprio = self._branch(proprio_dim, fusion_dim) if proprio_dim else None
-        self.output_dim = (3 if proprio_dim else 2) * fusion_dim
+        # Retain token passthrough only for loading its existing checkpoints.
+        balanced = input_fusion == "balanced"
+        self.token = self._branch(token_dim, fusion_dim) if balanced else nn.Identity()
+        proprio_width = fusion_dim if balanced else 32
+        self.proprio = self._branch(proprio_dim, proprio_width) if proprio_dim else None
+        self.output_dim = (fusion_dim if balanced else token_dim) + fusion_dim
+        if proprio_dim:
+            self.output_dim += proprio_width
         self.action = self._branch(chunk_dim, fusion_dim)
 
     @staticmethod
@@ -47,9 +55,10 @@ class Stage2ChunkActor(nn.Module):
         num_layers: int = 2,
         fixed_std: float = 0.1,
         ref_dropout_p: float = 0.5,
+        input_fusion: str = "balanced",
     ) -> None:
         super().__init__()
-        self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim)
+        self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim, input_fusion)
         self.net = build_mlp(
             self.fusion.output_dim, hidden_dim, chunk_dim, num_layers,
             activation="gelu", layer_norm=True,
@@ -87,9 +96,10 @@ class Stage2ChunkCritic(nn.Module):
         fusion_dim: int = 128,
         hidden_dim: int = 256,
         num_layers: int = 2,
+        input_fusion: str = "balanced",
     ) -> None:
         super().__init__()
-        self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim)
+        self.fusion = ChunkInputFusion(state_dim, proprio_dim, chunk_dim, fusion_dim, input_fusion)
         self.net = build_mlp(
             self.fusion.output_dim, hidden_dim, 1, num_layers,
             activation="gelu", layer_norm=True,
@@ -108,12 +118,14 @@ class Stage2TwinCritic(nn.Module):
         fusion_dim: int = 128,
         hidden_dim: int = 256,
         num_layers: int = 2,
+        input_fusion: str = "balanced",
     ) -> None:
         super().__init__()
         kwargs = dict(
             state_dim=state_dim, proprio_dim=proprio_dim,
             chunk_dim=chunk_dim, fusion_dim=fusion_dim,
             hidden_dim=hidden_dim, num_layers=num_layers,
+            input_fusion=input_fusion,
         )
         self.q1 = Stage2ChunkCritic(**kwargs)
         self.q2 = Stage2ChunkCritic(**kwargs)

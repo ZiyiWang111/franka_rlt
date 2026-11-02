@@ -1,0 +1,29 @@
+{
+  "checks_passed": true,
+  "checkpoint": "/workspace/wangziyi/projects/act_fine_1027/outputs/act_fine/usb_1027_z_cvae_30k/checkpoints/030000/pretrained_model",
+  "act_use_cvae": true,
+  "encoder_input": "encoder_out only",
+  "extra_positional_embedding": false,
+  "reconstruction_target": "encoder_out",
+  "hidden_shape": [
+    16,
+    922,
+    768
+  ],
+  "rl_memory_shape": [
+    16,
+    1,
+    768
+  ],
+  "posterior_calls": 0,
+  "latent": "all zeros",
+  "act_frozen": true,
+  "encoder_equivalence_verified": true,
+  "rl_token_gradient_norm": 0.2813463807106018,
+  "optimizer_steps": 0,
+  "batch_size": 16,
+  "adam_state_reserved": true,
+  "device": "cuda",
+  "peak_allocated_gib": 9.760909080505371,
+  "peak_reserved_gib": 10.78515625
+}

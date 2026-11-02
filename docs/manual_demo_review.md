@@ -14,4 +14,5 @@ PYTHONPATH=src /home/embint/miniconda3/envs/evo-rlt/bin/python -m evo_rlt.cli.re
 
 必须至少保留 1 个 episode（LeRobot 编辑工具的限制）。请先停止向该数据集写入的采集程序。
 删除使用 LeRobot 工具重建数据、视频和元数据，验证 episode 数量后替换原目录，成功后清理临时备份。
+编辑进程会加载一维 `observation.state` 的兼容处理，支持仅包含 `ee_z` 的数据集，保留其长度为 1 的向量格式。
 该脚本只提供目录选择和末尾批量删除，不再包含可视化、异常扫描或逐条审查功能。

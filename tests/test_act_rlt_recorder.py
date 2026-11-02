@@ -70,7 +70,7 @@ def test_z_insertion_is_the_default_collection_mode():
     args = build_parser().parse_args(["--dataset", "test/act_rlt", "--root", "/tmp/act-rlt"])
     validate_args(args)
     assert args.task is None
-    assert args.insert_minus_z == pytest.approx(0.004)
+    assert args.insert_minus_z == pytest.approx(0.006)
 
     custom_depth = build_parser().parse_args([
         "--dataset", "test/act_rlt", "--root", "/tmp/act-rlt",
@@ -168,7 +168,7 @@ def test_collection_returns_to_taught_orientation_before_insertion(monkeypatch):
     assert moves == [
         ("outside", sample_z_insertion_pose(taught, np.random.default_rng(42))),
         ("recorded", taught),
-        ("recorded", insertion_pose_minus_z(taught, 0.004)),
+        ("recorded", insertion_pose_minus_z(taught, 0.006)),
         ("outside", taught),
     ]
     assert moves[0][1][3:] != taught[3:]

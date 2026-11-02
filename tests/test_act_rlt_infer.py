@@ -27,6 +27,8 @@ from act_rlt.infer import (
     adjust_reset_xy_range,
     validate_sample_bounds,
     prompt_reset_choice,
+    prompt_idle_choice,
+    update_reset_reference,
     confirm_centered_bounds,
     move_to_next_sample,
     observation_frame,
@@ -123,6 +125,25 @@ def test_motion_cli_uses_confirmed_center_instead_of_workspace_arguments():
         parser.parse_args(["--checkpoint", "model", "--workspace-min", "0", "0", "0"])
 
 
+@pytest.mark.parametrize("display,keyboard,expected", [
+    (":0", None, "pynput"), ("", None, "evdev"), (":0", "/dev/input/event4", "evdev"),
+])
+def test_infer_idle_keyboard_backend_selection(monkeypatch, display, keyboard, expected):
+    monkeypatch.setenv("DISPLAY", display)
+    parser = build_parser()
+    values = ["--checkpoint", "model"]
+    if keyboard:
+        values += ["--teleop-keyboard", keyboard]
+    args = parser.parse_args(values)
+    validate_args(parser, args)
+    assert args.teleop_input_backend == expected
+    with pytest.raises(SystemExit):
+        validate_args(parser, parser.parse_args([
+            "--checkpoint", "model", "--teleop-input-backend", "pynput",
+            "--teleop-keyboard", "/dev/input/event4",
+        ]))
+
+
 def test_centered_xy_defaults_to_zero_range_and_measured_xyz_workspace():
     pose = [0.4, -0.2, 0.3, 1, 2, 3]
     sample_min, sample_max, workspace_min, workspace_max = centered_bounds(pose)
@@ -208,6 +229,109 @@ def test_enter_captures_latest_xy_but_samples_use_fixed_collection_z_and_orienta
         )
     np.testing.assert_allclose(config.workspace_min_xyz, [0.45, -0.15, 0.35])
     np.testing.assert_allclose(config.workspace_max_xyz, [0.55, -0.05, 0.45])
+
+
+def test_reference_pose_mode_captures_latest_pose_and_disables_workspace():
+    parser = build_parser()
+    assert not parser.parse_args(["--checkpoint", "model"]).use_reference_pose
+    args = parser.parse_args(["--checkpoint", "model", "--use-reference-pose"])
+    config = SimpleNamespace(workspace_min_xyz=(0, 0, 0), workspace_max_xyz=(1, 1, 1))
+    poses = iter([[0.4, -0.2, 0.3, 1, 2, 3], [0.5, -0.1, 0.6, 0.1, 0.2, 0.3]])
+    robot = SimpleNamespace(config=config, robot=SimpleNamespace(get_tool_pose=lambda: next(poses)))
+    with patch("builtins.input", return_value=""):
+        lower, upper, orientation = confirm_centered_bounds(robot, args.use_reference_pose)
+    np.testing.assert_allclose(lower, [0.5, -0.1, 0.6])
+    np.testing.assert_allclose(upper, lower)
+    np.testing.assert_allclose(orientation, [0.1, 0.2, 0.3])
+    assert config.workspace_min_xyz is None and config.workspace_max_xyz is None
+    reference = lower.copy()
+    lower[:2] -= 0.05
+    upper[:2] += 0.05
+    validate_sample_bounds(lower, upper, config.workspace_min_xyz, config.workspace_max_xyz)
+    rng = np.random.default_rng(0)
+    for _ in range(10):
+        sample = sample_workspace_pose(lower, upper, orientation, 0, rng)
+        assert np.all(np.abs(sample[:2] - reference[:2]) <= 0.05)
+        assert sample[2] == reference[2]
+        np.testing.assert_allclose(sample[3:], orientation)
+
+
+@pytest.mark.parametrize("key,axis,sign", [
+    ("KEY_W", 0, -1), ("KEY_S", 0, 1), ("KEY_A", 1, -1), ("KEY_D", 1, 1),
+])
+@pytest.mark.parametrize("finish", ["release", "held", "disconnect", "no_motion"])
+def test_infer_idle_wasd_stops_and_returns_measured_reference(monkeypatch, key, axis, sign, finish):
+    pose = np.array([.5, -.1, .6, .1, .2, .3])
+    initial = pose.copy()
+    events = []
+    clock = [0.]
+
+    class Monitor:
+        def __init__(self, *args):
+            self.frame = 0
+            assert self._key_outcomes["KEY_N"] == "n"
+            assert "KEY_S" in self._directions and "KEY_S" not in self._key_outcomes
+
+        def poll(self):
+            self.frame += 1
+            if finish == "disconnect" and self.frame == 14:
+                raise RuntimeError("keyboard disconnected")
+            if finish == "no_motion":
+                return ""
+            return "" if self.frame == 14 else None
+
+        def pressed_keys(self):
+            return {key} if self.frame <= 10 or finish == "held" else set()
+
+        def close(self):
+            events.append("close")
+
+    def servo(target):
+        events.append("servo")
+        pose[:] = target
+
+    robot = SimpleNamespace(
+        robot=SimpleNamespace(get_tool_pose=lambda: pose.copy(), servo_tool=servo,
+                              stop_servo=lambda: events.append("stop") or True),
+        config=SimpleNamespace(workspace_min_xyz=None, workspace_max_xyz=None),
+        resync_command_pose=lambda: events.append("resync"),
+    )
+    monkeypatch.setattr("act_rlt.human_input.HumanInputMonitor", Monitor)
+    monkeypatch.setattr("act_rlt.infer.time.perf_counter", lambda: clock[0])
+    monkeypatch.setattr("act_rlt.infer.time.sleep", lambda duration: clock.__setitem__(0, clock[0] + .02))
+    args = SimpleNamespace(teleop_input_backend="pynput", teleop_keyboard=None)
+    if finish == "disconnect":
+        with pytest.raises(RuntimeError, match="keyboard disconnected"):
+            prompt_idle_choice(robot, args, "Ready?", {"": "start"})
+        assert events[-3:] == ["stop", "close", "resync"]
+        return
+    decision, reference = prompt_idle_choice(robot, args, "Ready?", {"": "start"})
+    assert decision == "start"
+    if finish == "no_motion":
+        assert reference is None
+        assert events == ["stop", "close", "resync"]
+        return
+    assert sign * (reference[axis] - initial[axis]) >= .0059
+    np.testing.assert_allclose(reference[2:], initial[2:])
+    np.testing.assert_allclose(reference, pose)
+    assert events[-3:] == ["stop", "close", "resync"]
+    if finish == "release":
+        assert events[-4] == "stop"
+
+
+@pytest.mark.parametrize("use_reference_pose", [False, True])
+def test_manual_motion_recenters_future_samples(use_reference_pose):
+    lower = np.array([.4, -.2, .402])
+    upper = lower.copy()
+    xy = lower[:2].copy()
+    orientation = np.array([1., 2., 3.])
+    measured = np.array([.5, -.1, .6, .1, .2, .3])
+    update_reset_reference(measured, lower, upper, xy, orientation, .01, use_reference_pose)
+    np.testing.assert_allclose(xy, measured[:2])
+    np.testing.assert_allclose(lower[:2], measured[:2] - .01)
+    np.testing.assert_allclose(upper[:2], measured[:2] + .01)
+    assert lower[2] == upper[2] == (.6 if use_reference_pose else .402)
+    np.testing.assert_allclose(orientation, measured[3:] if use_reference_pose else [1, 2, 3])
 
 
 def test_reset_orientation_is_not_a_cli_argument():

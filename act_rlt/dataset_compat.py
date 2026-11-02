@@ -25,3 +25,12 @@ def install_scalar_state_dataset_support():
 
     features_with_state_vector._scalar_state_vector = True
     dataset_reader.get_hf_features_from_features = features_with_state_vector
+
+
+def install_scalar_state_dataset_edit_support():
+    """Preserve one-channel state vectors when the editor reads and rewrites data."""
+    install_scalar_state_dataset_support()
+    from lerobot.datasets import dataset_reader, feature_utils
+
+    # The editor imports this function locally when rewriting parquet files.
+    feature_utils.get_hf_features_from_features = dataset_reader.get_hf_features_from_features

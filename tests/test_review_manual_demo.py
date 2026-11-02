@@ -49,7 +49,7 @@ def test_count_quit_and_single_episode(monkeypatch):
 
 def _fake_editor(monkeypatch, *, total=3, fail=False):
     calls = []
-    monkeypatch.setattr(review, "_resolve_editor", lambda: "editor")
+    monkeypatch.setattr(review, "_editor_command", lambda: ["editor"])
 
     def run(command, *, check):
         calls.append(command)
@@ -148,3 +148,50 @@ def test_failed_replacement_rolls_back_original(monkeypatch, tmp_path):
         review._delete_tail(root, 2, snapshot)
     assert (root / "original.txt").is_file()
     assert (root / "meta" / "info.json").read_bytes() == snapshot
+
+
+def test_real_editor_deletes_tail_with_single_channel_state(monkeypatch, tmp_path):
+    """Exercise the child process where the scalar/vector compatibility is needed."""
+    monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "hf_cache"))
+    import numpy as np
+    import pyarrow.parquet as pq
+    import datasets
+    from lerobot.datasets import dataset_writer
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    # Construct the same fixed-size state vectors as the converted Z dataset.
+    original_features = dataset_writer.get_hf_features_from_features
+
+    def vector_features(features):
+        result = original_features(features)
+        result["observation.state"] = datasets.Sequence(datasets.Value("float32"), length=1)
+        return result
+
+    monkeypatch.setattr(dataset_writer, "get_hf_features_from_features", vector_features)
+    root = tmp_path / "single_z"
+    dataset = LeRobotDataset.create(
+        repo_id="single_z", fps=30, root=root, use_videos=False,
+        features={
+            "observation.state": {"dtype": "float32", "shape": (1,), "names": ["ee_z"]},
+            "action": {"dtype": "float32", "shape": (6,), "names": ["dx", "dy", "dz", "drx", "dry", "drz"]},
+        },
+    )
+    for episode in range(3):
+        for frame in range(3):
+            dataset.add_frame({
+                "observation.state": np.array([0.4 + episode * 0.001], dtype=np.float32),
+                "action": np.zeros(6, dtype=np.float32),
+                "task": "test insertion",
+            })
+        dataset.save_episode()
+    dataset.finalize()
+    snapshot = (root / "meta" / "info.json").read_bytes()
+    review._delete_tail(root, 1, snapshot)
+    info = json.loads((root / "meta" / "info.json").read_bytes())
+    assert info["total_episodes"] == 2
+    assert info["total_frames"] == 6
+    tables = [pq.read_table(path) for path in (root / "data").rglob("*.parquet")]
+    episodes = [index for table in tables for index in table["episode_index"].to_pylist()]
+    states = [state for table in tables for state in table["observation.state"].to_pylist()]
+    assert episodes == [0, 0, 0, 1, 1, 1]
+    np.testing.assert_allclose(states, [[0.4]] * 3 + [[0.401]] * 3)

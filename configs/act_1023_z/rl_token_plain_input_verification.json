@@ -1,0 +1,29 @@
+{
+  "checks_passed": true,
+  "checkpoint": "/home/embint/wzy/Evo-RLT/outputs/vga_act/act_1023_z/checkpoints/040000/pretrained_model",
+  "act_use_cvae": false,
+  "encoder_input": "encoder_out only",
+  "extra_positional_embedding": false,
+  "reconstruction_target": "encoder_out",
+  "hidden_shape": [
+    1,
+    922,
+    768
+  ],
+  "rl_memory_shape": [
+    1,
+    1,
+    768
+  ],
+  "posterior_calls": 0,
+  "latent": "all zeros",
+  "act_frozen": true,
+  "encoder_equivalence_verified": true,
+  "rl_token_gradient_norm": 0.2818257212638855,
+  "optimizer_steps": 0,
+  "batch_size": 1,
+  "adam_state_reserved": false,
+  "device": "cpu",
+  "peak_allocated_gib": null,
+  "peak_reserved_gib": null
+}

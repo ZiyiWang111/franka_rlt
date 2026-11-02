@@ -1,0 +1,25 @@
+{
+  "pid": 3671538,
+  "host": "10.0.40.113",
+  "gpu": 4,
+  "usb_batch_size": 16,
+  "vga_batch_size": 32,
+  "started_at": "2026-10-28T10:02:49.906066+08:00",
+  "command": [
+    "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+    "-u",
+    "/workspace/wangziyi/projects/act_fine_1027/scripts/run_act_idle_queue.py",
+    "--project",
+    "/workspace/wangziyi/projects/act_fine_1027",
+    "--python",
+    "/workspace/wangziyi/projects/franka_rlt/.venv/bin/python",
+    "--configs",
+    "configs/act_fine_1027_server6/usb_1027_z_cvae_30k.json",
+    "configs/act_fine_1027_server6/vga_1023_z_cvae_30k.json",
+    "--gpus",
+    "4",
+    "--idle-samples",
+    "1"
+  ],
+  "status_file": "/workspace/wangziyi/projects/act_fine_1027/logs/act_idle_queue/status.json"
+}
